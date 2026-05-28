@@ -18,12 +18,12 @@ CLASSES = {
 
 def extract_pcd_by_class(las, class_codes):
     """根据分类码提取点云，并转换为 Open3D 格式"""
-    mask = np.isin(las.classification, class_codes)
+    mask = np.isin(las.classification[::10], class_codes)
     
     # 提取 XYZ 坐标
-    x = las.x[mask]
-    y = las.y[mask]
-    z = las.z[mask]
+    x = las.x[::10][mask]
+    y = las.y[::10][mask]
+    z = las.z[::10][mask]
     
     if len(x) == 0:
         return None
@@ -86,7 +86,7 @@ def process_laz_to_stl(laz_path, stl_path):
         if name in ["Buildings", "Bridges_Docks"]:
             # 建筑物和桥梁：使用泊松重建获得平滑表面
             # depth 越大细节越多，但计算越慢
-            mesh = mesh_poisson(pcd, depth=1, density_threshold=0.03)
+            mesh = mesh_poisson(pcd, depth=10, density_threshold=0.03)
             
         elif name in ["Vegetation"]:
             # 植被：使用 Alpha Shape 生成包裹团块
@@ -96,6 +96,7 @@ def process_laz_to_stl(laz_path, stl_path):
         elif name in ["Terrain"]:
             # 地形：通常使用 Alpha Shape 获取表皮
             # 进阶操作：也可以用泊松，但需要极高的密度过滤
+            continue
             mesh = mesh_alpha_shape(pcd, alpha=3.0)
             
         elif name in ["Water"]:

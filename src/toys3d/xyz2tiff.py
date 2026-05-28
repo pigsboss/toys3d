@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """xyz2tiff.py Load and convert swisstopo .xyz.zip files (e.g., swissALTIregio, swissALTI3D) to TIFF.
 """
+
 import zipfile
 import sys
 from os import path
@@ -30,8 +31,8 @@ def load_xyz(zip_input, npixels):
     return x, y, z
 
 zip_dir = Path(sys.argv[1])
-tiff_output = path.join(zip_dir.absolute(), 'preview.tiff')
-png_output = path.join(zip_dir.absolute(), 'preview.png')
+tiff_output = path.join(zip_dir.absolute(), 'dem.tiff')
+png_output = path.join(zip_dir.absolute(), 'dem_preview.png')
 zip_list = []
 for file_path in zip_dir.iterdir():
     if file_path.is_file():
@@ -84,18 +85,37 @@ for i in range(nframes):
     zfull[ridx*npixels:(ridx+1)*npixels, cidx*npixels:(cidx+1)*npixels] = results[i][2][:,:]
 del results
 gc.collect()
-# plt.imshow(zfull)
-# plt.show()
+
+# 2. 定义普通的物理分辨率（例如打印用的 DPI 或物理尺寸）
+# 格式：(X_res, Y_res, 'UNIT')，单位可选 'INCH' 或 'CENTIMETER'
+dpi_resolution = (1200., 1200.0, 'INCH')
+
+# 3. 定义 GeoTIFF 的核心空间标签 (参考点与像素比例)
+# 像素比例：X方向每像素 0.5m，Y方向每像素 0.5m
+pixel_scale = (abs(xinc), abs(yinc), 0.0) 
+
+# 参考点(Tie Point)：[I, J, K, X, Y, Z]
+# 意思是把图像的第 0 行, 0 列像素，锚定到真实地理坐标 X=600000, Y=200000
+tie_point = (0.0, 0.0, 0.0, xfull[0,0], yfull[0,0], 0.0)
+
+# 4. 写入文件
 tifffile.imwrite(
     tiff_output,
     zfull,
     compression='lzw',       # 使用无损的 LZW 压缩
-    photometric='minisblack' # 单通道灰度
+    photometric='minisblack', # 单通道灰度/高程图的标准光度解释
+    resolution=dpi_resolution,
+    extratags=[
+        # 语法: (Tag ID, 数据类型, 元素数量, 值)
+        # 'd' 代表 double (双精度浮点数)
+        (33550, 'd', 3, pixel_scale), 
+        (33922, 'd', 6, tie_point)
+    ]
 )
-print(f"{tiff_output} preview saved.")
+print(f"{tiff_output} saved.")
+
 cv2.imwrite(
     png_output,
     (((zfull-zfull.min()) / (zfull.max()-zfull.min())) * 65535.).astype(np.uint16),
     [cv2.IMWRITE_PNG_COMPRESSION, 1])
-print(f"{png_output} preview saved.")
-
+print(f"{png_output} saved.")
