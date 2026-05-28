@@ -86,25 +86,21 @@ def process_laz_to_stl(laz_path, stl_path):
         if name in ["Buildings", "Bridges_Docks"]:
             # 建筑物和桥梁：使用泊松重建获得平滑表面
             # depth 越大细节越多，但计算越慢
-            print("  reconstructing buildings...")
-            mesh = mesh_poisson(pcd, depth=10, density_threshold=0.03)
+            mesh = mesh_poisson(pcd, depth=1, density_threshold=0.03)
             
         elif name in ["Vegetation"]:
             # 植被：使用 Alpha Shape 生成包裹团块
             # alpha 值越小越紧贴散点，越大越像一个凸包
-            print("  reconstruction vegetation...")
             mesh = mesh_alpha_shape(pcd, alpha=2.0)
             
         elif name in ["Terrain"]:
             # 地形：通常使用 Alpha Shape 获取表皮
             # 进阶操作：也可以用泊松，但需要极高的密度过滤
-            print("  reconstructing terrain...")
             mesh = mesh_alpha_shape(pcd, alpha=3.0)
             
         elif name in ["Water"]:
             # 水体：LiDAR 扫水体往往只有零星散点
             # 增加 alpha 值强行将稀疏的点连成片
-            print("  reconstructing water...")
             mesh = mesh_alpha_shape(pcd, alpha=5.0)
         
         # 导出为 STL
