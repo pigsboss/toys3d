@@ -28,7 +28,10 @@ def visualize_swiss_surface_3d(file_path, class_id, sampling_rate=1.0):
     y = np.array(las_data.y)
     z = np.array(las_data.z)
     c = np.array(las_data.classification)
-    points = np.vstack((x[c==class_id], y[c==class_id], z[c==class_id])).T
+    m = np.zeros(c.shape, dtype='bool')
+    for i in class_id:
+        m = np.logical_or(m, c==i)
+    points = np.vstack((x[m], y[m], z[m])).T
 
     # 3. 大数字地理坐标归零（!!关键优化!!）
     # 瑞士坐标系（MN95）的数值非常大（如 X=2,600,000, Y=1,200,000），
@@ -42,14 +45,14 @@ def visualize_swiss_surface_3d(file_path, class_id, sampling_rate=1.0):
         indices = np.random.choice(len(points_centered), size=int(len(points_centered) * sampling_rate), replace=False)
         points_centered = points_centered[indices]
         # 同步抽样属性字段
-        intensity = np.array(las_data.intensity[c==class_id])[indices]
-        classification = np.array(las_data.classification[c==class_id])[indices]
+        intensity = np.array(las_data.intensity[m])[indices]
+        classification = np.array(las_data.classification[m])[indices]
         z_values = z[indices]
         print(f"抽样完成，当前渲染点数: {len(points_centered):,}")
     else:
-        intensity = np.array(las_data.intensity[c==class_id])
-        classification = np.array(las_data.classification[c==class_id])
-        z_values = z[c==class_id]
+        intensity = np.array(las_data.intensity[m])
+        classification = np.array(las_data.classification[m])
+        z_values = z[m]
 
     # 5. 构筑 PyVista 点云对象
     point_cloud = pv.PolyData(points_centered)
@@ -67,11 +70,11 @@ def visualize_swiss_surface_3d(file_path, class_id, sampling_rate=1.0):
     # 提示：若电脑配置较高，可设置 render_points_as_spheres=True 让每个点变成3D微球体
     plotter.add_mesh(
         point_cloud,
-        scalars="Elevation (m)",       # 默认渲染的属性，可替换为 "Intensity" 或 "Classification"
+        scalars="Classification",       # 默认渲染的属性，可替换为 "Intensity" 或 "Classification"
         cmap="terrain",                 # 地形常用色带，可选 'viridis', 'jet', 'plasma' 等
         point_size=1.5,                 # 调整点的大小，数值越小越显精致
         render_points_as_spheres=False, # 设为 False 渲染速度极快，适合海量点
-        scalar_bar_args={"title": "Elevation (m)", "color": "white"} # 色条配置
+        scalar_bar_args={"title": "Classification", "color": "white"} # 色条配置
     )
 
     # 添加 3D 坐标轴刻度线（由于中心化了，我们将轴标签隐藏或参考相对值）
@@ -85,6 +88,10 @@ if __name__ == "__main__":
     # 请将此处替换为您的真实 swissSURFACE3D .laz 文件路径
     # 示例文件名如: C_CH1903Plus_LV95_2600_1200.laz
     file_path = path.abspath(path.normpath(path.realpath(sys.argv[1])))
-    class_id  = int(eval(sys.argv[2]))
+    class_id  = eval(sys.argv[2])
+    try:
+       iter(class_id)
+    except:
+        class_id = (class_id, )
     # 执行可视化，若单张图点数超过3000万导致拖动卡顿，可将 sampling_rate 改为 0.5 或 0.3
     visualize_swiss_surface_3d(file_path, class_id, sampling_rate=1.0)
