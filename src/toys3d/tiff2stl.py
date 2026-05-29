@@ -6,7 +6,7 @@ import sys
 import os
 from showtiff import load_tifffile
 
-def generate_terrain_solid(tiff_input, stl_output, base_z=-1.0):
+def generate_terrain_solid(tiff_input, stl_output, down_sampling=1, base_z=-1.0):
     """
     将二维高度场向下挤出并封底，生成水密实体 STL
     
@@ -16,9 +16,13 @@ def generate_terrain_solid(tiff_input, stl_output, base_z=-1.0):
     :param base_z: 挤出底座的绝对 Z 坐标 (必须小于高度场的最小值)
     :param out_file: 导出的 STL 文件名
     """
-    cdata, info = load_tifffile(tiff_input)
-    rows, cols = cdata.shape
+    Z, info = load_tifffile(tiff_input)
+    Z = Z[::down_sampling, ::down_sampling]
+    rows, cols = Z.shape
     num_points = rows * cols
+    x = np.arange(cols) * info['scale_x'] * down_sampling
+    y = np.arange(rows) * info['scale_y'] * down_sampling
+    X, Y = np.meshgrid(x, y)
     
     # ================= 2. 构建所有顶点 (Vertices) =================
     # 顶部顶点：原始的山体高度
@@ -90,17 +94,16 @@ def generate_terrain_solid(tiff_input, stl_output, base_z=-1.0):
     if mesh.is_watertight:
         print(f"✅ 成功生成水密实体！共包含 {len(mesh.vertices)} 个顶点, {len(mesh.faces)} 个面。")
         # 导出为 STL 格式
-        mesh.export(out_file)
-        print(f"💾 文件已保存为: {out_file}")
+        mesh.export(stl_output)
+        print(f"💾 文件已保存为: {stl_output}")
     else:
         print("❌ 警告：生成的网格存在开放边缘 (Open Edges)，请检查逻辑。")
 
 # ================= 运行示例 =================
 if __name__ == "__main__":
     generate_terrain_solid(
-        x_range=(-5, 5), 
-        y_range=(-5, 5), 
-        resolution=150,     # 分辨率 150x150，将会生成约 45000 个面
-        base_z=-2.0,        # 底座延伸到 Z = -2.0 的高度
-        out_file="my_mountain.stl"
+        os.path.abspath(os.path.normpath(sys.argv[1])),
+        os.path.abspath(os.path.normpath(sys.argv[2])),
+        down_sampling=int(eval(sys.argv[3])),
+        base_z=float(eval(sys.argv[4]))
     )
