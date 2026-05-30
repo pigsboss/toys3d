@@ -32,8 +32,8 @@ def generate_terrain_solid(tiff_input, stl_output, down_sampling=1, base_z=-1.0,
     Z, info = load_tiff(tiff_input)
     if sphere:
         print("将海平面基准高度转换为子午面基准高度...")
-        lon_E = info['corner_coords'][0][0]
-        lon_W = info['corner_coords'][1][0]
+        lon_W = info['corner_coords'][0][0]
+        lon_E = info['corner_coords'][1][0]
         lat_S = info['corner_coords'][2][1]
         lat_N = info['corner_coords'][0][1]
         Z, X, Y = sphere_height(Z[::down_sampling, ::down_sampling], (lon_W, lon_E, lat_S, lat_N), info['radius'])

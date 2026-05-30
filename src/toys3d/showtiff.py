@@ -103,8 +103,8 @@ def main():
     if "radius" in info:
         print("行星平均半径: {:f} km".format(info['radius']))
     if "corner_coords" in info:
-        lon_E = info['corner_coords'][0][0]
-        lon_W = info['corner_coords'][1][0]
+        lon_W = info['corner_coords'][0][0]
+        lon_E = info['corner_coords'][1][0]
         lat_S = info['corner_coords'][2][1]
         lat_N = info['corner_coords'][0][1]
         print("标准分幅边界: LON_W={:f}, LON_E={:f}, LAT_S={:f}, LAT_N={:f}".format(lon_E, lon_W, lat_S, lat_N))
