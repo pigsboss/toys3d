@@ -7,7 +7,19 @@ import os
 from showtiff import load_tiff
 import argparse
 
-def generate_terrain_solid(tiff_input, stl_output, down_sampling=1, base_z=-1.0):
+def sphere_height(Z, quadrangle, radius):
+    lon_W, lon_E, lat_S, lat_N = quadrangle
+    lon_C = 0.5 * (lon_W + lon_E)
+    nrows, ncols = Z.shape
+    lon = np.deg2rad(np.linspace(lon_W, lon_E, ncols) - lon_C)
+    lat = np.deg2rad(np.linspace(lat_S, lat_N, nrows))
+    Lon, Lat = np.meshgrid(lon, lat)
+    h = (Z+radius)*np.cos(Lat)*np.cos(Lon)
+    y = (Z+radius)*np.sin(Lat)
+    x = (Z+radius)*np.cos(Lat)*np.sin(Lon)
+    return h, x, y
+
+def generate_terrain_solid(tiff_input, stl_output, down_sampling=1, base_z=-1.0, sphere=False):
     """
     将二维高度场向下挤出并封底，生成水密实体 STL
     
@@ -18,12 +30,25 @@ def generate_terrain_solid(tiff_input, stl_output, down_sampling=1, base_z=-1.0)
     :param out_file: 导出的 STL 文件名
     """
     Z, info = load_tiff(tiff_input)
-    Z = Z[::down_sampling, ::down_sampling]
-    rows, cols = Z.shape
-    num_points = rows * cols
-    x = np.arange(cols) * info['scale_x'] * down_sampling
-    y = np.arange(rows) * info['scale_y'] * down_sampling
-    X, Y = np.meshgrid(x, y)
+    if sphere:
+        print("将海平面基准高度转换为子午面基准高度...")
+        lon_E = info['corner_coords'][0][0]
+        lon_W = info['corner_coords'][1][0]
+        lat_S = info['corner_coords'][2][1]
+        lat_N = info['corner_coords'][0][1]
+        Z, X, Y = sphere_height(Z[::down_sampling, ::down_sampling], (lon_W, lon_E, lat_S, lat_N), info['radius'])
+        print("子午面基准高度范围: {:f} km (min) -- {:f} km (max)".format(np.min(Z.ravel())/1e3, np.max(Z.ravel())/1e3))
+        print("子午面投影横向跨度: {:f} km".format(np.max(X.ravel())/1e3 - np.min(X.ravel())/1e3))
+        print("子午面投影纵向跨度: {:f} km".format(np.max(Y.ravel())/1e3 - np.min(Y.ravel())/1e3))
+        rows, cols = Z.shape
+        num_points = rows * cols
+    else:
+        Z = Z[::down_sampling, ::down_sampling]
+        rows, cols = Z.shape
+        num_points = rows * cols
+        x = np.arange(cols) * info['scale_x'] * down_sampling
+        y = np.arange(rows) * info['scale_y'] * down_sampling
+        X, Y = np.meshgrid(x, y)
     
     # ================= 2. 构建所有顶点 (Vertices) =================
     # 顶部顶点：原始的山体高度
@@ -128,12 +153,18 @@ def main():
         metavar="BASE_Z",
         help="Z-coordinate of base layer"
     )
+    parser.add_argument(
+        "--sphere",
+        action="store_true",
+        help="以球面为基准"
+    )
     args = parser.parse_args()
     generate_terrain_solid(
         args.tiff_input,
         args.stl_output,
         down_sampling=args.down_sampling,
-        base_z=args.base_z
+        base_z=args.base_z,
+        sphere=args.sphere
     )
 
 if __name__ == "__main__":

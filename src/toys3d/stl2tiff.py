@@ -92,7 +92,7 @@ def main():
         "-R", "--radius",
         dest="radius",
         type=float,
-        default=3390.0, # Mars mean radius in km
+        default=3390000.0, # Mars mean radius in m
         metavar="RADIUS",
         help="行星半径（单位：千米）"
     )
@@ -102,11 +102,6 @@ def main():
         type=quadrangle_type,
         metavar="QUADRANGLE",
         help="标准分幅（左边经度，右边经度，下边纬度，上边纬度）"
-    )
-    parser.add_argument(
-        "--sphere",
-        action="store_true",
-        help="补偿球面高度"
     )
     parser.add_argument(
         "--flop",

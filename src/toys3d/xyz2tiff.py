@@ -47,7 +47,7 @@ def save_tiff(tiff_output, cdata, info):
         tags.append((65001, 'd', 1, info['radius'], True))
     tifffile.imwrite(
         tiff_output,
-        cdata.astype('float32'),
+        cdata,
         compression='lzw',       # 使用无损的 LZW 压缩
         photometric='minisblack', # 单通道灰度/高程图的标准光度解释
         resolution=dpi_resolution,
