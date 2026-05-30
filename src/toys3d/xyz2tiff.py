@@ -12,6 +12,7 @@ import tifffile
 import cv2
 import gc
 from multiprocessing import Pool, cpu_count
+import argparse
 
 def load_xyz(zip_input, npixels):
     x = np.empty((npixels, npixels), dtype=np.float32)
@@ -30,10 +31,50 @@ def load_xyz(zip_input, npixels):
                 x[j,k], y[j,k], z[j,k] = map(float, xyzlst[k+j*npixels+1].split(' '))
     return x, y, z
 
-if __name__ == '__main__':
-    zip_dir = Path(sys.argv[1])
-    tiff_output = path.join(zip_dir.absolute(), 'dem.tiff')
-    png_output = path.join(zip_dir.absolute(), 'dem_preview.png')
+def save_tiff(tiff_output, cdata, info):
+    dpi_resolution = (1200., 1200.0, 'INCH')
+    tags = []
+    if 'scale_x' in info:
+        pixel_scale = (info['scale_x'], info['scale_y'], 0.0)
+        tags.append((33550, 'd', 3, pixel_scale))
+    if 'ref_x' in info:
+        tie_point = (0.0, 0.0, 0.0, info['ref_x'], info['ref_y'], 0.0)
+        tags.append((33922, 'd', 6, tie_point))
+    if 'corner_coords' in info:
+        corner_coords = info['corner_coords'].flatten()
+        tags.append((65000, 'd', 8, corner_coords.flatten(), True))
+    if 'radius' in info:
+        tags.append((65001, 'd', 1, info['radius'], True))
+    tifffile.imwrite(
+        tiff_output,
+        cdata.astype('float32'),
+        compression='lzw',       # 使用无损的 LZW 压缩
+        photometric='minisblack', # 单通道灰度/高程图的标准光度解释
+        resolution=dpi_resolution,
+        extratags=tags
+    )
+
+def main():
+    parser = argparse.ArgumentParser(description="swisstopo .xyz.zip 文件批量转换 TIFF 图像")
+    parser.add_argument(
+        "zip_dir",
+        type=str,
+        help="需要读取的 .xyz.zip 所在路径"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        dest="tiff_output",
+        type=str,
+        metavar="TIFF_OUTPUT",
+        help="TIFF 图像输出路径"
+    )
+    args = parser.parse_args()
+    zip_dir = Path(args.zip_dir)
+    if args.tiff_output:
+        tiff_output = path.abspath(path.normpath(args.tiff_output))
+    else:
+        tiff_output = path.join(zip_dir.absolute(), 'DEM.tiff')
+    png_output = path.splitext(tiff_output)[0] + '_preview.png'
     zip_list = []
     for file_path in zip_dir.iterdir():
         if file_path.is_file():
@@ -64,11 +105,11 @@ if __name__ == '__main__':
         ymax = max(ymax, np.max(y.ravel()))
     xinc = results[0][0][0,1] - results[0][0][0,0]
     yinc = results[0][1][1,0] - results[0][1][0,0]
-    xdim = xmax - xmin
-    ydim = ymax - ymin
     xpts = int((xmax - xmin)/abs(xinc) + 1.)
     ypts = int((ymax - ymin)/abs(yinc) + 1.)
-    print('full frame: {:f} km x {:f} km ({:d} pixels x {:d} pixels)'.format(xdim/1e3, ydim/1e3, xpts, ypts))
+    print('full frame: {:f} km x {:f} km ({:d} pixels x {:d} pixels)'.format(xpts*abs(xinc)/1e3, ypts*abs(yinc)/1e3, xpts, ypts))
+    print('reference (southwest corner): X = {:f} km, Y = {:f} km to LV95 origin'.format(xmin/1e3, ymin/1e3))
+    print('pixel scale: dx = {:f} m, dy = {:f} m'.format(xinc, yinc))
     xfull = np.empty((ypts, xpts), dtype=np.float32)
     yfull = np.empty_like(xfull)
     zfull = np.empty_like(xfull)
@@ -86,37 +127,17 @@ if __name__ == '__main__':
         zfull[ridx*npixels:(ridx+1)*npixels, cidx*npixels:(cidx+1)*npixels] = results[i][2][:,:]
     del results
     gc.collect()
-    
-    # 2. 定义普通的物理分辨率（例如打印用的 DPI 或物理尺寸）
-    # 格式：(X_res, Y_res, 'UNIT')，单位可选 'INCH' 或 'CENTIMETER'
-    dpi_resolution = (1200., 1200.0, 'INCH')
-    
-    # 3. 定义 GeoTIFF 的核心空间标签 (参考点与像素比例)
-    # 像素比例：X方向每像素 0.5m，Y方向每像素 0.5m
-    pixel_scale = (abs(xinc), abs(yinc), 0.0) 
-    
-    # 参考点(Tie Point)：[I, J, K, X, Y, Z]
-    # 意思是把图像的第 0 行, 0 列像素，锚定到真实地理坐标 X=600000, Y=200000
-    tie_point = (0.0, 0.0, 0.0, xfull[0,0], yfull[0,0], 0.0)
-    
-    # 4. 写入文件
-    tifffile.imwrite(
-        tiff_output,
-        zfull,
-        compression='lzw',       # 使用无损的 LZW 压缩
-        photometric='minisblack', # 单通道灰度/高程图的标准光度解释
-        resolution=dpi_resolution,
-        extratags=[
-            # 语法: (Tag ID, 数据类型, 元素数量, 值)
-            # 'd' 代表 double (双精度浮点数)
-            (33550, 'd', 3, pixel_scale), 
-            (33922, 'd', 6, tie_point)
-        ]
-    )
+    save_tiff(tiff_output, zfull, {
+        'scale_x': xinc,
+        'scale_y': yinc,
+        'ref_x': xfull[0,0],
+        'ref_y': yfull[0,0]})
     print(f"{tiff_output} saved.")
-    
     cv2.imwrite(
         png_output,
         (((zfull-zfull.min()) / (zfull.max()-zfull.min())) * 65535.).astype(np.uint16),
         [cv2.IMWRITE_PNG_COMPRESSION, 1])
     print(f"{png_output} saved.")
+    
+if __name__ == '__main__':
+    main()

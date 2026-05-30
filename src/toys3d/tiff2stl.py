@@ -4,7 +4,8 @@ import numpy as np
 import trimesh
 import sys
 import os
-from showtiff import load_tifffile
+from showtiff import load_tiff
+import argparse
 
 def generate_terrain_solid(tiff_input, stl_output, down_sampling=1, base_z=-1.0):
     """
@@ -16,7 +17,7 @@ def generate_terrain_solid(tiff_input, stl_output, down_sampling=1, base_z=-1.0)
     :param base_z: 挤出底座的绝对 Z 坐标 (必须小于高度场的最小值)
     :param out_file: 导出的 STL 文件名
     """
-    Z, info = load_tifffile(tiff_input)
+    Z, info = load_tiff(tiff_input)
     Z = Z[::down_sampling, ::down_sampling]
     rows, cols = Z.shape
     num_points = rows * cols
@@ -99,11 +100,41 @@ def generate_terrain_solid(tiff_input, stl_output, down_sampling=1, base_z=-1.0)
     else:
         print("❌ 警告：生成的网格存在开放边缘 (Open Edges)，请检查逻辑。")
 
-# ================= 运行示例 =================
-if __name__ == "__main__":
-    generate_terrain_solid(
-        os.path.abspath(os.path.normpath(sys.argv[1])),
-        os.path.abspath(os.path.normpath(sys.argv[2])),
-        down_sampling=int(eval(sys.argv[3])),
-        base_z=float(eval(sys.argv[4]))
+def main():
+    parser = argparse.ArgumentParser(description="TIFF转STL参数解析")
+    parser.add_argument(
+        "tiff_input",
+        type=str,
+        help="需要处理的输入TIFF图像文件路径"
     )
+    parser.add_argument(
+        "stl_output",
+        type=str,
+        help="需要处理的输入TIFF图像文件路径"
+    )
+    parser.add_argument(
+        "-d", "--down_sampling",
+        dest="down_sampling",
+        default=10,
+        type=int,
+        metavar="DOWN_SAMPLING",
+        help="Down-sampling step size"
+    )
+    parser.add_argument(
+        "-b", "--base_z",
+        dest="base_z",
+        type=float,
+        default=0.0,
+        metavar="BASE_Z",
+        help="Z-coordinate of base layer"
+    )
+    args = parser.parse_args()
+    generate_terrain_solid(
+        args.tiff_input,
+        args.stl_output,
+        down_sampling=args.down_sampling,
+        base_z=args.base_z
+    )
+
+if __name__ == "__main__":
+    main()
