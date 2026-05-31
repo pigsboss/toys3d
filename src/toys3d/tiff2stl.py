@@ -8,7 +8,7 @@ from showtiff import load_tiff
 import argparse
 from scipy.interpolate import griddata
 
-def sphere_height(Z, quadrangle, radius, verbose=False):
+def sphere_height(Z, quadrangle, radius, barrel=False, verbose=False):
     # 1. 找到标准分幅中心子午线，确定与中心子午面正交的子午面，作为测高基准
     lon_W, lon_E, lat_S, lat_N = quadrangle
     lon_C = 0.5 * (lon_W + lon_E)
@@ -33,16 +33,39 @@ def sphere_height(Z, quadrangle, radius, verbose=False):
         print("  正交子午面投影初始横向跨度：{:f} km (min) -- {:f} km (max)".format(xmin/1e3, xmax/1e3))
         print("  正交子午面投影初始纵向跨度：{:f} km (min) -- {:f} km (max)".format(ymin/1e3, ymax/1e3))
     # 2. 确定初始格点在正交子午面的投影范围，重新划分规则、边缘整齐的网格
-    x_W = np.max(x[:, 0])
-    x_E = np.min(x[:,-1])
-    y_S = np.max(y[ 0,:])
-    y_N = np.min(y[-1,:])
-    u = np.linspace(x_W, x_E, ncols)
-    v = np.linspace(y_S, y_N, nrows)
-    grid_x, grid_y = np.meshgrid(u, v)
-    if verbose:
-        print("  正交子午面最大矩形包络：{:f} km (W) -- {:f} km (E), {:f} km (S) -- {:f} km (N)".format(x_W/1e3, x_E/1e3, y_S/1e3, y_N/1e3))
-        print("  正交子午面优化网格差值...")
+    if barrel:
+        print("  正交子午面重采样使用桶形包络")
+        lon_W = np.arcsin(x[:, 0]/radius/np.cos(Lat[:, 0]))
+        lon_E = np.arcsin(x[:,-1]/radius/np.cos(Lat[:,-1]))
+        lat_S = np.arcsin(y[ 0,:]/radius)
+        lat_N = np.arcsin(y[-1,:]/radius)
+        if verbose:
+            print("  正交子午面西侧边界：{:f} deg (min) -- {:f} deg (max)".format(np.rad2deg(np.min(lon_W)), np.rad2deg(np.max(lon_W))))
+            print("  正交子午面东侧边界：{:f} deg (min) -- {:f} deg (max)".format(np.rad2deg(np.min(lon_E)), np.rad2deg(np.max(lon_E))))
+            print("  正交子午面南侧边界：{:f} deg (min) -- {:f} deg (max)".format(np.rad2deg(np.min(lat_S)), np.rad2deg(np.max(lat_S))))
+            print("  正交子午面北侧边界：{:f} deg (min) -- {:f} deg (max)".format(np.rad2deg(np.min(lat_N)), np.rad2deg(np.max(lat_N))))
+        lon_M = min(abs(np.max(lon_W)), abs(np.min(lon_E)))
+        lat_M = min(abs(np.max(lat_S)), abs(np.min(lat_N)))
+        u = np.linspace(-lon_M, lon_M, ncols)
+        v = np.linspace(-lat_M, lat_M, nrows)
+        grid_u, grid_v = np.meshgrid(u, v)
+        grid_x = radius * np.cos(grid_v) * np.sin(grid_u)
+        grid_y = radius * np.sin(grid_v)
+        if verbose:
+            print("  正交子午面最大桶形包络：{:f} deg (W) -- {:f} deg (E), {:f} deg (S) -- {:f} deg (N)".format(
+                -np.rad2deg(lon_M), np.rad2deg(lon_M), -np.rad2deg(lat_M), np.rad2deg(lat_M)))
+            print("  正交子午面优化网格插值...")
+    else:
+        x_W = np.max(x[:, 0])
+        x_E = np.min(x[:,-1])
+        y_S = np.max(y[ 0,:])
+        y_N = np.min(y[-1,:])
+        u = np.linspace(x_W, x_E, ncols)
+        v = np.linspace(y_S, y_N, nrows)
+        grid_x, grid_y = np.meshgrid(u, v)
+        if verbose:
+            print("  正交子午面最大矩形包络：{:f} km (W) -- {:f} km (E), {:f} km (S) -- {:f} km (N)".format(x_W/1e3, x_E/1e3, y_S/1e3, y_N/1e3))
+            print("  正交子午面优化网格插值...")
     H = griddata(np.column_stack((x.ravel(), y.ravel())), h.ravel(), (grid_x, grid_y), method='linear')
     assert not np.any(np.isnan(H)), "插值越界！"
     if verbose:
@@ -51,7 +74,7 @@ def sphere_height(Z, quadrangle, radius, verbose=False):
         print("  正交子午面投影重采样纵向跨度：{:f} km (min) -- {:f} km (max)".format(np.min(grid_y.ravel())/1e3, np.max(grid_y.ravel())/1e3))
     return H, grid_x, grid_y
 
-def generate_terrain_solid(tiff_input, stl_output, down_sampling=1, base_z=-1.0, sphere=False, verbose=False):
+def generate_terrain_solid(tiff_input, stl_output, down_sampling=1, base_z=-1.0, sphere=False, barrel=False, verbose=False):
     """
     将二维高度场向下挤出并封底，生成水密实体 STL
     
@@ -70,7 +93,7 @@ def generate_terrain_solid(tiff_input, stl_output, down_sampling=1, base_z=-1.0,
         lon_E = info['corner_coords'][1][0]
         lat_S = info['corner_coords'][2][1]
         lat_N = info['corner_coords'][0][1]
-        Z, X, Y = sphere_height(Z, (lon_W, lon_E, lat_S, lat_N), info['radius'], verbose=verbose)
+        Z, X, Y = sphere_height(Z, (lon_W, lon_E, lat_S, lat_N), info['radius'], barrel=barrel, verbose=verbose)
         Z = Z[::down_sampling, ::down_sampling]
         X = X[::down_sampling, ::down_sampling]
         Y = Y[::down_sampling, ::down_sampling]
@@ -196,6 +219,11 @@ def main():
         help="以球面为基准"
     )
     parser.add_argument(
+        "--barrel",
+        action="store_true",
+        help="正交子午面重采样使用桶形包络（而非矩形包络）"
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="增加调试消息输出"
@@ -207,6 +235,7 @@ def main():
         down_sampling=args.down_sampling,
         base_z=args.base_z,
         sphere=args.sphere,
+        barrel=args.barrel,
         verbose=args.verbose
     )
 
