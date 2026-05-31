@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 def load_top_mesh(stl_path):
     print(f"正在加载 STL 模型: {stl_path} ...")
     mesh = trimesh.load_mesh(stl_path)
+    print("模型数据格式：{}".format(mesh.vertices.dtype))
     norm = mesh.face_normals
     tidx = np.where(norm[:, 2] > 1e-6)[0]
     tmesh = mesh.submesh([tidx], append=True)
@@ -123,7 +124,7 @@ def main():
     )
     args = parser.parse_args()
     vertices = load_top_mesh(os.path.abspath(os.path.normpath(args.stl_input)))
-    gridz, info = mesh_to_dem(vertices, args.voxel_size, args.resolution)
+    gridz, info = mesh_to_dem(vertices.astype('float64'), args.voxel_size, args.resolution)
     if args.quadrangle:
         lon_W, lon_E, lat_S, lat_N = args.quadrangle
         info['corner_coords'] = np.array([
