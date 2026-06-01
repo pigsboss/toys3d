@@ -20,8 +20,6 @@ CLASSES = {
     "Bridge_piers": [27]      # 27: 桥墩
 }
 
-# ================= 辅助函数 =================
-
 def extract_pcd_by_class(las, class_codes):
     """根据分类码提取点云，并转换为 Open3D 格式"""
     mask = np.isin(las.classification[::10], class_codes)

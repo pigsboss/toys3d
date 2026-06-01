@@ -51,10 +51,15 @@ def sphere_height(Z, quadrangle, radius, barrel=False, verbose=False):
         grid_u, grid_v = np.meshgrid(u, v)
         grid_x = radius * np.cos(grid_v) * np.sin(grid_u)
         grid_y = radius * np.sin(grid_v)
+        assert np.all(grid_u[:, 0]>=Lon[:, 0])
+        assert np.all(grid_u[:,-1]<=Lon[:,-1])
+        assert np.all(grid_v[ 0,:]>=Lat[ 0,:])
+        assert np.all(grid_v[-1,:]<=Lat[-1,:])
         if verbose:
             print("  正交子午面最大桶形包络：{:f} deg (W) -- {:f} deg (E), {:f} deg (S) -- {:f} deg (N)".format(
                 -np.rad2deg(lon_M), np.rad2deg(lon_M), -np.rad2deg(lat_M), np.rad2deg(lat_M)))
             print("  正交子午面优化网格插值...")
+        H = griddata(np.column_stack((Lon.ravel(), Lat.ravel())), h.ravel(), (grid_u, grid_v), method='linear')
     else:
         x_W = np.max(x[:, 0])
         x_E = np.min(x[:,-1])
@@ -66,7 +71,7 @@ def sphere_height(Z, quadrangle, radius, barrel=False, verbose=False):
         if verbose:
             print("  正交子午面最大矩形包络：{:f} km (W) -- {:f} km (E), {:f} km (S) -- {:f} km (N)".format(x_W/1e3, x_E/1e3, y_S/1e3, y_N/1e3))
             print("  正交子午面优化网格插值...")
-    H = griddata(np.column_stack((x.ravel(), y.ravel())), h.ravel(), (grid_x, grid_y), method='linear')
+        H = griddata(np.column_stack((x.ravel(), y.ravel())), h.ravel(), (grid_x, grid_y), method='linear')
     assert not np.any(np.isnan(H)), "插值越界！"
     if verbose:
         print("  正交子午面基准重采样高度范围：{:f} km (min) -- {:f} km (max)".format(np.min(H.ravel())/1e3, np.max(H.ravel())/1e3))

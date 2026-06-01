@@ -146,11 +146,13 @@ def main():
         print("垂直翻转图像")
         gridz[:,:] = gridz[::-1,:]
     else:
-        print("垂直保持原状")
+        print("高度保持原状")
     if args.exaggerate:
-        print("垂直夸张系数：{:f}".format(args.exaggerate))
-        base_z = np.min(gridz.ravel())
-        gridz = (gridz-base_z) * args.exaggerate + base_z
+        print("高度夸张系数：{:f}".format(args.exaggerate))
+        print("  原始高度范围：{:f} (min) -- {:f} (max)".format(np.min(gridz.ravel()), np.max(gridz.ravel())))
+        mean_z = np.mean(gridz.ravel())
+        gridz = (gridz-mean_z) * args.exaggerate + mean_z
+        print("  当前高度范围：{:f} (min) -- {:f} (max)".format(np.min(gridz.ravel()), np.max(gridz.ravel())))
     if args.tiff_output:
         tiff_path = os.path.abspath(os.path.normpath(args.tiff_output))
         print(f"正在保存 DEM 至: {tiff_path} ...")
