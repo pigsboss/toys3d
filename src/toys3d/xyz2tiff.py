@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 """xyz2tiff.py Load and convert swisstopo .xyz.zip files (e.g., swissALTIregio, swissALTI3D) to TIFF.
 """
-
 import zipfile
 import sys
 from os import path
@@ -48,33 +47,13 @@ def save_tiff(tiff_output, cdata, info):
     tifffile.imwrite(
         tiff_output,
         cdata,
-        compression='lzw',       # 使用无损的 LZW 压缩
-        photometric='minisblack', # 单通道灰度/高程图的标准光度解释
+        compression='lzw',
+        photometric='minisblack',
         resolution=dpi_resolution,
         extratags=tags
     )
 
-def main():
-    parser = argparse.ArgumentParser(description="swisstopo .xyz.zip 文件批量转换 TIFF 图像")
-    parser.add_argument(
-        "zip_dir",
-        type=str,
-        help="需要读取的 .xyz.zip 所在路径"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        dest="tiff_output",
-        type=str,
-        metavar="TIFF_OUTPUT",
-        help="TIFF 图像输出路径"
-    )
-    args = parser.parse_args()
-    zip_dir = Path(args.zip_dir)
-    if args.tiff_output:
-        tiff_output = path.abspath(path.normpath(args.tiff_output))
-    else:
-        tiff_output = path.join(zip_dir.absolute(), 'DEM.tiff')
-    png_output = path.splitext(tiff_output)[0] + '_preview.png'
+def map_xyz(zip_dir):
     zip_list = []
     for file_path in zip_dir.iterdir():
         if file_path.is_file():
@@ -110,7 +89,7 @@ def main():
     print('full frame: {:f} km x {:f} km ({:d} pixels x {:d} pixels)'.format(xpts*abs(xinc)/1e3, ypts*abs(yinc)/1e3, xpts, ypts))
     print('reference (southwest corner): X = {:f} km, Y = {:f} km to LV95 origin'.format(xmin/1e3, ymin/1e3))
     print('pixel scale: dx = {:f} m, dy = {:f} m'.format(xinc, yinc))
-    xfull = np.empty((ypts, xpts), dtype=np.float32)
+    xfull = np.empty((ypts, xpts), dtype=np.float64)
     yfull = np.empty_like(xfull)
     zfull = np.empty_like(xfull)
     for i in range(nframes):
@@ -127,17 +106,42 @@ def main():
         zfull[ridx*npixels:(ridx+1)*npixels, cidx*npixels:(cidx+1)*npixels] = results[i][2][:,:]
     del results
     gc.collect()
-    save_tiff(tiff_output, zfull, {
-        'scale_x': xinc,
-        'scale_y': yinc,
-        'ref_x': xfull[0,0],
-        'ref_y': yfull[0,0]})
+    info = {'scale_x': xinc,
+            'scale_y': yinc,
+            'ref_x': xfull[0,0],
+            'ref_y': yfull[0,0]
+            }
+    return zfull, info
+
+def main():
+    parser = argparse.ArgumentParser(description="swisstopo .xyz.zip 文件批量转换 TIFF 图像")
+    parser.add_argument(
+        "zip_dir",
+        type=str,
+        help="需要读取的 .xyz.zip 所在路径"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        dest="tiff_output",
+        type=str,
+        metavar="TIFF_OUTPUT",
+        help="TIFF 图像输出路径"
+    )
+    args = parser.parse_args()
+    zip_dir = Path(args.zip_dir)
+    zfull, info = map_xyz(zip_dir)
+    if args.tiff_output:
+        tiff_output = path.abspath(path.normpath(args.tiff_output))
+    else:
+        tiff_output = path.join(zip_dir.absolute(), 'DEM.tiff')
+    png_output = path.splitext(tiff_output)[0] + '_preview.png'
+    save_tiff(tiff_output, zfull, info)
     print(f"{tiff_output} saved.")
     cv2.imwrite(
         png_output,
         (((zfull-zfull.min()) / (zfull.max()-zfull.min())) * 65535.).astype(np.uint16),
         [cv2.IMWRITE_PNG_COMPRESSION, 1])
     print(f"{png_output} saved.")
-    
+
 if __name__ == '__main__':
     main()
