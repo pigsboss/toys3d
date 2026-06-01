@@ -4,14 +4,20 @@ import laspy
 import open3d as o3d
 import numpy as np
 import os
+import argparse
 
 # swissSURFACE3D (ASPRS标准) 分类码C
 CLASSES = {
-    "Terrain": [2],                 # 2: 地面
-    "Vegetation": [3, 4, 5],        # 3,4,5: 低/中/高植被
-    "Buildings": [6],               # 6: 建筑物
-    "Water": [9],                   # 9: 水体
-    "Bridges_Docks": [17, 26]       # 17: 桥梁, 26: 可能是码头/其他人造结构(需核对具体元数据)
+    "Unclassified": [1],      #  1: 未分类
+    "Terrain": [2],           #  2: 地面
+    "Vegetation": [3, 4, 5],  #  3,4,5: 低/中/高植被
+    "Buildings": [6],         #  6: 建筑物
+    "Water": [9],             #  9: 水体
+    "Wire": [14],             # 14: 电线
+    "Masts": [15],            # 15: 塔架
+    "Bridge_Deck": [17],      # 17: 桥面
+    "Building_facades": [26], # 26: 建筑物外立面
+    "Bridge_piers": [27]      # 27: 桥墩
 }
 
 # ================= 辅助函数 =================
