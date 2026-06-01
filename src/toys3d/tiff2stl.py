@@ -51,7 +51,7 @@ def sphere_height(Z, quadrangle, radius, barrel=False, verbose=False):
         grid_u, grid_v = np.meshgrid(u, v)
         grid_x = radius * np.cos(grid_v) * np.sin(grid_u)
         grid_y = radius * np.sin(grid_v)
-        assert np.all(grid_u[:, 0]>=Lon[:, 0])
+        assert np.all(grid_u[:, 0]>=Lon[:, 0]), "{:f}".format(np.min(np.rad2deg(grid_u[:, 0])))
         assert np.all(grid_u[:,-1]<=Lon[:,-1])
         assert np.all(grid_v[ 0,:]>=Lat[ 0,:])
         assert np.all(grid_v[-1,:]<=Lat[-1,:])
