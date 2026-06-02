@@ -124,7 +124,7 @@ def main():
     )
     args = parser.parse_args()
     vertices = load_top_mesh(os.path.abspath(os.path.normpath(args.stl_input)))
-    gridz, info = mesh_to_dem(vertices.astype('float64'), args.voxel_size, args.resolution)
+    grid_z, info = mesh_to_dem(vertices.astype('float64'), args.voxel_size, args.resolution)
     if args.quadrangle:
         lon_W, lon_E, lat_S, lat_N = args.quadrangle
         info['corner_coords'] = np.array([
@@ -139,28 +139,28 @@ def main():
         print("包含行星平均半径")
     if args.flop:
         print("水平翻转图像")
-        gridz[:,:] = gridz[:,::-1]
+        grid_z[:,:] = grid_z[:,::-1]
     else:
         print("水平保持原状")
     if args.flip:
         print("垂直翻转图像")
-        gridz[:,:] = gridz[::-1,:]
+        grid_z[:,:] = grid_z[::-1,:]
     else:
         print("高度保持原状")
     if args.exaggerate:
         print("高度夸张系数：{:f}".format(args.exaggerate))
-        print("  原始高度范围：{:f} (min) -- {:f} (max)".format(np.min(gridz.ravel()), np.max(gridz.ravel())))
-        mean_z = np.mean(gridz.ravel())
-        gridz = (gridz-mean_z) * args.exaggerate + mean_z
-        print("  当前高度范围：{:f} (min) -- {:f} (max)".format(np.min(gridz.ravel()), np.max(gridz.ravel())))
+        print("  原始高度范围：{:f} (min) -- {:f} (max)".format(np.min(grid_z.ravel()), np.max(grid_z.ravel())))
+        mean_z = np.mean(grid_z.ravel())
+        grid_z = (grid_z-mean_z) * args.exaggerate + mean_z
+        print("  当前高度范围：{:f} (min) -- {:f} (max)".format(np.min(grid_z.ravel()), np.max(grid_z.ravel())))
     if args.tiff_output:
         tiff_path = os.path.abspath(os.path.normpath(args.tiff_output))
         print(f"正在保存 DEM 至: {tiff_path} ...")
-        save_tiff(tiff_path, gridz, info)
+        save_tiff(tiff_path, grid_z, info)
         print("✅ 转换完成！")
     else:
         print("显示高度图...")
-        plt.imshow(gridz)
+        plt.imshow(grid_z)
         plt.show
 
 if __name__ == "__main__":

@@ -51,10 +51,10 @@ def sphere_height(Z, quadrangle, radius, barrel=False, verbose=False):
         grid_u, grid_v = np.meshgrid(u, v)
         grid_x = radius * np.cos(grid_v) * np.sin(grid_u)
         grid_y = radius * np.sin(grid_v)
-        assert np.all(grid_u[:, 0]>=Lon[:, 0]), "{:f}".format(np.min(np.rad2deg(grid_u[:, 0])))
-        assert np.all(grid_u[:,-1]<=Lon[:,-1])
-        assert np.all(grid_v[ 0,:]>=Lat[ 0,:])
-        assert np.all(grid_v[-1,:]<=Lat[-1,:])
+        assert np.all(grid_x[:, 0] >= x[:, 0]), "{}".format(np.where(grid_u[:, 0] < x[:, 0]))
+        assert np.all(grid_x[:,-1] <= x[:,-1])
+        assert np.all(grid_y[ 0,:] >= y[ 0,:])
+        assert np.all(grid_y[-1,:] <= y[-1,:])
         if verbose:
             print("  正交子午面最大桶形包络：{:f} deg (W) -- {:f} deg (E), {:f} deg (S) -- {:f} deg (N)".format(
                 -np.rad2deg(lon_M), np.rad2deg(lon_M), -np.rad2deg(lat_M), np.rad2deg(lat_M)))
