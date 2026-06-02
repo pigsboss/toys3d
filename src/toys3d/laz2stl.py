@@ -5,20 +5,7 @@ import open3d as o3d
 import numpy as np
 import os
 import argparse
-
-# swissSURFACE3D (ASPRS标准) 分类码C
-CLASSES = {
-    "Unclassified": [1],      #  1: 未分类
-    "Terrain": [2],           #  2: 地面
-    "Vegetation": [3, 4, 5],  #  3,4,5: 低/中/高植被
-    "Buildings": [6],         #  6: 建筑物
-    "Water": [9],             #  9: 水体
-    "Wire": [14],             # 14: 电线
-    "Masts": [15],            # 15: 塔架
-    "Bridge_Deck": [17],      # 17: 桥面
-    "Building_facades": [26], # 26: 建筑物外立面
-    "Bridge_piers": [27]      # 27: 桥墩
-}
+from laz2tiff import CLASSES
 
 def extract_pcd_by_class(las, class_codes):
     """根据分类码提取点云，并转换为 Open3D 格式"""
