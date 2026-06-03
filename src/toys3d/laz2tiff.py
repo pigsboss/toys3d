@@ -20,6 +20,9 @@ CLASSES = {
     "Bridge_piers": [27]      # 27: 桥墩
 }
 
+laz_xdim = 100000  # LAZ x-axis dimension in cm
+laz_ydim = 100000  # LAZ y-axis dimension in cm
+
 def basename_without_all_extensions(path):
     basename = os.path.basename(path)  # 仅文件名部分，不含路径
     while True:
@@ -28,7 +31,22 @@ def basename_without_all_extensions(path):
             break
     return basename
 
-def rasterize_laz(laz_data):
+def build_meshgrid(laz_data, resolution):
+    info = {
+        'ref_x': laz_data.X.min() / 100.,
+        'ref_y': laz_data.Y.min() / 100.,
+        'scale_x': resolution,
+        'scale_y': resolution
+    }
+    return info
+
+def xy2pixel(x, y, info):
+    row = np.int32((y-info['ref_y'])/info['scale_y'])
+    col = np.int32((x-info['ref_x'])/info['scale_x'])
+    pid = np.int32(row*laz_xdmin/100./info['scale_x'])
+    return row, col, pid
+
+def rasterize_laz(laz_data, class_ids):
     pass
 
 def main():
@@ -86,5 +104,8 @@ def main():
         laz_data = laz.read()
     print(args.classes)
     print(tiff_output)
+    info = build_meshgrid(laz_data, args.resolution)
+    print(info)
+
 if __name__=='__main__':
     main()
