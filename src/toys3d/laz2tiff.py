@@ -92,7 +92,7 @@ def main():
         dest="classes",
         nargs="+",
         type=int,
-        default=[2,3,4,5,6,9],
+        default=[1,2,3,4,5,6,9,14,15,17,26,27], # all classes
         metavar="CLASSES",
         help="提取地物种类"
     )
@@ -150,7 +150,12 @@ def main():
         (33922, 'd', 6, (0.0, 0.0, 0.0, grid_info['ref_x'], grid_info['ref_y'], 0.0), True)]
     with tifffile.TiffWriter(tiff_output) as tif:
         for class_name in CLASSES:
-            class_ids = CLASSES[class_name]
+            class_ids = []
+            for i in CLASSES[class_name]:
+                if i in args.classes:
+                    class_ids.append(i)
+            if not class_ids:
+                continue
             counts, height, intensity = rasterize_laz(laz_data, grid_info, class_ids, args.verbose)
             if args.inpaint:
                 if class_name.lower() == 'terrain':

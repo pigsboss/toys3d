@@ -1,4 +1,8 @@
 #!/usr/bin/env python
+"""tiff2stl.py
+将闭合、光滑曲面向下挤出为几何体。例如，将山脉等自然地貌的测高数据网格，转换为可用于 3D 打印切片软件的 STL 文件。
+
+"""
 import tifffile
 import numpy as np
 import trimesh
@@ -187,7 +191,7 @@ def generate_terrain_solid(tiff_input, stl_output, down_sampling=1, base_z=-1.0,
         print("❌ 警告：生成的网格存在开放边缘 (Open Edges)，请检查逻辑。")
 
 def main():
-    parser = argparse.ArgumentParser(description="TIFF转STL参数解析")
+    parser = argparse.ArgumentParser(description="数字测高模型转几何体。输入：TIFF 格式的数字测高模型（DEM）；输出：STL 格式的几何体，可用于 3D 打印切片软件。")
     parser.add_argument(
         "tiff_input",
         type=str,
