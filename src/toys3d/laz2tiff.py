@@ -5,6 +5,11 @@ import argparse
 import numpy as np
 import cv2
 import os
+import ast
+import reverse_geocoder as rg
+import zipfile
+from showtiff import convert_swiss_xyz_to_wgs84
+from skimage.restoration import inpaint_biharmonic
 
 # swissSURFACE3D (ASPRS标准) 分类码C
 CLASSES = {
@@ -24,33 +29,43 @@ laz_xdim = 100000  # LAZ x-axis dimension in cm
 laz_ydim = 100000  # LAZ y-axis dimension in cm
 
 def basename_without_all_extensions(path):
-    basename = os.path.basename(path)  # 仅文件名部分，不含路径
+    basename = os.path.basename(path)
     while True:
         basename, ext = os.path.splitext(basename)
-        if not ext:          # 没有扩展名了
+        if not ext:
             break
     return basename
 
 def build_meshgrid(laz_data, resolution):
-    info = {
-        'ref_x': laz_data.X.min() / 100.,
-        'ref_y': laz_data.Y.min() / 100.,
+    grid_info = {
+        'ref_x': np.floor(np.min(laz_data.xyz[:, 0])/resolution)*resolution,
+        'ref_y': np.floor(np.min(laz_data.xyz[:, 1])/resolution)*resolution,
         'scale_x': resolution,
         'scale_y': resolution
     }
-    return info
+    return grid_info
 
 def xy2pixel(x, y, info):
     row = np.int32((y-info['ref_y'])/info['scale_y'])
     col = np.int32((x-info['ref_x'])/info['scale_x'])
-    pid = np.int32(row*laz_xdmin/100./info['scale_x'])
+    pid = np.int32(row*laz_xdim/100./info['scale_x']+col)
     return row, col, pid
 
-def rasterize_laz(laz_data, class_ids):
-    pass
+def rasterize_laz(laz_data, grid_info, class_ids, verbose=False):
+    mask = np.isin(laz_data.classification, class_ids)
+    if verbose:
+        print("  Class IDs {}: {:d} points".format(class_ids, np.sum(mask)))
+    row, col, pid = xy2pixel(laz_data.xyz[mask, 0], laz_data.xyz[mask, 1], grid_info)
+    ncols = int(laz_xdim/100./grid_info['scale_x'])
+    nrows = int(laz_ydim/100./grid_info['scale_y'])
+    pixels = nrows * ncols
+    counts = np.bincount(pid, minlength=pixels).reshape((nrows, ncols)).astype('float64')
+    height = np.bincount(pid, weights=laz_data.xyz[mask, 2], minlength=pixels).reshape((nrows, ncols)) / np.clip(counts, 1.0, None)
+    intensity = np.bincount(pid, weights=laz_data.intensity[mask], minlength=pixels).reshape((nrows, ncols)) / np.clip(counts, 1.0, None)
+    return counts, height, intensity
 
 def main():
-    parser = argparse.ArgumentParser(description="LAZ 激光测高点云文件转换 TIFF 图像")
+    parser = argparse.ArgumentParser(description="LAZ/LAS 激光测高点云文件转换 TIFF 图像")
     parser.add_argument(
         "laz_input",
         type=str,
@@ -91,6 +106,16 @@ def main():
         action="store_true",
         help="输出详细调试信息"
     )
+    parser.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="静默运行"
+    )
+    parser.add_argument(
+        "-i", "--inpaint",
+        action="store_true",
+        help="填充地物缺失像素"
+    )
     args = parser.parse_args()
     laz_input = os.path.abspath(os.path.normpath(args.laz_input))
     if args.tiff_output:
@@ -100,12 +125,116 @@ def main():
             os.path.join(
                 os.path.dirname(laz_input),
                 basename_without_all_extensions(laz_input) + '.tiff')))
-    with laspy.open(laz_input) as laz:
-        laz_data = laz.read()
-    print(args.classes)
-    print(tiff_output)
-    info = build_meshgrid(laz_data, args.resolution)
-    print(info)
+    if laz_input.lower().endswith('.laz'):
+        with laspy.open(laz_input) as laz:
+            laz_data = laz.read()
+    elif laz_input.lower().endswith('.las.zip'):
+        with zipfile.ZipFile(laz_input, 'r') as zf:
+            all_files = zf.namelist()
+            assert all_files[0].lower().endswith('.las')
+            laz_data = laspy.read(zf.read(all_files[0]))
+    else:
+        raise TypeError('{} is not supported.')
+    if not args.quiet:
+        print("LAZ data read from {}".format(laz_input))
+    grid_info = build_meshgrid(laz_data, args.resolution)
+    if args.verbose:
+        lon, lat = convert_swiss_xyz_to_wgs84(grid_info['ref_x']+laz_xdim/100., grid_info['ref_y']+laz_ydim/100.)
+        print("  Reference [0,0]: X = {} m, Y = {} m".format(grid_info["ref_x"], grid_info["ref_y"]))
+        print("  Center: LON = {}, LAT = {}".format(lon, lat))
+        results = rg.search((lat, lon))
+        for res in results:
+            print("  Country: {}, City: {}, Province: {}".format(res["cc"], res["name"], res["admin1"]))
+    tags = [
+        (33550, 'd', 3, (grid_info['scale_x'], grid_info['scale_y'], 0.0), True),
+        (33922, 'd', 6, (0.0, 0.0, 0.0, grid_info['ref_x'], grid_info['ref_y'], 0.0), True)]
+    with tifffile.TiffWriter(tiff_output) as tif:
+        for class_name in CLASSES:
+            class_ids = CLASSES[class_name]
+            counts, height, intensity = rasterize_laz(laz_data, grid_info, class_ids, args.verbose)
+            if args.inpaint:
+                if class_name.lower() == 'terrain':
+                    if args.verbose:
+                        print("  Terrain map inpainting...")
+                    mask = np.uint8(counts==0) # terrain missing pixels
+                    height[:] = inpaint_biharmonic(height, mask)
+                    intensity[:] = inpaint_biharmonic(intensity, mask)
+                elif class_name.lower() == 'water':
+                    if args.verbose:
+                        print("  Water map inpainting...")
+                    nowater = np.uint8(counts==0) # water missing pixels
+                    # 背景：有测量值的区域；前景：无测量值的区域。
+                    # 图像分割之后，有测量值的区域标签为0，无测量值的区域标签从1开始。
+                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(nowater, 8, cv2.CV_32S)
+                    mask = np.zeros(nowater.shape, dtype='uint8')
+                    for i in range(1, num_labels):
+                        if args.verbose:
+                            print("  Water map missing component {}: X={}, Y={}, Width={}, Height={}, Area={}, Centroid=({}, {})".format(
+                                i, stats[i,0], stats[i,1], stats[i,2], stats[i,3], stats[i,4], centroids[i,0], centroids[i,1]))
+                        if stats[i,2]<3 or stats[i,3]<3:
+                            mask = np.logical_or(mask, labels==i)
+                            if args.verbose:
+                                print("  Add component {} to inpainting list".format(i))
+                    height[:] = inpaint_biharmonic(height, mask)
+                    intensity[:] = inpaint_biharmonic(intensity, mask)
+            tif.write(
+                counts.astype('uint16'),
+                compression='lzw',
+                photometric='minisblack',
+                metadata={
+                    'class_name':class_name,
+                    'class_ids':class_ids,
+                    'data':'counts'},
+                extratags=tags
+            )
+            if not args.quiet:
+                print("  {}:{} counts saved to {}".format(class_name, class_ids, tiff_output))
+            tif.write(
+                height,
+                compression='lzw',
+                photometric='minisblack',
+                metadata={
+                    'class_name':class_name,
+                    'class_ids':class_ids,
+                    'data':'height'},
+                extratags=tags
+            )
+            if not args.quiet:
+                print("  {}:{} height saved to {}".format(class_name, class_ids, tiff_output))
+            tif.write(
+                intensity,
+                compression='lzw',
+                photometric='minisblack',
+                metadata={
+                    'class_name':class_name,
+                    'class_ids':class_ids,
+                    'data':'intensity'},
+                extratags=tags
+            )
+            if not args.quiet:
+                print("  {}:{} intensity saved to {}".format(class_name, class_ids, tiff_output))
+            if args.png_output:
+                png_output = os.path.splitext(tiff_output)[0]+'_{}'.format(class_name)+'_counts.png'
+                cv2.imwrite(
+                    png_output,
+                    (((counts - counts.min()) / max(1, counts.max() - counts.min())) * 65535.).astype(np.uint16),
+                    [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                if not args.quiet:
+                    print("  {} saved.".format(png_output))
+                png_output = os.path.splitext(tiff_output)[0]+'_{}'.format(class_name)+'_height.png'
+                cv2.imwrite(
+                    png_output,
+                    (((height - height.min()) / max(1, height.max() - height.min())) * 65535.).astype(np.uint16),
+                    [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                if not args.quiet:
+                    print("  {} saved.".format(png_output))
+                png_output = os.path.splitext(tiff_output)[0]+'_{}'.format(class_name)+'_intensity.png'
+                cv2.imwrite(
+                    png_output,
+                    (((intensity - intensity.min()) / max(1, intensity.max() - intensity.min())) * 65535.).astype(np.uint16),
+                    [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                if not args.quiet:
+                    print("  {} saved.".format(png_output))
 
 if __name__=='__main__':
     main()
