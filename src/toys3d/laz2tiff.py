@@ -164,18 +164,18 @@ def main():
                     mask = np.uint8(counts==0) # terrain missing pixels
                     height[:] = inpaint_biharmonic(height, mask)
                     intensity[:] = inpaint_biharmonic(intensity, mask)
-                elif class_name.lower() == 'water':
+                elif class_name.lower() in ['water', 'buildings', 'vegetation']:
                     if args.verbose:
-                        print("  Water map inpainting...")
-                    nowater = np.uint8(counts==0) # water missing pixels
+                        print(f"  {class_name} map inpainting...")
+                    noobj = np.uint8(counts==0) # object missing pixels
                     # 背景：有测量值的区域；前景：无测量值的区域。
                     # 图像分割之后，有测量值的区域标签为0，无测量值的区域标签从1开始。
-                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(nowater, 8, cv2.CV_32S)
-                    mask = np.zeros(nowater.shape, dtype='uint8')
+                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(noobj, 8, cv2.CV_32S)
+                    mask = np.zeros(noobj.shape, dtype='uint8')
                     for i in range(1, num_labels):
                         if args.verbose:
-                            print("  Water map missing component {}: X={}, Y={}, Width={}, Height={}, Area={}, Centroid=({}, {})".format(
-                                i, stats[i,0], stats[i,1], stats[i,2], stats[i,3], stats[i,4], centroids[i,0], centroids[i,1]))
+                            print("  {} map missing component {}: X={}, Y={}, Width={}, Height={}, Area={}, Centroid=({}, {})".format(
+                                class_name, i, stats[i,0], stats[i,1], stats[i,2], stats[i,3], stats[i,4], centroids[i,0], centroids[i,1]))
                         if stats[i,2]<3 or stats[i,3]<3:
                             mask = np.logical_or(mask, labels==i)
                             if args.verbose:
