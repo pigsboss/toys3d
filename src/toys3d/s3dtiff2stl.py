@@ -58,24 +58,30 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         top_faces = []
         for r in range(rows - 1):
             for c in range(cols - 1):
-                # 四个角点是否在 mask 内
                 p00 = mask[r, c]
                 p01 = mask[r, c+1]
                 p10 = mask[r+1, c]
                 p11 = mask[r+1, c+1]
-                # 统计有效顶点
-                v00 = vtx_idx[r, c]   if p00 else -1
-                v01 = vtx_idx[r, c+1] if p01 else -1
-                v10 = vtx_idx[r+1, c] if p10 else -1
-                v11 = vtx_idx[r+1, c+1] if p11 else -1
-                # 生成三角形：只取三个顶点都在 mask 内的组合
-                if p00 and p01 and p11:
-                    top_faces.append([v00, v01, v11])
-                if p00 and p11 and p10:
-                    top_faces.append([v00, v11, v10])
-                # 处理 v00 不存在的情况（例如边界像素只存在右下块）
-                if not p00 and p01 and p11 and p10:
-                    top_faces.append([v01, v11, v10])
+                # 四个角点的顶点索引
+                idx = [
+                    vtx_idx[r, c]     if p00 else -1,
+                    vtx_idx[r, c+1]   if p01 else -1,
+                    vtx_idx[r+1, c]   if p10 else -1,
+                    vtx_idx[r+1, c+1] if p11 else -1
+                ]
+                valid = [p00, p01, p10, p11]
+                count = sum(valid)
+                if count == 4:
+                    # 四个有效 → 两个三角形
+                    top_faces.append([idx[0], idx[1], idx[3]])
+                    top_faces.append([idx[0], idx[3], idx[2]])
+                elif count == 3:
+                    # 三个有效 → 一个三角形
+                    missing = next(i for i, v in enumerate(valid) if not v)
+                    tri = [idx[i] for i in range(4) if i != missing]
+                    top_faces.append(tri)
+                # count <= 2 不生成三角形
+        if len(top_faces) == 0:
         if len(top_faces) == 0:
             if verbose:
                 print("  Object {} is skipped (no valid grid cells).".format(i))
