@@ -33,102 +33,98 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         if verbose:
             print("  Object {}, area = {} pixels".format(i, stats[i, 4]))
             
-        # 修正1：解决 np.bool 废弃报错
         mask = (labels == i)
-        
-        # 获取顶部所有顶点
-        vtx_top = np.column_stack((X[mask].ravel(), Y[mask].ravel(), obj_height[mask].ravel()))
-        if verbose:
-            print("  Top mesh of object {}: Z_min = {}, Z_max = {}, Z_mean = {}, Z_std = {}".format(
-                i, np.min(obj_height[mask]), np.max(obj_height[mask]), np.mean(obj_height[mask]), np.std(obj_height[mask])))
+        # indices of mask pixels (row, col)
+        idx = np.argwhere(mask)          # shape (N,2)
+        N = idx.shape[0]
+        if N < 3:
+            continue
+
+        # ---- top vertices (pixel centres) ----
+        vtx_top = np.empty((N, 3), dtype=np.float64)
+        vtx_top[:, 0] = X[mask].ravel()
+        vtx_top[:, 1] = Y[mask].ravel()
+        vtx_top[:, 2] = obj_height[mask].ravel()
+
+        # ---- bottom vertices (same XY, lowered Z) ----
+        vtx_bot = np.empty((N, 3), dtype=np.float64)
+        vtx_bot[:, 0] = vtx_top[:, 0]
+        vtx_bot[:, 1] = vtx_top[:, 1]
+        vtx_bot[:, 2] = terrain_height[mask].ravel() - weld_thickness
+
+        # ---- mapping from (r,c) to vertex index ----
+        vtx_idx = np.full((rows, cols), -1, dtype=np.int32)
+        vtx_idx[mask] = np.arange(N, dtype=np.int32)
+
+        # ---- top faces via Delaunay on pixel centres ----
         pts_top = np.column_stack((X[mask].ravel(), Y[mask].ravel()))
-        
         try:
             tri_top = Delaunay(pts_top)
         except:
             print("  Object {} is skipped (Delaunay failed).".format(i))
             continue
-            
         faces_top = tri_top.simplices
-        
-        if use_convex_hull:
-            # 凸包模式：保留所有三角形，不进行重心过滤
-            valid_faces_top = faces_top
-            if verbose:
-                print("  Using convex hull top mesh ({} triangles)".format(len(valid_faces_top)))
-        else:
-            # 重心过滤法剔除凹包（与原逻辑一致）
-            cx = np.mean(pts_top[faces_top, 0], axis=1)
-            cy = np.mean(pts_top[faces_top, 1], axis=1)
-            c = np.clip(np.int32((cx - X[0,0])/scale_x), 0, cols - 1)
-            r = np.clip(np.int32((cy - Y[0,0])/scale_y), 0, rows - 1)
-            valid_faces_top = faces_top[mask[r, c]]
-            if verbose:
-                print("  After centroid filtering: {} triangles".format(len(valid_faces_top)))
-        
-        # =========================================================
-        # 核心修复：完全抛弃二次 Delaunay，使用纯 NumPy 构建无缝拓扑
-        # =========================================================
-        
-        # 1. 纯 NumPy 提取外边界，保证索引与原始 vtx_top 绝对绑定
-        edges = np.vstack((
-            valid_faces_top[:, [0, 1]],
-            valid_faces_top[:, [1, 2]],
-            valid_faces_top[:, [2, 0]]
-        ))
-        sorted_edges = np.sort(edges, axis=1)
-        unique_edges, counts = np.unique(sorted_edges, axis=0, return_counts=True)
-        # 只被引用1次的边即为悬空外边界
-        boundary_edges = unique_edges[counts == 1]
-        
-        if len(boundary_edges) < 3:
-            print("  Object {} is skipped (Not enough boundary edges).".format(i))
-            continue
 
-        # 2. 生成底面顶点：因共用相同的XY栅格，直接生成等量的底面顶点
-        vtx_bot = np.column_stack((
-            X[mask].ravel(),
-            Y[mask].ravel(),
-            terrain_height[mask].ravel() - weld_thickness
-        ))
-        if verbose:
-            print("  Bottom mesh of object {}: Z_min = {}, Z_max = {}, Z_mean = {}, Z_std = {}".format(
-                i, np.min(terrain_height[mask]), np.max(terrain_height[mask]), np.mean(terrain_height[mask]), np.std(terrain_height[mask])))
-        
-        # 3. 复用顶面拓扑作为底面拓扑，只需要加上偏移量，并反转绕序 (保证法线朝下)
-        num_vtx = len(vtx_top)
-        valid_faces_bot = valid_faces_top[:, ::-1] + num_vtx
-        
-        # 4. 生成侧墙：精确连接上下对应的边界顶点
+        # ---- bottom faces (reversed winding) ----
+        faces_bot = faces_top[:, ::-1] + N
+
+        # ---- side walls from mask boundary (4‑connectivity) ----
+        boundary_edges = []
+        for r in range(rows):
+            for c in range(cols):
+                if not mask[r, c]:
+                    continue
+                # right neighbour
+                if c + 1 < cols and not mask[r, c + 1]:
+                    boundary_edges.append((r, c, r, c + 1))
+                # bottom neighbour
+                if r + 1 < rows and not mask[r + 1, c]:
+                    boundary_edges.append((r, c, r + 1, c))
+                # left neighbour
+                if c - 1 >= 0 and not mask[r, c - 1]:
+                    boundary_edges.append((r, c - 1, r, c))
+                # top neighbour
+                if r - 1 >= 0 and not mask[r - 1, c]:
+                    boundary_edges.append((r - 1, c, r, c))
+
+        # remove duplicates (each edge appears twice)
+        unique_edges = set()
+        for r1, c1, r2, c2 in boundary_edges:
+            if (r1, c1) < (r2, c2):
+                unique_edges.add((r1, c1, r2, c2))
+            else:
+                unique_edges.add((r2, c2, r1, c1))
+
         faces_side = []
-        for edge in boundary_edges:
-            top_v1, top_v2 = edge[0], edge[1]
-            bot_v1 = top_v1 + num_vtx
-            bot_v2 = top_v2 + num_vtx
-            
-            # 将四边形切为两个三角形
-            faces_side.append([top_v1, bot_v1, bot_v2])
-            faces_side.append([top_v1, bot_v2, top_v2])
-            
-        faces_side = np.array(faces_side)
-        
-        # 5. 组装实体模型：此时交给 Trimesh 打包，它会自动清理没用到的孤立点
+        for r1, c1, r2, c2 in unique_edges:
+            idx1 = vtx_idx[r1, c1]
+            idx2 = vtx_idx[r2, c2]
+            if idx1 == -1 or idx2 == -1:
+                continue
+            bot1 = idx1 + N
+            bot2 = idx2 + N
+            # two triangles per quad
+            faces_side.append([idx1, bot1, bot2])
+            faces_side.append([idx1, bot2, idx2])
+
+        if len(faces_side) == 0:
+            print("  Object {} is skipped (no side walls).".format(i))
+            continue
+        faces_side = np.array(faces_side, dtype=np.int32)
+
+        # ---- assemble ----
         all_vertices = np.vstack((vtx_top, vtx_bot))
-        all_faces = np.vstack((valid_faces_top, faces_side, valid_faces_bot))
-        
+        all_faces = np.vstack((faces_top, faces_side, faces_bot))
+
         solid_mesh = trimesh.Trimesh(vertices=all_vertices, faces=all_faces, process=False)
         solid_mesh.remove_unreferenced_vertices()
         solid_mesh.process()
         if not solid_mesh.is_watertight:
             solid_mesh.fill_holes()
             solid_mesh.remove_unreferenced_vertices()
-        
-        # 强制修复侧墙可能存在的法线倒置
         solid_mesh.fix_normals()
-
         if not solid_mesh.is_watertight:
-            print("  Try fill holes...")
-            solid_mesh.fill_holes() # 尝试自动缝合破洞
+            solid_mesh.fill_holes()
         if solid_mesh.is_watertight:
             if verbose:
                 print("  Watertight solid of object {} is generated including {} vertices and {} faces.".format(
