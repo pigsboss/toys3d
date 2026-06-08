@@ -137,16 +137,18 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                 if sub_poly.area < obj_area_threshold:
                     continue
 
-                # 合并顶点：多边形边界 + 内部采样点
-                # 内部点：所有 sub_mask 中的像素（不包括内孔，因为 sub_mask 已经排除）
+                # === 合并顶点：多边形边界（简化）+ 内孔边界 + 内部像素 ===
+                bnd_pts = outer_world                               # shape (N,2)
+                hole_pts_list = holes_world                         # list of (M,2)
+                # 内部栅格点 (像素中心)
                 r_inside, c_inside = np.where(sub_mask)
                 inside_wx = (c_inside + x0) * scale_x + origin_x
                 inside_wy = (r_inside + y0) * scale_y + origin_y
-                # 多边形边界点（去掉重复顶点对 Delaunay 更友好）
-                boundary_pts = np.array(sub_poly.exterior.coords).squeeze()
-                # 合并
-                all_pts = np.vstack([boundary_pts[:, :2], np.column_stack((inside_wx, inside_wy))])
-                # 去除精确重复点（容差1e-10）
+                inside_pts = np.column_stack((inside_wx, inside_wy))
+                # 合并所有点
+                parts = [bnd_pts] + hole_pts_list + [inside_pts]
+                all_pts = np.concatenate(parts, axis=0)
+                # 去重（容差1e-10）
                 _, uniq_idx = np.unique(np.round(all_pts, decimals=10), axis=0, return_index=True)
                 all_pts = all_pts[np.sort(uniq_idx)]
 
@@ -179,29 +181,24 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                 # 底面三角形（顺时针，保证法线向下）
                 faces_bot = tri_simplices[:, [0, 2, 1]] + N
 
-                # 侧面：沿外轮廓和内孔轮廓
+                # === 侧面：沿外轮廓和内孔轮廓（使用原始简化边界） ===
                 side_faces = []
-
-                # 构建 all_pts 坐标到索引的精确映射（容差 1e-8）
                 coord_map = {}
                 for pt_idx, pt in enumerate(all_pts):
                     key = (round(pt[0], 8), round(pt[1], 8))
                     coord_map[key] = pt_idx
 
-                # 外边界：使用 sub_poly.exterior.coords（最可靠）
-                boundary_exterior = np.array(sub_poly.exterior.coords)
+                # 外轮廓（使用 outer_world）
                 outer_indices = []
-                for pt in boundary_exterior:
+                for pt in outer_world:
                     key = (round(pt[0], 8), round(pt[1], 8))
                     if key in coord_map:
                         outer_indices.append(coord_map[key])
                     else:
-                        # 极少数情况，使用最近邻回退
-                        from scipy.spatial import KDTree
                         tree = KDTree(all_pts)
                         _, idx = tree.query(pt[:2])
                         outer_indices.append(idx)
-                # 去重保持顺序
+                # 去重
                 outer_uniq = []
                 seen = set()
                 for idx in outer_indices:
@@ -214,27 +211,23 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                         b = outer_uniq[k+1]
                         side_faces.append([a, b, b + N])
                         side_faces.append([a, b + N, a + N])
-                    # 闭合
                     if len(outer_uniq) >= 2:
                         a = outer_uniq[-1]
                         b = outer_uniq[0]
                         side_faces.append([a, b, b + N])
                         side_faces.append([a, b + N, a + N])
 
-                # 内孔轮廓（使用 sub_poly.interiors 代替 holes_world）
-                for interior in sub_poly.interiors:
-                    hole_pts = np.array(interior.coords)
+                # 内孔轮廓（使用 holes_world 的原始数组）
+                for hole_world in holes_world:
                     hole_indices = []
-                    for pt in hole_pts:
+                    for pt in hole_world:
                         key = (round(pt[0], 8), round(pt[1], 8))
                         if key in coord_map:
                             hole_indices.append(coord_map[key])
                         else:
-                            from scipy.spatial import KDTree
                             tree = KDTree(all_pts)
                             _, idx = tree.query(pt[:2])
                             hole_indices.append(idx)
-                    # 去重并保持顺序
                     hole_uniq = []
                     seen = set()
                     for idx in hole_indices:
