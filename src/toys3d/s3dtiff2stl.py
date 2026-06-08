@@ -93,12 +93,18 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         # ---- 侧墙：利用顶面网格的边界边 ----
         # 创建顶面网格（仅用于提取边界边，不process以保持顶点索引一致）
         top_mesh = trimesh.Trimesh(vertices=vtx_top, faces=top_faces, process=False)
+        if verbose:
+            print("      top_mesh has {} vertices, {} faces".format(len(top_mesh.vertices), len(top_mesh.faces)))
+            print("      top_mesh.is_watertight = {}".format(top_mesh.is_watertight))
         # 获取所有边的排序表示（每边小顶点在前）
         edges_sorted = top_mesh.edges_sorted
-        # 统计每条边的出现次数，出现1次的为边界边
         from collections import Counter
         edge_count = Counter(tuple(e) for e in edges_sorted)
         boundary_edges = [e for e, cnt in edge_count.items() if cnt == 1]
+        if verbose:
+            print("      total edges = {}, boundary edges = {}".format(len(edges_sorted), len(boundary_edges)))
+            if len(boundary_edges) > 0:
+                print("      first 5 boundary edges: ", boundary_edges[:5])
         if len(boundary_edges) == 0:
             if verbose:
                 print("  Object {} is skipped (no boundary edges).".format(i))
@@ -136,6 +142,12 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         else:
             if verbose:
                 print(f"  Open edges detected on object {i}")
+                # 输出固体网格的边界边数量
+                solid_edges = solid_mesh.edges_sorted
+                solid_edge_count = Counter(tuple(e) for e in solid_edges)
+                solid_boundary = [e for e, cnt in solid_edge_count.items() if cnt == 1]
+                print("      solid mesh: vertices {}, faces {}, boundary edges {}".format(
+                    len(solid_mesh.vertices), len(solid_mesh.faces), len(solid_boundary)))
     return meshes
 
 def generate_terrain_solid(X, Y, Z, base_z):
