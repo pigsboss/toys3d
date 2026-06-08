@@ -87,7 +87,7 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
             if len(outer_poly.shape) != 2 or outer_poly.shape[0] < 3:
                 continue
             # 多边形简化（基于周长）
-            epsilon = 0.001 * cv2.arcLength(cnt, True)
+            epsilon = 0.0001 * cv2.arcLength(cnt, True)
             approx_outer = cv2.approxPolyDP(cnt, epsilon, True).squeeze()
             if len(approx_outer.shape) != 2 or approx_outer.shape[0] < 3:
                 approx_outer = outer_poly  # fallback
