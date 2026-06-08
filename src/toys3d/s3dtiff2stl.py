@@ -288,9 +288,10 @@ def main():
         )
         print("  {} generated {} solid objects.".format(class_name, len(meshes)))
         for i in range(len(meshes)):
-            print(i)
-            scene.graph.update(frame_to=grp_name, frame_from=class_name+'_Obj_{:d}'.format(i), geometry=meshes[i])
-            obj_stl_output = stl_output + f'_{class_name}' + f'_Obj_{i}.stl'
+            node_name = f'{class_name}_Obj_{i}'
+            # 将 mesh 添加到 scene 的 geometry 字典，并建立父子关系
+            scene.add_geometry(meshes[i], node_name=node_name, parent_node_name=grp_name)
+            obj_stl_output = stl_output + f'_{class_name}_Obj_{i}.stl'
             print(obj_stl_output)
             meshes[i].export(obj_stl_output)
     if scene.is_empty:
