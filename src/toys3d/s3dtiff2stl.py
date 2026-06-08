@@ -54,22 +54,10 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         vtx_idx = np.full((rows, cols), -1, dtype=np.int32)
         vtx_idx[mask] = np.arange(N, dtype=np.int32)
 
-        # ---- 顶面三角形：每个 2x2 像素四边形生成两个三角形 ----
-        top_faces = []
-        for r, c in idx:
-            if (r + 1 < rows and c + 1 < cols and
-                mask[r, c] and mask[r, c+1] and mask[r+1, c] and mask[r+1, c+1]):
-                p0 = vtx_idx[r, c]
-                p1 = vtx_idx[r, c+1]
-                p2 = vtx_idx[r+1, c+1]
-                p3 = vtx_idx[r+1, c]
-                top_faces.append([p0, p1, p2])
-                top_faces.append([p0, p2, p3])
-        if len(top_faces) == 0:
-            if verbose:
-                print("  Object {} is skipped (no valid grid cells).".format(i))
-            continue
-        top_faces = np.array(top_faces, dtype=np.int32)
+        # ---- 顶面三角形：Delaunay 凸包（保留所有三角形） ----
+        from scipy.spatial import Delaunay
+        tri = Delaunay(np.column_stack((vtx_top[:, 0], vtx_top[:, 1])))
+        top_faces = tri.simplices  # shape (M, 3)，所有三角形
         # 底面三角形（反转绕序）
         bot_faces = top_faces[:, ::-1] + N
 
