@@ -5,6 +5,7 @@ import numpy as np
 import tifffile
 import trimesh
 import os
+import random
 import argparse
 import trimesh
 import cv2
@@ -272,9 +273,40 @@ def main():
 #        print("Open edges detected.")
     scene = trimesh.Scene()
 #    scene.graph.update(frame_to='world', frame_from='Terrain', geometry=terrain_mesh)
+    # 定义经典色卡调色板
+    CLASS_PALETTES = {
+        'Water': [
+            (  0, 119, 190),   # 海蓝
+            (  0, 191, 255),   # 湖蓝
+            ( 25,  25, 112),   # 深蓝
+            ( 70, 130, 180),   # 钢蓝
+            (100, 149, 237),   # 矢车菊蓝
+        ],
+        'Buildings': [
+            (176, 176, 176),   # 水泥灰
+            (178,  34,  34),   # 砖红
+            (194, 178, 128),   # 沙褐
+            (128, 128, 128),   # 灰
+            ( 85,  85,  85),   # 深灰
+            (205, 133,  63),   # 铜色
+        ],
+    }
+
+    def get_class_color(palette):
+        """从调色板随机选一种颜色，并施加不可察觉的微小抖动"""
+        base = random.choice(palette)
+        r = max(0, min(255, base[0] + random.randint(-3, 3)))
+        g = max(0, min(255, base[1] + random.randint(-3, 3)))
+        b = max(0, min(255, base[2] + random.randint(-3, 3)))
+        a = max(0, min(255, 255 + random.randint(-10, 10)))  # 抖动 alpha
+        return [r, g, b, a]
+
+    random.seed()  # 可复现（可选：设置固定数字如 random.seed(42)）
+
     for class_name in ['Water', 'Buildings']:
         if class_name.lower() == 'unclassified':
             continue
+        palette = CLASS_PALETTES.get(class_name, [(128, 128, 128)])
         meshes = extrude_object_solid(
             X, Y, surface_height['Terrain'],
             surface_counts[class_name],
@@ -286,8 +318,9 @@ def main():
         )
         print("  {} generated {} solid objects.".format(class_name, len(meshes)))
         for i in range(len(meshes)):
+            color = get_class_color(palette)
+            meshes[i].visual.face_colors = color
             node_name = f'{class_name}_Obj_{i}'
-            # 直接作为 'world' 的子节点添加，避免组节点导致导出错误
             scene.add_geometry(meshes[i], node_name=node_name, parent_node_name='world')
             obj_stl_output = stl_output + f'_{class_name}_Obj_{i}.stl'
             print(obj_stl_output)
