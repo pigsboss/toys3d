@@ -128,13 +128,21 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                     print(f"      Polygon creation failed: {e}")
                 continue
 
-            # 对于 MultiPolygon，分别处理（这里简化只取第一个子多边形，可根据需要改为循环）
+            # 提取所有 Polygon 子几何体（支持 MultiPolygon 和 GeometryCollection）
             if poly.geom_type == 'MultiPolygon':
                 polys = list(poly.geoms)
-            else:
+            elif poly.geom_type == 'GeometryCollection':
+                polys = [geom for geom in poly.geoms if geom.geom_type == 'Polygon']
+            elif poly.geom_type == 'Polygon':
                 polys = [poly]
+            else:
+                if verbose:
+                    print(f"      Unexpected geometry type: {poly.geom_type}, skip")
+                continue
 
             for sub_poly in polys:
+                if sub_poly.geom_type != 'Polygon':
+                    continue
                 if sub_poly.area < obj_area_threshold:
                     continue
 
