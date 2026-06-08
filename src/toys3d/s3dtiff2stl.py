@@ -11,147 +11,170 @@ import trimesh
 import cv2
 from laz2tiff import basename_without_all_extensions
 from ast import literal_eval
-from scipy.spatial import Delaunay
 from laz2tiff import CLASSES
+from shapely.geometry import Polygon, orient
+from shapely.validation import make_valid
+from scipy.interpolate import RegularGridInterpolator
 from collections import Counter
 
-def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_threshold=3.0, weld_thickness=0.1, verbose=False, use_convex_hull=False):
-    _ = use_convex_hull  # 忽略旧参数
+def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
+                         obj_area_threshold=3.0, weld_thickness=0.1,
+                         verbose=False, use_convex_hull=False):
+    """
+    使用多边形挤出生成水密实体，支持内部孔洞。
+    
+    参数：
+        X, Y: ndarray (rows, cols) 世界坐标网格
+        terrain_height: 地面高程网格
+        obj_counts: 分类计数网格（用于连通域）
+        obj_height: 地物高程网格
+        weld_thickness: 地物沉入地面厚度
+        use_convex_hull: 忽略（兼容旧参数）
+    
+    返回：
+        meshes: list of trimesh.Trimesh
+    """
+    # 连通域提取（使用原始计数网格）
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
         np.uint8(obj_counts > 0), 4, cv2.CV_32S
     )
     if verbose:
-        print("  {} objects extracted.".format(num_labels))
+        print(f"  {num_labels} objects extracted.")
+    
     meshes = []
     rows, cols = X.shape
-    scale_x = np.mean(np.diff(X, axis=1))
-    scale_y = np.mean(np.diff(Y, axis=0))
+
+    # 像素坐标到世界坐标的变换参数
+    # X, Y 是均匀网格，可直接通过索引映射
+    scale_x = X[0, 1] - X[0, 0] if cols > 1 else 1.0
+    scale_y = Y[1, 0] - Y[0, 0] if rows > 1 else 1.0
+    origin_x = X[0, 0]
+    origin_y = Y[0, 0]
 
     for i in range(1, num_labels):
-        if stats[i, 4] * scale_x * scale_y < obj_area_threshold:
+        area_pixels = stats[i, cv2.CC_STAT_AREA]
+        if area_pixels * scale_x * scale_y < obj_area_threshold:
             continue
         if verbose:
-            print("  Object {}, area = {} pixels".format(i, stats[i, 4]))
+            print(f"  Object {i}, area = {area_pixels} pixels")
 
+        # mask 和边界矩形
         mask = (labels == i)
-        idx = np.argwhere(mask)          # (N, 2)
-        N = idx.shape[0]
-        if N < 3:
+        x, y, w, h = (stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP],
+                      stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT])
+        # 裁剪到图像边界内
+        y0, y1 = max(0, y), min(rows, y + h)
+        x0, x1 = max(0, x), min(cols, x + w)
+        sub_mask = mask[y0:y1, x0:x1]
+
+        # 提取轮廓（层次树模式）
+        sub_mask_uint8 = sub_mask.astype(np.uint8) * 255
+        # 使用 RETR_TREE 以获取内外轮廓关系
+        contours, hierarchy = cv2.findContours(sub_mask_uint8, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if contours is None or len(contours) == 0:
+            if verbose:
+                print(f"  Object {i} skipped (no contours)")
             continue
 
-        # ---- 顶面顶点 ----
-        vtx_top = np.empty((N, 3), dtype=np.float64)
-        vtx_top[:, 0] = X[mask].ravel()
-        vtx_top[:, 1] = Y[mask].ravel()
-        vtx_top[:, 2] = obj_height[mask].ravel()
+        # 对于每个外轮廓（hierarchy[0][][3] == -1），构建带孔的多边形
+        for idx, cnt in enumerate(contours):
+            if hierarchy is None or hierarchy[0][idx][3] != -1:
+                continue   # 只处理外轮廓
 
-        # ---- 底面顶点 ----
-        vtx_bot = np.empty((N, 3), dtype=np.float64)
-        vtx_bot[:, 0] = vtx_top[:, 0]
-        vtx_bot[:, 1] = vtx_top[:, 1]
-        vtx_bot[:, 2] = terrain_height[mask].ravel() - weld_thickness
+            # 外轮廓顶点（像素坐标）
+            outer_poly = cnt.squeeze()
+            if len(outer_poly.shape) != 2 or outer_poly.shape[0] < 3:
+                continue
+            # 多边形简化（基于周长）
+            epsilon = 0.02 * cv2.arcLength(cnt, True)
+            approx_outer = cv2.approxPolyDP(cnt, epsilon, True).squeeze()
+            if len(approx_outer.shape) != 2 or approx_outer.shape[0] < 3:
+                approx_outer = outer_poly  # fallback
 
-        # ---- 像素 -> 顶点索引映射 ----
-        vtx_idx = np.full((rows, cols), -1, dtype=np.int32)
-        vtx_idx[mask] = np.arange(N, dtype=np.int32)
+            # 转换为世界坐标（像素坐标 + 偏移）
+            outer_world = approx_outer.copy().astype(np.float64)
+            outer_world[:, 0] = outer_world[:, 0] * scale_x + origin_x + (x0 * scale_x)
+            outer_world[:, 1] = outer_world[:, 1] * scale_y + origin_y + (y0 * scale_y)
 
-        # ---- 顶面三角形：基于像素网格，覆盖所有 mask 像素 ----
-        top_faces = []
-        for r in range(rows - 1):
-            for c in range(cols - 1):
-                p00 = mask[r, c]
-                p01 = mask[r, c+1]
-                p10 = mask[r+1, c]
-                p11 = mask[r+1, c+1]
-                # 四个角点的顶点索引
-                idx = [
-                    vtx_idx[r, c]     if p00 else -1,
-                    vtx_idx[r, c+1]   if p01 else -1,
-                    vtx_idx[r+1, c]   if p10 else -1,
-                    vtx_idx[r+1, c+1] if p11 else -1
-                ]
-                valid = [p00, p01, p10, p11]
-                count = sum(valid)
-                if count == 4:
-                    # 四个有效 → 两个三角形
-                    top_faces.append([idx[0], idx[1], idx[3]])
-                    top_faces.append([idx[0], idx[3], idx[2]])
-                elif count == 3:
-                    # 三个有效 → 一个三角形
-                    missing = next(i for i, v in enumerate(valid) if not v)
-                    tri = [idx[i] for i in range(4) if i != missing]
-                    top_faces.append(tri)
-                # count <= 2 不生成三角形
-        if len(top_faces) == 0:
-            if verbose:
-                print("  Object {} is skipped (no valid grid cells).".format(i))
-            continue
-        top_faces = np.array(top_faces, dtype=np.int32)
-        # 底面三角形（反转绕序）
-        bot_faces = top_faces[:, ::-1] + N
+            # 收集内部孔洞
+            holes_world = []
+            for j, hcnt in enumerate(contours):
+                if hierarchy[0][j][3] == idx:  # 子轮廓（内孔）
+                    hole_poly = hcnt.squeeze()
+                    if len(hole_poly.shape) != 2 or hole_poly.shape[0] < 3:
+                        continue
+                    epsilon_h = 0.02 * cv2.arcLength(hcnt, True)
+                    approx_hole = cv2.approxPolyDP(hcnt, epsilon_h, True).squeeze()
+                    if len(approx_hole.shape) != 2 or approx_hole.shape[0] < 3:
+                        approx_hole = hole_poly
+                    hole_world = approx_hole.copy().astype(np.float64)
+                    hole_world[:, 0] = hole_world[:, 0] * scale_x + origin_x + (x0 * scale_x)
+                    hole_world[:, 1] = hole_world[:, 1] * scale_y + origin_y + (y0 * scale_y)
+                    # 确保方向为顺时针（shapely 要求内孔顺时针）
+                    holes_world.append(hole_world)
 
-        # ---- 侧墙：利用顶面网格的边界边 ----
-        # 创建顶面网格（仅用于提取边界边，不process以保持顶点索引一致）
-        top_mesh = trimesh.Trimesh(vertices=vtx_top, faces=top_faces, process=False)
-        if verbose:
-            print("      top_mesh has {} vertices, {} faces".format(len(top_mesh.vertices), len(top_mesh.faces)))
-            print("      top_mesh.is_watertight = {}".format(top_mesh.is_watertight))
-        # 获取所有边的排序表示（每边小顶点在前）
-        edges_sorted = top_mesh.edges_sorted
-        from collections import Counter
-        edge_count = Counter(tuple(e) for e in edges_sorted)
-        boundary_edges = [e for e, cnt in edge_count.items() if cnt == 1]
-        if verbose:
-            print("      total edges = {}, boundary edges = {}".format(len(edges_sorted), len(boundary_edges)))
-            if len(boundary_edges) > 0:
-                print("      first 5 boundary edges: ", boundary_edges[:5])
-        if len(boundary_edges) == 0:
-            if verbose:
-                print("  Object {} is skipped (no boundary edges).".format(i))
-            continue
+            # 构建 shapely 多边形
+            try:
+                poly = Polygon(outer_world, holes_world)
+                if not poly.is_valid:
+                    poly = make_valid(poly)
+                poly = orient(poly, sign=1.0)  # 外逆时针，内顺时针
+            except Exception as e:
+                if verbose:
+                    print(f"      Failed to create polygon: {e}")
+                continue
 
-        side_faces = []
-        for (i1, i2) in boundary_edges:
-            b1 = i1 + N   # 底面顶点索引
-            b2 = i2 + N
-            side_faces.append([i1, i2, b2])
-            side_faces.append([i1, b2, b1])
-        if len(side_faces) == 0:
-            if verbose:
-                print("  Object {} is skipped (no side walls).".format(i))
-            continue
-        side_faces = np.array(side_faces, dtype=np.int32)
+            # 计算物体平均高度和地面平均高度（在完整 mask 范围内）
+            mask_obj_height = obj_height[mask]
+            mask_terrain_height = terrain_height[mask]
+            if mask_obj_height.size == 0:
+                continue
+            avg_obj_z = np.mean(mask_obj_height)
+            avg_terrain_z = np.mean(mask_terrain_height)
+            extrude_height = avg_obj_z - (avg_terrain_z - weld_thickness)
+            if extrude_height <= 0:
+                if verbose:
+                    print(f"      Object {i} skipped (extrude height <= 0)")
+                continue
 
-        # ---- 组装 ----
-        all_vertices = np.vstack((vtx_top, vtx_bot))
-        all_faces = np.vstack((top_faces, bot_faces, side_faces))
+            # 挤出生成实体
+            try:
+                solid_mesh = trimesh.creation.extrude_polygon(poly, height=extrude_height)
+            except Exception as e:
+                if verbose:
+                    print(f"      Extrude failed: {e}")
+                continue
 
-        solid_mesh = trimesh.Trimesh(vertices=all_vertices, faces=all_faces, process=False)
-        solid_mesh.remove_unreferenced_vertices()
-        solid_mesh.process()
-        if not solid_mesh.is_watertight:
-            solid_mesh.fill_holes()
-            solid_mesh.remove_unreferenced_vertices()
-        solid_mesh.fix_normals()
-
-        if solid_mesh.is_watertight:
-            if verbose:
-                print("  Watertight solid of object {} is generated including {} vertices and {} faces.".format(
-                    i, len(solid_mesh.vertices), len(solid_mesh.faces)))
-            meshes.append(solid_mesh)
-        else:
-            if verbose:
-                print(f"  Open edges detected on object {i}")
-                # 输出固体网格的边界边数量
-                solid_edges = solid_mesh.edges_sorted
-                solid_edge_count = Counter(tuple(e) for e in solid_edges)
-                solid_boundary = [e for e, cnt in solid_edge_count.items() if cnt == 1]
-                print("      solid mesh: vertices {}, faces {}, boundary edges {}".format(
-                    len(solid_mesh.vertices), len(solid_mesh.faces), len(solid_boundary)))
-                non_manifold_edges = [e for e, cnt in solid_edge_count.items() if cnt > 2]
-                print("      solid mesh non-manifold edges: {}".format(len(non_manifold_edges)))
-                if len(non_manifold_edges) > 0:
-                    print("      first 5 non-manifold edges: ", non_manifold_edges[:5])
+            # 平移 mesh 使底面位于地面高程 - weld_thickness
+            # extrude_polygon 默认底面在 Z=0，顶面在 Z=height
+            # 我们需要将 Z 平移到 avg_terrain_z - weld_thickness
+            solid_mesh.apply_translation([0, 0, avg_terrain_z - weld_thickness])
+            # 法线修复
+            solid_mesh.fix_normals()
+            # 可选：简化网格以减少面数（但可能影响水密性）
+            # solid_mesh = solid_mesh.simplify_quadratic_decimation(face_count=some)
+            
+            # 检查水密性
+            if not solid_mesh.is_watertight:
+                solid_mesh.fill_holes()
+                solid_mesh.remove_unreferenced_vertices()
+                solid_mesh.fix_normals()
+            
+            if solid_mesh.is_watertight:
+                if verbose:
+                    print(f"  Watertight solid of object {i} is generated including "
+                          f"{len(solid_mesh.vertices)} vertices and {len(solid_mesh.faces)} faces.")
+                meshes.append(solid_mesh)
+            else:
+                if verbose:
+                    print(f"  Open edges detected on object {i} (non-manifold after all)")
+                    # 调试信息
+                    edges = solid_mesh.edges_sorted
+                    edge_count = Counter(tuple(e) for e in edges)
+                    boundary = [e for e, cnt in edge_count.items() if cnt == 1]
+                    non_manifold = [e for e, cnt in edge_count.items() if cnt > 2]
+                    print(f"      boundary edges: {len(boundary)}, non-manifold edges: {len(non_manifold)}")
+        # end for each outer contour
     return meshes
 
 def generate_terrain_solid(X, Y, Z, base_z):
