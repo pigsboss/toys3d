@@ -164,7 +164,8 @@ def main():
                     mask = np.uint8(counts==0) # terrain missing pixels
                     height[:] = inpaint_biharmonic(height, mask)
                     intensity[:] = inpaint_biharmonic(intensity, mask)
-                elif class_name.lower() in ['water', 'buildings', 'vegetation']:
+                elif class_name.lower() in []:
+#                elif class_name.lower() in ['water', 'buildings', 'vegetation']:
                     if args.verbose:
                         print(f"  {class_name} map inpainting...")
                     noobj = np.uint8(counts==0) # object missing pixels

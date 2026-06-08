@@ -37,6 +37,9 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         
         # 获取顶部所有顶点
         vtx_top = np.column_stack((X[mask].ravel(), Y[mask].ravel(), obj_height[mask].ravel()))
+        if verbose:
+            print("  Top mesh of object {}: Z_min = {}, Z_max = {}, Z_mean = {}, Z_std = {}".format(
+                i, np.min(obj_height[mask]), np.max(obj_height[mask]), np.mean(obj_height[mask]), np.std(obj_height[mask])))
         pts_top = np.column_stack((X[mask].ravel(), Y[mask].ravel()))
         
         try:
@@ -87,6 +90,9 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
             Y[mask].ravel(),
             terrain_height[mask].ravel() - weld_thickness
         ))
+        if verbose:
+            print("  Bottom mesh of object {}: Z_min = {}, Z_max = {}, Z_mean = {}, Z_std = {}".format(
+                i, np.min(terrain_height[mask]), np.max(terrain_height[mask]), np.mean(terrain_height[mask]), np.std(terrain_height[mask])))
         
         # 3. 复用顶面拓扑作为底面拓扑，只需要加上偏移量，并反转绕序 (保证法线朝下)
         num_vtx = len(vtx_top)
@@ -266,7 +272,7 @@ def main():
 #        print("Open edges detected.")
     scene = trimesh.Scene()
 #    scene.graph.update(frame_to='world', frame_from='Terrain', geometry=terrain_mesh)
-    for class_name in ['Water']:
+    for class_name in ['Water', 'Buildings']:
         if class_name.lower() == 'unclassified':
             continue
         grp_name = class_name + '_Group'
@@ -282,8 +288,11 @@ def main():
         )
         print("  {} generated {} solid objects.".format(class_name, len(meshes)))
         for i in range(len(meshes)):
+            print(i)
             scene.graph.update(frame_to=grp_name, frame_from=class_name+'_Obj_{:d}'.format(i), geometry=meshes[i])
-            meshes[i].export(stl_output + f'_{class_name}' + f'_Obj_{i}.stl')
+            obj_stl_output = stl_output + f'_{class_name}' + f'_Obj_{i}.stl'
+            print(obj_stl_output)
+            meshes[i].export(obj_stl_output)
     if scene.is_empty:
         print("Scene is empty!")
     else:
