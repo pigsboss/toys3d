@@ -24,14 +24,13 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                          obj_area_threshold=3.0, weld_thickness=0.1,
                          verbose=False, use_convex_hull=False):
     """
-    使用双线性插值恢复真实高程的水密实体生成。
+    使用 trimesh.creation.extrude_polygon 生成水密实体，再通过插值调整顶面高程。
     """
     import cv2
     import numpy as np
     import trimesh
     from scipy.interpolate import RegularGridInterpolator
-    from scipy.spatial import KDTree
-    from shapely.geometry import Polygon, Point
+    from shapely.geometry import Polygon
     from shapely.validation import make_valid
     from shapely.geometry.polygon import orient
 
@@ -128,7 +127,7 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                     print(f"      Polygon creation failed: {e}")
                 continue
 
-            # 提取所有 Polygon 子几何体（支持 MultiPolygon 和 GeometryCollection）
+            # 提取所有 Polygon 子几何体
             if poly.geom_type == 'MultiPolygon':
                 polys = list(poly.geoms)
             elif poly.geom_type == 'GeometryCollection':
@@ -146,134 +145,57 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                 if sub_poly.area < obj_area_threshold:
                     continue
 
-                # === 仅使用多边形简化轮廓点（外轮廓 + 内孔） ===
-                bnd_pts = outer_world                               # shape (N,2)
-                hole_pts_list = holes_world                         # list of (M,2)
-                parts = [bnd_pts] + hole_pts_list
-                if not parts:
+                # --- 使用 extrude_polygon 生成水密实体 ---
+                # 先以一个临时高度挤出（例如 1.0 米），后面调整顶点
+                approx_height = 1.0
+                mesh = trimesh.creation.extrude_polygon(sub_poly, height=approx_height)
+
+                # 获取顶点
+                verts = mesh.vertices.copy()
+                n_verts = len(verts)
+                # extrude_polygon 先输出底面顶点（逆时针），再输出顶面顶点（相同数量，相同顺序）
+                n_base = n_verts // 2
+                if n_verts % 2 != 0:
+                    if verbose:
+                        print(f"      Unexpected vertex count {n_verts}, skip")
                     continue
-                all_pts = np.concatenate(parts, axis=0)
-                # 去重（容差1e-10）
-                _, uniq_idx = np.unique(np.round(all_pts, decimals=10), axis=0, return_index=True)
-                all_pts = all_pts[np.sort(uniq_idx)]
 
-                # 使用 shapely.ops.triangulate 进行约束三角剖分
-                tri_polys = triangulate(sub_poly)
+                # 获取所有轮廓点的世界坐标（用于插值）
+                # 收集外环 + 所有内环的点（按 shapely 顺序）
+                all_contour_pts = []
+                all_contour_pts.extend(list(sub_poly.exterior.coords)[:-1])  # 不重复闭合点
+                for hole in sub_poly.interiors:
+                    all_contour_pts.extend(list(hole.coords)[:-1])
 
-                # 1. 先插入所有边界点（确保索引与侧面完全一致）
-                verts_dict = {}
-                for ring in [sub_poly.exterior] + list(sub_poly.interiors):
-                    for coord in ring.coords[:-1]:  # 忽略闭合重复点
-                        key = (round(coord[0], 10), round(coord[1], 10))
-                        if key not in verts_dict:
-                            verts_dict[key] = len(verts_dict)
+                # 确保数量匹配
+                if len(all_contour_pts) != n_base:
+                    if verbose:
+                        print(f"      Contour points mismatch: {len(all_contour_pts)} vs {n_base}, skip")
+                    continue
 
-                # 2. 再插入 triangulate 生成的顶点（仅新点）
-                tri_verts = []
-                for tri_poly in tri_polys:
-                    idx_tri = []
-                    for coord in tri_poly.exterior.coords[:3]:
-                        key = (round(coord[0], 10), round(coord[1], 10))
-                        if key not in verts_dict:
-                            verts_dict[key] = len(verts_dict)
-                        idx_tri.append(verts_dict[key])
-                    tri_verts.append(idx_tri)
+                # 对每个轮廓点插值得到顶面和底面的高度
+                for j, pt in enumerate(all_contour_pts):
+                    top_z = interp_top((pt[1], pt[0]))
+                    bot_z = interp_bot((pt[1], pt[0])) - weld_thickness
+                    # 处理 NaN
+                    if np.isnan(top_z):
+                        top_z = 0.0
+                    if np.isnan(bot_z):
+                        bot_z = 0.0
+                    # 底面顶点（前一半）
+                    verts[j, 2] = bot_z
+                    # 顶面顶点（后一半）
+                    verts[j + n_base, 2] = top_z
 
-                # 3. 从 verts_dict 构建顶点坐标数组
-                all_pts = np.array([list(k) for k in verts_dict.keys()])
-
-                # 插值得到每个顶点的高度
-                top_z = interp_top((all_pts[:, 1], all_pts[:, 0]))
-                bot_z = interp_bot((all_pts[:, 1], all_pts[:, 0])) - weld_thickness
-                top_z = np.nan_to_num(top_z, nan=0.0)
-                bot_z = np.nan_to_num(bot_z, nan=0.0)
-
-                N = len(all_pts)
-                vertices_top = np.column_stack((all_pts[:, 0], all_pts[:, 1], top_z))
-                vertices_bot = np.column_stack((all_pts[:, 0], all_pts[:, 1], bot_z))
-                vertices = np.vstack((vertices_top, vertices_bot))
-
-                # 顶面三角形（逆时针，保持 tri_verts 顺序）
-                faces_top = np.array(tri_verts)
-                # 底面三角形（顺时针）
-                faces_bot = np.array(tri_verts)[:, [0, 2, 1]] + N
-
-                # === 侧面：沿多边形的外轮廓和内孔轮廓（直接从 sub_poly 获取顶点索引） ===
-                # 利用 verts_dict 获取边界点的精确索引
-                def get_contour_indices(ring):
-                    indices = []
-                    for coord in ring.coords[:-1]:  # 忽略最后一个重复点
-                        key = (round(coord[0], 10), round(coord[1], 10))
-                        if key in verts_dict:
-                            indices.append(verts_dict[key])
-                        else:
-                            # 理论上不会发生，因为 triangulate 包含了边界点
-                            # 若发生则用最近邻（极少见）
-                            from scipy.spatial import KDTree
-                            tree = KDTree(all_pts)
-                            _, idx = tree.query(coord)
-                            indices.append(idx)
-                    # 去除连续重复（避免退化三角形）
-                    unique = []
-                    for idx in indices:
-                        if not unique or idx != unique[-1]:
-                            unique.append(idx)
-                    return unique
-
-                side_faces = []
-
-                # 外轮廓
-                outer_ring = sub_poly.exterior
-                outer_idx = get_contour_indices(outer_ring)
-                if len(outer_idx) >= 3:
-                    for k in range(len(outer_idx) - 1):
-                        a = outer_idx[k]
-                        b = outer_idx[k+1]
-                        side_faces.append([a, b, b + N])
-                        side_faces.append([a, b + N, a + N])
-                    # 闭合
-                    a = outer_idx[-1]
-                    b = outer_idx[0]
-                    side_faces.append([a, b, b + N])
-                    side_faces.append([a, b + N, a + N])
-
-                # 内孔轮廓
-                for interior_ring in sub_poly.interiors:
-                    hole_idx = get_contour_indices(interior_ring)
-                    if len(hole_idx) >= 3:
-                        for k in range(len(hole_idx) - 1):
-                            a = hole_idx[k]
-                            b = hole_idx[k+1]
-                            side_faces.append([a, b, b + N])
-                            side_faces.append([a, b + N, a + N])
-                        a = hole_idx[-1]
-                        b = hole_idx[0]
-                        side_faces.append([a, b, b + N])
-                        side_faces.append([a, b + N, a + N])
-
-                # 组装网格
-                all_faces = np.vstack((faces_top, faces_bot, np.array(side_faces)))
-                # 调试输出：顶点数、各组成部分面数、索引合法性
-                if verbose:
-                    print(f"    Debug: N={N}")
-                    print(f"    Debug: faces_top.shape={faces_top.shape}, faces_bot.shape={faces_bot.shape}, side_faces.shape={np.array(side_faces).shape}")
-                    print(f"    Debug: all_faces.shape={all_faces.shape}, max index={all_faces.max()}, vertices shape={vertices.shape}")
-                    print(f"    Debug: any index >= 2*N? {np.any(all_faces >= 2*N)}")
-                    # 检查退化三角形（两个顶点相同）
-                    dup_edges = (all_faces[:, 0] == all_faces[:, 1]) | (all_faces[:, 1] == all_faces[:, 2]) | (all_faces[:, 0] == all_faces[:, 2])
-                    print(f"    Debug: degenerate faces count={dup_edges.sum()}")
-                mesh = trimesh.Trimesh(vertices=vertices, faces=all_faces)
-                if verbose:
-                    print(f"    Debug after Trimesh construction: watertight? {mesh.is_watertight}")
+                mesh.vertices = verts
                 mesh.fix_normals()
-                if verbose:
-                    print(f"    Debug after fix_normals: watertight? {mesh.is_watertight}, euler={mesh.euler_number}, winding_consistent? {mesh.is_winding_consistent}")
+
+                # 验证水密性
                 if not mesh.is_watertight:
                     mesh.fill_holes()
                     mesh.remove_unreferenced_vertices()
                     mesh.fix_normals()
-                    if verbose:
-                        print(f"    Debug after fill_holes+remove_unreferenced: watertight? {mesh.is_watertight}, euler={mesh.euler_number}")
+
                 if mesh.is_watertight and len(mesh.vertices) > 0:
                     meshes.append(mesh)
                     if verbose:
