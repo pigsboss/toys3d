@@ -184,9 +184,9 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
 
                 # 构建 all_pts 坐标到索引的精确映射（容差 1e-8）
                 coord_map = {}
-                for i, pt in enumerate(all_pts):
+                for pt_idx, pt in enumerate(all_pts):
                     key = (round(pt[0], 8), round(pt[1], 8))
-                    coord_map[key] = i
+                    coord_map[key] = pt_idx
 
                 # 外边界：使用 sub_poly.exterior.coords（最可靠）
                 boundary_exterior = np.array(sub_poly.exterior.coords)
