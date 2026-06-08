@@ -295,7 +295,9 @@ def main():
     if scene.is_empty:
         print("Scene is empty!")
     else:
-        scene.export(stl_output + '_Scene.glb')
+        glb_output = stl_output + '_Scene.glb'
+        scene.export(glb_output)
+        print(glb_output)
 
 if __name__=='__main__':
     main()
