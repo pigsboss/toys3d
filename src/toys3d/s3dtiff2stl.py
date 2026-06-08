@@ -54,10 +54,33 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         vtx_idx = np.full((rows, cols), -1, dtype=np.int32)
         vtx_idx[mask] = np.arange(N, dtype=np.int32)
 
-        # ---- 顶面三角形：Delaunay 凸包（保留所有三角形） ----
-        from scipy.spatial import Delaunay
-        tri = Delaunay(np.column_stack((vtx_top[:, 0], vtx_top[:, 1])))
-        top_faces = tri.simplices  # shape (M, 3)，所有三角形
+        # ---- 顶面三角形：基于像素网格，覆盖所有 mask 像素 ----
+        top_faces = []
+        for r in range(rows - 1):
+            for c in range(cols - 1):
+                # 四个角点是否在 mask 内
+                p00 = mask[r, c]
+                p01 = mask[r, c+1]
+                p10 = mask[r+1, c]
+                p11 = mask[r+1, c+1]
+                # 统计有效顶点
+                v00 = vtx_idx[r, c]   if p00 else -1
+                v01 = vtx_idx[r, c+1] if p01 else -1
+                v10 = vtx_idx[r+1, c] if p10 else -1
+                v11 = vtx_idx[r+1, c+1] if p11 else -1
+                # 生成三角形：只取三个顶点都在 mask 内的组合
+                if p00 and p01 and p11:
+                    top_faces.append([v00, v01, v11])
+                if p00 and p11 and p10:
+                    top_faces.append([v00, v11, v10])
+                # 处理 v00 不存在的情况（例如边界像素只存在右下块）
+                if not p00 and p01 and p11 and p10:
+                    top_faces.append([v01, v11, v10])
+        if len(top_faces) == 0:
+            if verbose:
+                print("  Object {} is skipped (no valid grid cells).".format(i))
+            continue
+        top_faces = np.array(top_faces, dtype=np.int32)
         # 底面三角形（反转绕序）
         bot_faces = top_faces[:, ::-1] + N
 
