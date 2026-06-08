@@ -13,6 +13,7 @@ from laz2tiff import basename_without_all_extensions
 from ast import literal_eval
 from scipy.spatial import Delaunay
 from laz2tiff import CLASSES
+from collections import Counter
 
 def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_threshold=3.0, weld_thickness=0.1, verbose=False, use_convex_hull=False):
     _ = use_convex_hull  # 忽略旧参数
@@ -89,35 +90,26 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         # 底面三角形（反转绕序）
         bot_faces = top_faces[:, ::-1] + N
 
-        # ---- 侧墙：通过轮廓提取边界 ----
-        contours, hierarchy = cv2.findContours(
-            np.uint8(mask), cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE
-        )
-        side_faces = []
-        for contour in contours:
-            contour = contour[:, 0, :]  # shape (M, 2)，每行 (c, r)
-            # 将轮廓点转为顶点索引
-            pts = []
-            for (c, r) in contour:
-                if 0 <= r < rows and 0 <= c < cols and mask[r, c]:
-                    vid = vtx_idx[r, c]
-                    if vid >= 0:
-                        pts.append(vid)
-            if len(pts) < 2:
-                continue
-            # 沿轮廓生成侧墙四边形
-            for j in range(len(pts) - 1):
-                t1, t2 = pts[j], pts[j+1]
-                b1, b2 = t1 + N, t2 + N
-                side_faces.append([t1, b1, b2])
-                side_faces.append([t1, b2, t2])
-            # 闭合最后一点到第一点
-            if len(pts) > 2:
-                t1, t2 = pts[-1], pts[0]
-                b1, b2 = t1 + N, t2 + N
-                side_faces.append([t1, b1, b2])
-                side_faces.append([t1, b2, t2])
+        # ---- 侧墙：利用顶面网格的边界边 ----
+        # 创建顶面网格（仅用于提取边界边，不process以保持顶点索引一致）
+        top_mesh = trimesh.Trimesh(vertices=vtx_top, faces=top_faces, process=False)
+        # 获取所有边的排序表示（每边小顶点在前）
+        edges_sorted = top_mesh.edges_sorted
+        # 统计每条边的出现次数，出现1次的为边界边
+        from collections import Counter
+        edge_count = Counter(tuple(e) for e in edges_sorted)
+        boundary_edges = [e for e, cnt in edge_count.items() if cnt == 1]
+        if len(boundary_edges) == 0:
+            if verbose:
+                print("  Object {} is skipped (no boundary edges).".format(i))
+            continue
 
+        side_faces = []
+        for (i1, i2) in boundary_edges:
+            b1 = i1 + N   # 底面顶点索引
+            b2 = i2 + N
+            side_faces.append([i1, i2, b2])
+            side_faces.append([i1, b2, b1])
         if len(side_faces) == 0:
             if verbose:
                 print("  Object {} is skipped (no side walls).".format(i))
