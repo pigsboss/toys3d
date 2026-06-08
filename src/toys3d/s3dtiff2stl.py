@@ -160,32 +160,20 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                         print(f"      Unexpected vertex count {n_verts}, skip")
                     continue
 
-                # 获取所有轮廓点的世界坐标（用于插值）
-                # 收集外环 + 所有内环的点（按 shapely 顺序）
-                all_contour_pts = []
-                all_contour_pts.extend(list(sub_poly.exterior.coords)[:-1])  # 不重复闭合点
-                for hole in sub_poly.interiors:
-                    all_contour_pts.extend(list(hole.coords)[:-1])
+                # 使用 KDTree 全局插值所有顶点（不依赖轮廓点数匹配）
+                bot_xy = verts[:n_base, :2]
+                top_xy = verts[n_base:, :2]
 
-                # 确保数量匹配
-                if len(all_contour_pts) != n_base:
-                    if verbose:
-                        print(f"      Contour points mismatch: {len(all_contour_pts)} vs {n_base}, skip")
-                    continue
+                # 插值底面和顶面的所有顶点 Z
+                new_bot_z = interp_bot((bot_xy[:, 1], bot_xy[:, 0])) - weld_thickness
+                new_top_z = interp_top((top_xy[:, 1], top_xy[:, 0]))
 
-                # 对每个轮廓点插值得到顶面和底面的高度
-                for j, pt in enumerate(all_contour_pts):
-                    top_z = interp_top((pt[1], pt[0]))
-                    bot_z = interp_bot((pt[1], pt[0])) - weld_thickness
-                    # 处理 NaN
-                    if np.isnan(top_z):
-                        top_z = 0.0
-                    if np.isnan(bot_z):
-                        bot_z = 0.0
-                    # 底面顶点（前一半）
-                    verts[j, 2] = bot_z
-                    # 顶面顶点（后一半）
-                    verts[j + n_base, 2] = top_z
+                # 处理 NaN
+                new_bot_z = np.nan_to_num(new_bot_z, nan=0.0)
+                new_top_z = np.nan_to_num(new_top_z, nan=0.0)
+
+                verts[:n_base, 2] = new_bot_z
+                verts[n_base:, 2] = new_top_z
 
                 mesh.vertices = verts
                 mesh.fix_normals()
