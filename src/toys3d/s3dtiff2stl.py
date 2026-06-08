@@ -205,6 +205,8 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                     if idx not in seen:
                         seen.add(idx)
                         outer_uniq.append(idx)
+                if verbose:
+                    print(f"    Debug outer_uniq: {len(outer_uniq)} unique indices from {len(outer_indices)} candidates")
                 if len(outer_uniq) >= 3:
                     for k in range(len(outer_uniq) - 1):
                         a = outer_uniq[k]
@@ -218,6 +220,7 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                         side_faces.append([a, b + N, a + N])
 
                 # 内孔轮廓（使用 holes_world 的原始数组）
+                hole_idx = 0
                 for hole_world in holes_world:
                     hole_indices = []
                     for pt in hole_world:
@@ -234,6 +237,8 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                         if idx not in seen:
                             seen.add(idx)
                             hole_uniq.append(idx)
+                    if verbose:
+                        print(f"    Debug hole_uniq ({hole_idx}): {len(hole_uniq)} unique indices from {len(hole_indices)} candidates")
                     if len(hole_uniq) >= 3:
                         for k in range(len(hole_uniq) - 1):
                             a = hole_uniq[k]
@@ -244,15 +249,31 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                         b = hole_uniq[0]
                         side_faces.append([a, b, b + N])
                         side_faces.append([a, b + N, a + N])
+                    hole_idx += 1
 
                 # 组装网格
                 all_faces = np.vstack((faces_top, faces_bot, np.array(side_faces)))
+                # 调试输出：顶点数、各组成部分面数、索引合法性
+                if verbose:
+                    print(f"    Debug: N={N}")
+                    print(f"    Debug: faces_top.shape={faces_top.shape}, faces_bot.shape={faces_bot.shape}, side_faces.shape={np.array(side_faces).shape}")
+                    print(f"    Debug: all_faces.shape={all_faces.shape}, max index={all_faces.max()}, vertices shape={vertices.shape}")
+                    print(f"    Debug: any index >= 2*N? {np.any(all_faces >= 2*N)}")
+                    # 检查退化三角形（两个顶点相同）
+                    dup_edges = (all_faces[:, 0] == all_faces[:, 1]) | (all_faces[:, 1] == all_faces[:, 2]) | (all_faces[:, 0] == all_faces[:, 2])
+                    print(f"    Debug: degenerate faces count={dup_edges.sum()}")
                 mesh = trimesh.Trimesh(vertices=vertices, faces=all_faces)
+                if verbose:
+                    print(f"    Debug after Trimesh construction: watertight? {mesh.is_watertight}")
                 mesh.fix_normals()
+                if verbose:
+                    print(f"    Debug after fix_normals: watertight? {mesh.is_watertight}, euler={mesh.euler_number}, winding_consistent? {mesh.is_winding_consistent}")
                 if not mesh.is_watertight:
                     mesh.fill_holes()
                     mesh.remove_unreferenced_vertices()
                     mesh.fix_normals()
+                    if verbose:
+                        print(f"    Debug after fill_holes+remove_unreferenced: watertight? {mesh.is_watertight}, euler={mesh.euler_number}")
                 if mesh.is_watertight and len(mesh.vertices) > 0:
                     meshes.append(mesh)
                     if verbose:
