@@ -180,14 +180,27 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                 faces_bot = tri_simplices[:, [0, 2, 1]] + N
 
                 # 侧面：沿外轮廓和内孔轮廓
-                tree = KDTree(all_pts)
                 side_faces = []
 
-                # 外轮廓
+                # 构建 all_pts 坐标到索引的精确映射（容差 1e-8）
+                coord_map = {}
+                for i, pt in enumerate(all_pts):
+                    key = (round(pt[0], 8), round(pt[1], 8))
+                    coord_map[key] = i
+
+                # 外边界：使用 sub_poly.exterior.coords（最可靠）
+                boundary_exterior = np.array(sub_poly.exterior.coords)
                 outer_indices = []
-                for pt_world in outer_world:
-                    _, idx = tree.query(pt_world[:2])
-                    outer_indices.append(idx)
+                for pt in boundary_exterior:
+                    key = (round(pt[0], 8), round(pt[1], 8))
+                    if key in coord_map:
+                        outer_indices.append(coord_map[key])
+                    else:
+                        # 极少数情况，使用最近邻回退
+                        from scipy.spatial import KDTree
+                        tree = KDTree(all_pts)
+                        _, idx = tree.query(pt[:2])
+                        outer_indices.append(idx)
                 # 去重保持顺序
                 outer_uniq = []
                 seen = set()
@@ -202,17 +215,26 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                         side_faces.append([a, b, b + N])
                         side_faces.append([a, b + N, a + N])
                     # 闭合
-                    a = outer_uniq[-1]
-                    b = outer_uniq[0]
-                    side_faces.append([a, b, b + N])
-                    side_faces.append([a, b + N, a + N])
+                    if len(outer_uniq) >= 2:
+                        a = outer_uniq[-1]
+                        b = outer_uniq[0]
+                        side_faces.append([a, b, b + N])
+                        side_faces.append([a, b + N, a + N])
 
-                # 内孔轮廓
-                for hole_world in holes_world:
+                # 内孔轮廓（使用 sub_poly.interiors 代替 holes_world）
+                for interior in sub_poly.interiors:
+                    hole_pts = np.array(interior.coords)
                     hole_indices = []
-                    for pt in hole_world:
-                        _, idx = tree.query(pt[:2])
-                        hole_indices.append(idx)
+                    for pt in hole_pts:
+                        key = (round(pt[0], 8), round(pt[1], 8))
+                        if key in coord_map:
+                            hole_indices.append(coord_map[key])
+                        else:
+                            from scipy.spatial import KDTree
+                            tree = KDTree(all_pts)
+                            _, idx = tree.query(pt[:2])
+                            hole_indices.append(idx)
+                    # 去重并保持顺序
                     hole_uniq = []
                     seen = set()
                     for idx in hole_indices:
