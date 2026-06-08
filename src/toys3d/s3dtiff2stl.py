@@ -184,6 +184,22 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                     mesh.remove_unreferenced_vertices()
                     mesh.fix_normals()
 
+                if not mesh.is_watertight:
+                    # 回退方案：平面挤出，使用区域平均高程
+                    if verbose:
+                        print(f"      Falling back to flat extrusion for object {i}")
+                    obj_avg = np.mean(obj_height[y0:y1, x0:x1][sub_mask])
+                    terrain_avg = np.mean(terrain_height[y0:y1, x0:x1][sub_mask])
+                    flat_height = max(1.0, obj_avg - terrain_avg + weld_thickness)
+                    mesh = trimesh.creation.extrude_polygon(sub_poly, height=flat_height)
+                    verts2 = mesh.vertices.copy()
+                    n_base2 = len(verts2) // 2
+                    if n_base2 * 2 == len(verts2):
+                        verts2[:n_base2, 2] = terrain_avg - weld_thickness
+                        verts2[n_base2:, 2] = obj_avg
+                    mesh.vertices = verts2
+                    mesh.fix_normals()
+
                 if mesh.is_watertight and len(mesh.vertices) > 0:
                     meshes.append(mesh)
                     if verbose:
