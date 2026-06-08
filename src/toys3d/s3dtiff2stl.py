@@ -275,8 +275,6 @@ def main():
     for class_name in ['Water', 'Buildings']:
         if class_name.lower() == 'unclassified':
             continue
-        grp_name = class_name + '_Group'
-        scene.graph.update(frame_to='world', frame_from=grp_name)
         meshes = extrude_object_solid(
             X, Y, surface_height['Terrain'],
             surface_counts[class_name],
@@ -289,8 +287,8 @@ def main():
         print("  {} generated {} solid objects.".format(class_name, len(meshes)))
         for i in range(len(meshes)):
             node_name = f'{class_name}_Obj_{i}'
-            # 将 mesh 添加到 scene 的 geometry 字典，并建立父子关系
-            scene.add_geometry(meshes[i], node_name=node_name, parent_node_name=grp_name)
+            # 直接作为 'world' 的子节点添加，避免组节点导致导出错误
+            scene.add_geometry(meshes[i], node_name=node_name, parent_node_name='world')
             obj_stl_output = stl_output + f'_{class_name}_Obj_{i}.stl'
             print(obj_stl_output)
             meshes[i].export(obj_stl_output)
