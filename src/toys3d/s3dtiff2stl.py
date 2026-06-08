@@ -15,8 +15,8 @@ from laz2tiff import CLASSES
 
 def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_threshold=3.0, weld_thickness=0.1, verbose=False):
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        np.uint8(obj_counts>0),
-        8,
+        np.uint8(obj_counts > 0),
+        4,
         cv2.CV_32S
     )
     if verbose:
@@ -25,84 +25,90 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
     rows, cols = X.shape
     scale_x = np.mean(np.diff(X, axis=1))
     scale_y = np.mean(np.diff(Y, axis=0))
+    
     for i in range(1, num_labels):
         if (stats[i, 4] * scale_x * scale_y < obj_area_threshold):
             continue
         if verbose:
             print("  Object {}, area = {} pixels".format(i, stats[i, 4]))
-        mask = np.bool(labels == i)
+            
+        # 修正1：解决 np.bool 废弃报错
+        mask = (labels == i)
+        
+        # 获取顶部所有顶点
         vtx_top = np.column_stack((X[mask].ravel(), Y[mask].ravel(), obj_height[mask].ravel()))
         pts_top = np.column_stack((X[mask].ravel(), Y[mask].ravel()))
+        
         try:
             tri_top = Delaunay(pts_top)
         except:
-            print("  Object {} is skipped.".format(i))
+            print("  Object {} is skipped (Delaunay failed).".format(i))
             continue
+            
         faces_top = tri_top.simplices
+        
+        # 重心过滤法剔除凹包
         cx = np.mean(pts_top[faces_top, 0], axis=1)
         cy = np.mean(pts_top[faces_top, 1], axis=1)
         c = np.clip(np.int32((cx - X[0,0])/scale_x), 0, cols - 1)
         r = np.clip(np.int32((cy - Y[0,0])/scale_y), 0, rows - 1)
         valid_faces_top = faces_top[mask[r, c]]
-        mesh_top = trimesh.Trimesh(vertices=vtx_top, faces=valid_faces_top)
-        sorted_edges = np.sort(mesh_top.edges, axis=1)
+        
+        # =========================================================
+        # 核心修复：完全抛弃二次 Delaunay，使用纯 NumPy 构建无缝拓扑
+        # =========================================================
+        
+        # 1. 纯 NumPy 提取外边界，保证索引与原始 vtx_top 绝对绑定
+        edges = np.vstack((
+            valid_faces_top[:, [0, 1]],
+            valid_faces_top[:, [1, 2]],
+            valid_faces_top[:, [2, 0]]
+        ))
+        sorted_edges = np.sort(edges, axis=1)
         unique_edges, counts = np.unique(sorted_edges, axis=0, return_counts=True)
+        # 只被引用1次的边即为悬空外边界
         boundary_edges = unique_edges[counts == 1]
-        # 提取所有边界顶点的唯一索引 (这些点在 vtx_top 中的位置)
-        boundary_vertex_indices = np.unique(boundary_edges)
-        if len(boundary_edges) < 4:
-            print("  Object {} is skipped.".format(i))
+        
+        if len(boundary_edges) < 3:
+            print("  Object {} is skipped (Not enough boundary edges).".format(i))
             continue
-        # 建立映射字典：顶面边界顶点索引 -> 将要在总顶点数组中生成的底面顶点索引
-        num_vtx_top = len(vtx_top)
-        top_to_bottom_idx = {top_idx: num_vtx_top + i for i, top_idx in enumerate(boundary_vertex_indices)}
-        # 生成底面顶点 (投影到底部基准面)
-        vtx_bot = np.column_stack((X[mask].ravel(), Y[mask].ravel(), terrain_height[mask].ravel()-weld_thickness))[boundary_vertex_indices]
-        # 开始构建侧墙面片
+
+        # 2. 生成底面顶点：因共用相同的XY栅格，直接生成等量的底面顶点
+        vtx_bot = np.column_stack((
+            X[mask].ravel(),
+            Y[mask].ravel(),
+            terrain_height[mask].ravel() - weld_thickness
+        ))
+        
+        # 3. 复用顶面拓扑作为底面拓扑，只需要加上偏移量，并反转绕序 (保证法线朝下)
+        num_vtx = len(vtx_top)
+        valid_faces_bot = valid_faces_top[:, ::-1] + num_vtx
+        
+        # 4. 生成侧墙：精确连接上下对应的边界顶点
         faces_side = []
         for edge in boundary_edges:
             top_v1, top_v2 = edge[0], edge[1]
-            bot_v1 = top_to_bottom_idx[top_v1]
-            bot_v2 = top_to_bottom_idx[top_v2]
-            # 将一个四边形侧墙劈成两个三角形
-            # 注意此处的缠绕顺序 (Winding Order) 尽量保持一致
+            bot_v1 = top_v1 + num_vtx
+            bot_v2 = top_v2 + num_vtx
+            
+            # 将四边形切为两个三角形
             faces_side.append([top_v1, bot_v1, bot_v2])
             faces_side.append([top_v1, bot_v2, top_v2])
+            
         faces_side = np.array(faces_side)
-        # 提取底面顶点的 2D 坐标 (X, Y)
-        pts_bot = vtx_bot[:, :2]
-        # 对底部点集重新进行 Delaunay 剖分
-        try:
-            tri_bot = Delaunay(pts_bot)
-        except:
-            print("  Object {} is skipped.".format(i))
-            continue
-        faces_bot = tri_bot.simplices
-        # 同样使用重心过滤法剔除底座的凹包
-        cx = np.mean(pts_bot[faces_bot, 0], axis=1)
-        cy = np.mean(pts_bot[faces_bot, 1], axis=1)
-        c = np.clip(np.int32((cx - X[0,0])/scale_x), 0, cols - 1)
-        r = np.clip(np.int32((cy - Y[0,0])/scale_y), 0, rows - 1)
-        valid_faces_bot_local = faces_bot[mask[r, c]]
-        # 此时的 valid_faces_bot_local 是基于 vtx_bot 的局部索引 (0, 1, 2...)
-        # 我们需要将它们映射回全局顶点数组的索引 (num_vtx_top + i)
-        faces_bot_global = np.zeros_like(valid_faces_bot_local)
-        for j in range(3):
-            # valid_bot_faces_local 里的值对应的是 boundary_vertex_indices 数组的位置
-            local_idx_array = valid_faces_bot_local[:, j]
-            # 获取对应的顶面索引，再通过字典查到底面全局索引
-            faces_bot_global[:, j] = [top_to_bottom_idx[boundary_vertex_indices[idx]] for idx in local_idx_array]
-        # [关键细节] 必须将底面的三角形顶点顺序反转 (A,B,C -> C,B,A)
-        # 这样底面的法线才会统一下方，而不是向着模型内部
-        faces_bot_global = faces_bot_global[:, ::-1]
-        # 合并所有的顶点
+        
+        # 5. 组装实体模型：此时交给 Trimesh 打包，它会自动清理没用到的孤立点
         all_vertices = np.vstack((vtx_top, vtx_bot))
-        # 合并所有的面片
-        all_faces = np.vstack((valid_faces_top, faces_side, faces_bot_global))
-        # 创建最终的 3D 实体
-        solid_mesh = trimesh.Trimesh(vertices=all_vertices, faces=all_faces)
-        # [防呆机制] 让 Trimesh 自动处理任何细微的法线方向错乱
+        all_faces = np.vstack((valid_faces_top, faces_side, valid_faces_bot))
+        
+        solid_mesh = trimesh.Trimesh(vertices=all_vertices, faces=all_faces, process=False)
+        
+        # 强制修复侧墙可能存在的法线倒置
         solid_mesh.fix_normals()
+
+        if not solid_mesh.is_watertight:
+            print("  Try fill holes...")
+            solid_mesh.fill_holes() # 尝试自动缝合破洞
         if solid_mesh.is_watertight:
             if verbose:
                 print("  Watertight solid of object {} is generated including {} vertices and {} faces.".format(
@@ -110,6 +116,7 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
             meshes.append(solid_mesh)
         else:
             print(f"  Open edges detected on object {i}")
+            
     return meshes
 
 def generate_terrain_solid(X, Y, Z, base_z):
@@ -229,18 +236,18 @@ def main():
             elif metadata['data'].lower() == 'intensity':
                 surface_intensity[metadata['class_name']] = p.asarray()
     X, Y = np.meshgrid(x, y)
-    terrain_mesh = generate_terrain_solid(X, Y, surface_height['Terrain'], args.base_z)
-    terrain_output = stl_output + '_Terrain.stl'
-    if terrain_mesh.is_watertight:
-        print("Watertight terrain component is generated including {} vertices and {} faces.".format(
-            len(terrain_mesh.vertices), len(terrain_mesh.faces)))
-        terrain_mesh.export(terrain_output)
-        print(f"Terrain component is saved to {terrain_output}")
-    else:
-        print("Open edges detected.")
+#    terrain_mesh = generate_terrain_solid(X, Y, surface_height['Terrain'], args.base_z)
+#    terrain_output = stl_output + '_Terrain.stl'
+#    if terrain_mesh.is_watertight:
+#        print("Watertight terrain component is generated including {} vertices and {} faces.".format(
+#            len(terrain_mesh.vertices), len(terrain_mesh.faces)))
+#        terrain_mesh.export(terrain_output)
+#        print(f"Terrain component is saved to {terrain_output}")
+#    else:
+#        print("Open edges detected.")
     scene = trimesh.Scene()
-    scene.graph.update(frame_to='world', frame_from='Terrain', geometry=terrain_mesh)
-    for class_name in surface_classes:
+#    scene.graph.update(frame_to='world', frame_from='Terrain', geometry=terrain_mesh)
+    for class_name in ['Water']:
         if class_name.lower() == 'unclassified':
             continue
         grp_name = class_name + '_Group'
@@ -256,8 +263,11 @@ def main():
         print("  {} generated {} solid objects.".format(class_name, len(meshes)))
         for i in range(len(meshes)):
             scene.graph.update(frame_to=grp_name, frame_from=class_name+'_Obj_{:d}'.format(i), geometry=meshes[i])
-    print(scene.graph)
-    scene.export(stl_output + '_Scene.glb')
+            meshes[i].export(stl_output + f'_{class_name}' + f'_Obj_{i}.stl')
+    if scene.is_empty:
+        print("Scene is empty!")
+    else:
+        scene.export(stl_output + '_Scene.glb')
 
 if __name__=='__main__':
     main()
