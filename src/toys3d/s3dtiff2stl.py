@@ -12,7 +12,8 @@ import cv2
 from laz2tiff import basename_without_all_extensions
 from ast import literal_eval
 from laz2tiff import CLASSES
-from shapely.geometry import Polygon, orient
+from shapely.geometry import Polygon
+from shapely.geometry.polygon import orient
 from shapely.validation import make_valid
 from scipy.interpolate import RegularGridInterpolator
 from collections import Counter
