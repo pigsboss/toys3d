@@ -138,23 +138,29 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                     print(f"      Object {i} skipped (terrain_z = {avg_terrain_z}, obj_z = {avg_obj_z}, extrude height <= 0)")
                 continue
 
-            # 挤出生成实体
+            # 挤出生成实体（处理 MultiPolygon）
             try:
-                solid_mesh = trimesh.creation.extrude_polygon(poly, height=extrude_height)
+                # 如果 poly 是 MultiPolygon，则分别挤出并合并
+                if poly.geom_type == 'MultiPolygon':
+                    sub_meshes = []
+                    for sub_poly in poly.geoms:
+                        sub_mesh = trimesh.creation.extrude_polygon(sub_poly, height=extrude_height)
+                        sub_mesh.apply_translation([0, 0, avg_terrain_z - weld_thickness])
+                        sub_mesh.fix_normals()
+                        sub_meshes.append(sub_mesh)
+                    if len(sub_meshes) == 0:
+                        continue
+                    # 合并所有子网格
+                    solid_mesh = trimesh.util.concatenate(sub_meshes)
+                else:
+                    solid_mesh = trimesh.creation.extrude_polygon(poly, height=extrude_height)
+                    solid_mesh.apply_translation([0, 0, avg_terrain_z - weld_thickness])
+                    solid_mesh.fix_normals()
             except Exception as e:
                 if verbose:
                     print(f"      Extrude failed: {e}")
                 continue
 
-            # 平移 mesh 使底面位于地面高程 - weld_thickness
-            # extrude_polygon 默认底面在 Z=0，顶面在 Z=height
-            # 我们需要将 Z 平移到 avg_terrain_z - weld_thickness
-            solid_mesh.apply_translation([0, 0, avg_terrain_z - weld_thickness])
-            # 法线修复
-            solid_mesh.fix_normals()
-            # 可选：简化网格以减少面数（但可能影响水密性）
-            # solid_mesh = solid_mesh.simplify_quadratic_decimation(face_count=some)
-            
             # 检查水密性
             if not solid_mesh.is_watertight:
                 solid_mesh.fill_holes()
