@@ -137,16 +137,12 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                 if sub_poly.area < obj_area_threshold:
                     continue
 
-                # === 合并顶点：多边形边界（简化）+ 内孔边界 + 内部像素 ===
+                # === 仅使用多边形简化轮廓点（外轮廓 + 内孔） ===
                 bnd_pts = outer_world                               # shape (N,2)
                 hole_pts_list = holes_world                         # list of (M,2)
-                # 内部栅格点 (像素中心)
-                r_inside, c_inside = np.where(sub_mask)
-                inside_wx = (c_inside + x0) * scale_x + origin_x
-                inside_wy = (r_inside + y0) * scale_y + origin_y
-                inside_pts = np.column_stack((inside_wx, inside_wy))
-                # 合并所有点
-                parts = [bnd_pts] + hole_pts_list + [inside_pts]
+                parts = [bnd_pts] + hole_pts_list
+                if not parts:
+                    continue
                 all_pts = np.concatenate(parts, axis=0)
                 # 去重（容差1e-10）
                 _, uniq_idx = np.unique(np.round(all_pts, decimals=10), axis=0, return_index=True)
