@@ -135,7 +135,7 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
             extrude_height = avg_obj_z - (avg_terrain_z - weld_thickness)
             if extrude_height <= 0:
                 if verbose:
-                    print(f"      Object {i} skipped (extrude height <= 0)")
+                    print(f"      Object {i} skipped (terrain_z = {avg_terrain_z}, obj_z = {avg_obj_z}, extrude height <= 0)")
                 continue
 
             # 挤出生成实体
