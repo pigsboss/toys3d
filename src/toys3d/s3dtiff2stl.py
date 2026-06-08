@@ -310,7 +310,7 @@ def main():
 
     random.seed()  # 可复现（可选：设置固定数字如 random.seed(42)）
 
-    for class_name in ['Water', 'Buildings', 'Vegetation']:
+    for class_name in ['Water']:
         if class_name.lower() == 'unclassified':
             continue
         palette = CLASS_PALETTES.get(class_name, [(128, 128, 128)])
