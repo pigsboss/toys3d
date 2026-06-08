@@ -13,7 +13,7 @@ from ast import literal_eval
 from scipy.spatial import Delaunay
 from laz2tiff import CLASSES
 
-def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_threshold=3.0, weld_thickness=0.1, verbose=False):
+def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_threshold=3.0, weld_thickness=0.1, verbose=False, use_convex_hull=False):
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
         np.uint8(obj_counts > 0),
         4,
@@ -47,12 +47,20 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
             
         faces_top = tri_top.simplices
         
-        # 重心过滤法剔除凹包
-        cx = np.mean(pts_top[faces_top, 0], axis=1)
-        cy = np.mean(pts_top[faces_top, 1], axis=1)
-        c = np.clip(np.int32((cx - X[0,0])/scale_x), 0, cols - 1)
-        r = np.clip(np.int32((cy - Y[0,0])/scale_y), 0, rows - 1)
-        valid_faces_top = faces_top[mask[r, c]]
+        if use_convex_hull:
+            # 凸包模式：保留所有三角形，不进行重心过滤
+            valid_faces_top = faces_top
+            if verbose:
+                print("  Using convex hull top mesh ({} triangles)".format(len(valid_faces_top)))
+        else:
+            # 重心过滤法剔除凹包（与原逻辑一致）
+            cx = np.mean(pts_top[faces_top, 0], axis=1)
+            cy = np.mean(pts_top[faces_top, 1], axis=1)
+            c = np.clip(np.int32((cx - X[0,0])/scale_x), 0, cols - 1)
+            r = np.clip(np.int32((cy - Y[0,0])/scale_y), 0, rows - 1)
+            valid_faces_top = faces_top[mask[r, c]]
+            if verbose:
+                print("  After centroid filtering: {} triangles".format(len(valid_faces_top)))
         
         # =========================================================
         # 核心修复：完全抛弃二次 Delaunay，使用纯 NumPy 构建无缝拓扑
@@ -102,6 +110,11 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         all_faces = np.vstack((valid_faces_top, faces_side, valid_faces_bot))
         
         solid_mesh = trimesh.Trimesh(vertices=all_vertices, faces=all_faces, process=False)
+        solid_mesh.remove_unreferenced_vertices()
+        solid_mesh.process()
+        if not solid_mesh.is_watertight:
+            solid_mesh.fill_holes()
+            solid_mesh.remove_unreferenced_vertices()
         
         # 强制修复侧墙可能存在的法线倒置
         solid_mesh.fix_normals()
@@ -204,6 +217,12 @@ def main():
         help="输出详细调试信息"
     )
     parser.add_argument(
+        "--convex_hull",
+        dest="convex_hull",
+        action="store_true",
+        help="使用凸包近似顶面（牺牲凹形精度换取水密性）"
+    )
+    parser.add_argument(
         "-q", "--quiet",
         action="store_true",
         help="静默运行"
@@ -258,7 +277,8 @@ def main():
             surface_height[class_name],
             obj_area_threshold = args.object_area_threshold,
             weld_thickness = args.weld_thickness,
-            verbose = args.verbose
+            verbose = args.verbose,
+            use_convex_hull = args.convex_hull
         )
         print("  {} generated {} solid objects.".format(class_name, len(meshes)))
         for i in range(len(meshes)):
