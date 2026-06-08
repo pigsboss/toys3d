@@ -158,25 +158,28 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                 all_pts = all_pts[np.sort(uniq_idx)]
 
                 # 使用 shapely.ops.triangulate 进行约束三角剖分
-                tri_polys = triangulate(sub_poly)   # 返回 Shapely 三角形（多边形）列表
+                tri_polys = triangulate(sub_poly)
 
-                # 收集所有唯一顶点（从三角形中提取，保证包含边界点）
-                # 同时建立坐标→索引映射
+                # 1. 先插入所有边界点（确保索引与侧面完全一致）
                 verts_dict = {}
-                tri_verts = []  # 每个三角形三个顶点的索引列表
-                for tri_poly in tri_polys:
-                    # tri_poly 是一个三角形（Polygon），有3个顶点
-                    coords = list(tri_poly.exterior.coords)[:3]  # 三个顶点
-                    idx_tri = []
-                    for coord in coords:
+                for ring in [sub_poly.exterior] + list(sub_poly.interiors):
+                    for coord in ring.coords[:-1]:  # 忽略闭合重复点
                         key = (round(coord[0], 10), round(coord[1], 10))
                         if key not in verts_dict:
                             verts_dict[key] = len(verts_dict)
-                            # 存储坐标，后面用来插值
+
+                # 2. 再插入 triangulate 生成的顶点（仅新点）
+                tri_verts = []
+                for tri_poly in tri_polys:
+                    idx_tri = []
+                    for coord in tri_poly.exterior.coords[:3]:
+                        key = (round(coord[0], 10), round(coord[1], 10))
+                        if key not in verts_dict:
+                            verts_dict[key] = len(verts_dict)
                         idx_tri.append(verts_dict[key])
                     tri_verts.append(idx_tri)
 
-                # 从 verts_dict 构建顶点坐标数组
+                # 3. 从 verts_dict 构建顶点坐标数组
                 all_pts = np.array([list(k) for k in verts_dict.keys()])
 
                 # 插值得到每个顶点的高度
