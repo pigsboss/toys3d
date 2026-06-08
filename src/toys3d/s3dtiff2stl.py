@@ -16,6 +16,7 @@ from shapely.geometry import Polygon
 from shapely.geometry.polygon import orient
 from shapely.geometry import Point
 from shapely.validation import make_valid
+from shapely.ops import triangulate
 from scipy.interpolate import RegularGridInterpolator
 from collections import Counter
 
@@ -29,7 +30,7 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
     import numpy as np
     import trimesh
     from scipy.interpolate import RegularGridInterpolator
-    from scipy.spatial import Delaunay, KDTree
+    from scipy.spatial import KDTree
     from shapely.geometry import Polygon, Point
     from shapely.validation import make_valid
     from shapely.geometry.polygon import orient
@@ -148,22 +149,31 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                 _, uniq_idx = np.unique(np.round(all_pts, decimals=10), axis=0, return_index=True)
                 all_pts = all_pts[np.sort(uniq_idx)]
 
-                # Delaunay 三角剖分
-                tri = Delaunay(all_pts)
-                # 过滤三角形：重心在多边形内部
-                keep_tri = []
-                for simp in tri.simplices:
-                    center = all_pts[simp].mean(axis=0)
-                    if sub_poly.contains(Point(center)) or sub_poly.touches(Point(center)):
-                        keep_tri.append(simp)
-                if len(keep_tri) == 0:
-                    continue
-                tri_simplices = np.array(keep_tri)
+                # 使用 shapely.ops.triangulate 进行约束三角剖分
+                tri_polys = triangulate(sub_poly)   # 返回 Shapely 三角形（多边形）列表
+
+                # 收集所有唯一顶点（从三角形中提取，保证包含边界点）
+                # 同时建立坐标→索引映射
+                verts_dict = {}
+                tri_verts = []  # 每个三角形三个顶点的索引列表
+                for tri_poly in tri_polys:
+                    # tri_poly 是一个三角形（Polygon），有3个顶点
+                    coords = list(tri_poly.exterior.coords)[:3]  # 三个顶点
+                    idx_tri = []
+                    for coord in coords:
+                        key = (round(coord[0], 10), round(coord[1], 10))
+                        if key not in verts_dict:
+                            verts_dict[key] = len(verts_dict)
+                            # 存储坐标，后面用来插值
+                        idx_tri.append(verts_dict[key])
+                    tri_verts.append(idx_tri)
+
+                # 从 verts_dict 构建顶点坐标数组
+                all_pts = np.array([list(k) for k in verts_dict.keys()])
 
                 # 插值得到每个顶点的高度
                 top_z = interp_top((all_pts[:, 1], all_pts[:, 0]))
                 bot_z = interp_bot((all_pts[:, 1], all_pts[:, 0])) - weld_thickness
-                # 处理可能的 NaN
                 top_z = np.nan_to_num(top_z, nan=0.0)
                 bot_z = np.nan_to_num(bot_z, nan=0.0)
 
@@ -172,80 +182,63 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                 vertices_bot = np.column_stack((all_pts[:, 0], all_pts[:, 1], bot_z))
                 vertices = np.vstack((vertices_top, vertices_bot))
 
-                # 顶面三角形（逆时针）
-                faces_top = tri_simplices.copy()
-                # 底面三角形（顺时针，保证法线向下）
-                faces_bot = tri_simplices[:, [0, 2, 1]] + N
+                # 顶面三角形（逆时针，保持 tri_verts 顺序）
+                faces_top = np.array(tri_verts)
+                # 底面三角形（顺时针）
+                faces_bot = np.array(tri_verts)[:, [0, 2, 1]] + N
 
-                # === 侧面：沿外轮廓和内孔轮廓（使用原始简化边界） ===
-                side_faces = []
-                coord_map = {}
-                for pt_idx, pt in enumerate(all_pts):
-                    key = (round(pt[0], 8), round(pt[1], 8))
-                    coord_map[key] = pt_idx
-
-                # 外轮廓（使用 outer_world）
-                outer_indices = []
-                for pt in outer_world:
-                    key = (round(pt[0], 8), round(pt[1], 8))
-                    if key in coord_map:
-                        outer_indices.append(coord_map[key])
-                    else:
-                        tree = KDTree(all_pts)
-                        _, idx = tree.query(pt[:2])
-                        outer_indices.append(idx)
-                # 去重
-                outer_uniq = []
-                seen = set()
-                for idx in outer_indices:
-                    if idx not in seen:
-                        seen.add(idx)
-                        outer_uniq.append(idx)
-                if verbose:
-                    print(f"    Debug outer_uniq: {len(outer_uniq)} unique indices from {len(outer_indices)} candidates")
-                if len(outer_uniq) >= 3:
-                    for k in range(len(outer_uniq) - 1):
-                        a = outer_uniq[k]
-                        b = outer_uniq[k+1]
-                        side_faces.append([a, b, b + N])
-                        side_faces.append([a, b + N, a + N])
-                    if len(outer_uniq) >= 2:
-                        a = outer_uniq[-1]
-                        b = outer_uniq[0]
-                        side_faces.append([a, b, b + N])
-                        side_faces.append([a, b + N, a + N])
-
-                # 内孔轮廓（使用 holes_world 的原始数组）
-                hole_idx = 0
-                for hole_world in holes_world:
-                    hole_indices = []
-                    for pt in hole_world:
-                        key = (round(pt[0], 8), round(pt[1], 8))
-                        if key in coord_map:
-                            hole_indices.append(coord_map[key])
+                # === 侧面：沿多边形的外轮廓和内孔轮廓（直接从 sub_poly 获取顶点索引） ===
+                # 利用 verts_dict 获取边界点的精确索引
+                def get_contour_indices(ring):
+                    indices = []
+                    for coord in ring.coords[:-1]:  # 忽略最后一个重复点
+                        key = (round(coord[0], 10), round(coord[1], 10))
+                        if key in verts_dict:
+                            indices.append(verts_dict[key])
                         else:
+                            # 理论上不会发生，因为 triangulate 包含了边界点
+                            # 若发生则用最近邻（极少见）
+                            from scipy.spatial import KDTree
                             tree = KDTree(all_pts)
-                            _, idx = tree.query(pt[:2])
-                            hole_indices.append(idx)
-                    hole_uniq = []
-                    seen = set()
-                    for idx in hole_indices:
-                        if idx not in seen:
-                            seen.add(idx)
-                            hole_uniq.append(idx)
-                    if verbose:
-                        print(f"    Debug hole_uniq ({hole_idx}): {len(hole_uniq)} unique indices from {len(hole_indices)} candidates")
-                    if len(hole_uniq) >= 3:
-                        for k in range(len(hole_uniq) - 1):
-                            a = hole_uniq[k]
-                            b = hole_uniq[k+1]
+                            _, idx = tree.query(coord)
+                            indices.append(idx)
+                    # 去除连续重复（避免退化三角形）
+                    unique = []
+                    for idx in indices:
+                        if not unique or idx != unique[-1]:
+                            unique.append(idx)
+                    return unique
+
+                side_faces = []
+
+                # 外轮廓
+                outer_ring = sub_poly.exterior
+                outer_idx = get_contour_indices(outer_ring)
+                if len(outer_idx) >= 3:
+                    for k in range(len(outer_idx) - 1):
+                        a = outer_idx[k]
+                        b = outer_idx[k+1]
+                        side_faces.append([a, b, b + N])
+                        side_faces.append([a, b + N, a + N])
+                    # 闭合
+                    a = outer_idx[-1]
+                    b = outer_idx[0]
+                    side_faces.append([a, b, b + N])
+                    side_faces.append([a, b + N, a + N])
+
+                # 内孔轮廓
+                for interior_ring in sub_poly.interiors:
+                    hole_idx = get_contour_indices(interior_ring)
+                    if len(hole_idx) >= 3:
+                        for k in range(len(hole_idx) - 1):
+                            a = hole_idx[k]
+                            b = hole_idx[k+1]
                             side_faces.append([a, b, b + N])
                             side_faces.append([a, b + N, a + N])
-                        a = hole_uniq[-1]
-                        b = hole_uniq[0]
+                        a = hole_idx[-1]
+                        b = hole_idx[0]
                         side_faces.append([a, b, b + N])
                         side_faces.append([a, b + N, a + N])
-                    hole_idx += 1
 
                 # 组装网格
                 all_faces = np.vstack((faces_top, faces_bot, np.array(side_faces)))
