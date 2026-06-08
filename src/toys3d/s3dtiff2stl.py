@@ -185,20 +185,31 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
                     mesh.fix_normals()
 
                 if not mesh.is_watertight:
-                    # 回退方案：平面挤出，使用区域平均高程
                     if verbose:
                         print(f"      Falling back to flat extrusion for object {i}")
-                    obj_avg = np.mean(obj_height[y0:y1, x0:x1][sub_mask])
-                    terrain_avg = np.mean(terrain_height[y0:y1, x0:x1][sub_mask])
-                    flat_height = max(1.0, obj_avg - terrain_avg + weld_thickness)
-                    mesh = trimesh.creation.extrude_polygon(sub_poly, height=flat_height)
-                    verts2 = mesh.vertices.copy()
-                    n_base2 = len(verts2) // 2
-                    if n_base2 * 2 == len(verts2):
-                        verts2[:n_base2, 2] = terrain_avg - weld_thickness
-                        verts2[n_base2:, 2] = obj_avg
-                    mesh.vertices = verts2
-                    mesh.fix_normals()
+                    try:
+                        # 使用 buffer(0) 清洁多边形，修复自相交等问题
+                        cleaned_poly = sub_poly.buffer(0)
+                        if cleaned_poly.geom_type != 'Polygon':
+                            if verbose:
+                                print(f"      Not a Polygon after buffer, skip")
+                            continue  # 跳过该子多边形
+                        # 计算平均高程
+                        obj_avg = np.mean(obj_height[y0:y1, x0:x1][sub_mask])
+                        terrain_avg = np.mean(terrain_height[y0:y1, x0:x1][sub_mask])
+                        flat_height = max(1.0, obj_avg - terrain_avg + weld_thickness)
+                        mesh = trimesh.creation.extrude_polygon(cleaned_poly, height=flat_height)
+                        verts2 = mesh.vertices.copy()
+                        n_base2 = len(verts2) // 2
+                        if n_base2 * 2 == len(verts2):
+                            verts2[:n_base2, 2] = terrain_avg - weld_thickness
+                            verts2[n_base2:, 2] = obj_avg
+                        mesh.vertices = verts2
+                        mesh.fix_normals()
+                    except Exception as e:
+                        if verbose:
+                            print(f"      Fallback extrusion failed: {e}")
+                        continue  # 跳过该子多边形
 
                 if mesh.is_watertight and len(mesh.vertices) > 0:
                     meshes.append(mesh)
