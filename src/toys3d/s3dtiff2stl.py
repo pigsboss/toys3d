@@ -303,7 +303,7 @@ def main():
 
     random.seed()  # 可复现（可选：设置固定数字如 random.seed(42)）
 
-    for class_name in ['Water', 'Buildings']:
+    for class_name in ['Water', 'Buildings', 'Vegetation']:
         if class_name.lower() == 'unclassified':
             continue
         palette = CLASS_PALETTES.get(class_name, [(128, 128, 128)])
@@ -328,7 +328,7 @@ def main():
     if scene.is_empty:
         print("Scene is empty!")
     else:
-        glb_output = stl_output + '_Scene.glb'
+        glb_output = stl_output + '_Scene.3mf'
         scene.export(glb_output)
         print(glb_output)
 
