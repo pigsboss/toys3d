@@ -148,6 +148,10 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
                 solid_boundary = [e for e, cnt in solid_edge_count.items() if cnt == 1]
                 print("      solid mesh: vertices {}, faces {}, boundary edges {}".format(
                     len(solid_mesh.vertices), len(solid_mesh.faces), len(solid_boundary)))
+                non_manifold_edges = [e for e, cnt in solid_edge_count.items() if cnt > 2]
+                print("      solid mesh non-manifold edges: {}".format(len(non_manifold_edges)))
+                if len(non_manifold_edges) > 0:
+                    print("      first 5 non-manifold edges: ", non_manifold_edges[:5])
     return meshes
 
 def generate_terrain_solid(X, Y, Z, base_z):
