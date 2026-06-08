@@ -82,7 +82,6 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
                     top_faces.append(tri)
                 # count <= 2 不生成三角形
         if len(top_faces) == 0:
-        if len(top_faces) == 0:
             if verbose:
                 print("  Object {} is skipped (no valid grid cells).".format(i))
             continue
