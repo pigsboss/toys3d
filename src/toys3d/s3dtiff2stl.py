@@ -16,6 +16,8 @@ from scipy.interpolate import griddata, RegularGridInterpolator
 from skimage.restoration import inpaint_biharmonic
 from collections import Counter
 
+x_junc_avoid = 0.01
+
 def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_threshold=3.0, weld_thickness=0.1, verbose=False):
     scale_x = np.mean(np.diff(X, axis=1))
     scale_y = np.mean(np.diff(Y, axis=0))
@@ -93,30 +95,51 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         y1 = yc - 0.5 * scale_y # south east vertice
         y2 = yc + 0.5 * scale_y # north west vertice
         y3 = yc + 0.5 * scale_y # north east vertice
+        mask_local = np.pad(
+            mask[r0:r1, c0:c1],
+            ((1,1), (1,1)),
+            mode='constant',
+            constant_values=((0,0), (0,0)))
+        is_wall_w = np.logical_and(mask_local[1:-1, 1:-1], ~mask_local[1:-1,  :-2])
+        is_wall_e = np.logical_and(mask_local[1:-1, 1:-1], ~mask_local[1:-1, 2:  ])
+        is_wall_s = np.logical_and(mask_local[1:-1, 1:-1], ~mask_local[ :-2, 1:-1])
+        is_wall_n = np.logical_and(mask_local[1:-1, 1:-1], ~mask_local[2:  , 1:-1])
+        k_wall_w = np.argwhere(is_wall_w[mask_local[1:-1, 1:-1]].ravel()).ravel().astype('int32')
+        k_wall_e = np.argwhere(is_wall_e[mask_local[1:-1, 1:-1]].ravel()).ravel().astype('int32')
+        k_wall_s = np.argwhere(is_wall_s[mask_local[1:-1, 1:-1]].ravel()).ravel().astype('int32')
+        k_wall_n = np.argwhere(is_wall_n[mask_local[1:-1, 1:-1]].ravel()).ravel().astype('int32')
+        x_junc_sw = mask_local[1:-1, 1:-1] & ~mask_local[1:-1,  :-2] & mask_local[ :-2,  :-2] & ~mask_local[ :-2, 1:-1]
+        x_junc_se = mask_local[1:-1, 1:-1] & ~mask_local[1:-1, 2:  ] & mask_local[ :-2, 2:  ] & ~mask_local[ :-2, 1:-1]
+        x_junc_nw = mask_local[1:-1, 1:-1] & ~mask_local[1:-1,  :-2] & mask_local[2:  ,  :-2] & ~mask_local[2:  , 1:-1]
+        x_junc_ne = mask_local[1:-1, 1:-1] & ~mask_local[1:-1, 2:  ] & mask_local[2:  , 2:  ] & ~mask_local[2:  , 1:-1]
+        num_x_junc_sw = np.sum(x_junc_sw)
+        num_x_junc_se = np.sum(x_junc_se)
+        num_x_junc_nw = np.sum(x_junc_nw)
+        num_x_junc_ne = np.sum(x_junc_ne)
+        if verbose:
+            print(f"  Object {i}, X-junctions: {num_x_junc_sw} (SW), {num_x_junc_se} (SE), {num_x_junc_nw} (NW), {num_x_junc_ne} (NE).")
+            print(f"  {k_wall_w.size} west wall pixels detected.")
+            print(f"  {k_wall_e.size} east wall pixels detected.")
+            print(f"  {k_wall_s.size} south wall pixels detected.")
+            print(f"  {k_wall_n.size} north wall pixels detected.")
+        mask_x_sw = x_junc_sw[mask_local[1:-1, 1:-1]].ravel()
+        mask_x_se = x_junc_se[mask_local[1:-1, 1:-1]].ravel()
+        mask_x_nw = x_junc_nw[mask_local[1:-1, 1:-1]].ravel()
+        mask_x_ne = x_junc_ne[mask_local[1:-1, 1:-1]].ravel()
+        x0[mask_x_sw] +=  x_junc_avoid * scale_x
+        y0[mask_x_sw] +=  x_junc_avoid * scale_y
+        x1[mask_x_se] += -x_junc_avoid * scale_x
+        y1[mask_x_se] +=  x_junc_avoid * scale_y
+        x2[mask_x_nw] +=  x_junc_avoid * scale_x
+        y2[mask_x_nw] += -x_junc_avoid * scale_y
+        x3[mask_x_ne] += -x_junc_avoid * scale_x
+        y3[mask_x_ne] += -x_junc_avoid * scale_y
         xv = np.concatenate((x0, x1, x2, x3))
         yv = np.concatenate((y0, y1, y2, y3))
         if verbose:
             print(f"  Object {i}, vertices on top surface: x_min = {np.min(xv)}, x_max = {np.max(xv)}, y_min = {np.min(yv)}, y_max = {np.max(yv)}")
         zv_obj = interp_top((yv, xv))
         zv_terrain = interp_bot((yv, xv)) - weld_thickness
-        mask_local = np.pad(
-            mask[r0:r1, c0:c1],
-            ((1,1), (1,1)),
-            mode='constant',
-            constant_values=((0,0), (0,0)))
-        is_wall_w = np.logical_and(mask_local[1:-1, 1:-1], ~ mask_local[1:-1,  :-2])
-        is_wall_e = np.logical_and(mask_local[1:-1, 1:-1], ~ mask_local[1:-1, 2:  ])
-        is_wall_s = np.logical_and(mask_local[1:-1, 1:-1], ~ mask_local[ :-2, 1:-1])
-        is_wall_n = np.logical_and(mask_local[1:-1, 1:-1], ~ mask_local[2:  , 1:-1])
-        k_wall_w = np.argwhere(is_wall_w[mask_local[1:-1, 1:-1]].ravel()).ravel().astype('int32')
-        k_wall_e = np.argwhere(is_wall_e[mask_local[1:-1, 1:-1]].ravel()).ravel().astype('int32')
-        k_wall_s = np.argwhere(is_wall_s[mask_local[1:-1, 1:-1]].ravel()).ravel().astype('int32')
-        k_wall_n = np.argwhere(is_wall_n[mask_local[1:-1, 1:-1]].ravel()).ravel().astype('int32')
-        if verbose:
-            print(f"  {k_wall_w.size} west wall pixels detected.")
-            print(f"  {k_wall_e.size} east wall pixels detected.")
-            print(f"  {k_wall_s.size} south wall pixels detected.")
-            print(f"  {k_wall_n.size} north wall pixels detected.")
         vtx_top = np.column_stack((xv, yv, zv_obj))
         vtx_bot = np.column_stack((xv, yv, zv_terrain))
         vertices = np.vstack((vtx_top, vtx_bot))
@@ -150,11 +173,13 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
         mesh.fix_normals()
         if mesh.is_watertight:
-            # meshes.append(mesh)
+            meshes.append(mesh)
             if verbose:
-                print(f"  Watertight solid of object {i} generated: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces.")
+                print(f"  Watertight solid of object {i} generated: {len(mesh.vertices)} vertices ({8*num_pixels} vertices added), {len(mesh.faces)} faces.")
         else:
-            print(f"  Open edges detected on object {i}")
+            print(f"  Open edges detected on object {i}: {len(mesh.vertices)} vertices ({8*num_pixels} vertices added), {len(mesh.faces)} faces.")
+            mesh.merge_vertices()
+            print(f"    {len(mesh.vertices)} vertices remain after merging.")
             meshes.append(mesh)
             edge_counter = Counter()
             for face in mesh.faces:                                                                                                                                                                                        
@@ -177,6 +202,7 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
                     #print(f"      Edge: ({v1[0]:.4f}, {v1[1]:.4f}, {v1[2]:.4f}) - ({v2[0]:.4f}, {v2[1]:.4f}, {v2[2]:.4f})")
             print(f"    {num_open_edges} open edges found, {num_complex_edges} non-manifold edges found, {num_kissing_edges} kissing edges found.")
             assert num_complex_edges == num_kissing_edges
+            assert num_kissing_edges == num_x_junc_se + num_x_junc_sw
     return meshes
 
 def generate_terrain_solid_optimized(X, Y, Z, base_z):
