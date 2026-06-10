@@ -347,7 +347,7 @@ def main():
         dest="weld_thickness",
         type=float,
         metavar="WELD_THICKNESS",
-        default=0.1,
+        default=1.0,
         help="地物沉入地面的厚度"
     )
     parser.add_argument(
@@ -355,7 +355,7 @@ def main():
         dest="object_area_threshold",
         type=float,
         metavar="OBJECT_AREA_THRESHOLD",
-        default=3.0,
+        default=50.0,
         help="地物提取面积阈值"
     )
     parser.add_argument(
