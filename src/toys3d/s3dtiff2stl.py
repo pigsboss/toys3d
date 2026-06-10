@@ -14,6 +14,7 @@ from ast import literal_eval
 from laz2tiff import CLASSES
 from scipy.interpolate import griddata, RegularGridInterpolator
 from skimage.restoration import inpaint_biharmonic
+from collections import Counter
 
 def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_threshold=3.0, weld_thickness=0.1, verbose=False):
     scale_x = np.mean(np.diff(X, axis=1))
@@ -103,10 +104,10 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
             ((1,1), (1,1)),
             mode='constant',
             constant_values=((0,0), (0,0)))
-        is_wall_w = np.logical_and(mask_local[1:-1, 1:-1], mask_local[1:-1,  :-2])
-        is_wall_e = np.logical_and(mask_local[1:-1, 1:-1], mask_local[1:-1, 2:  ])
-        is_wall_s = np.logical_and(mask_local[1:-1, 1:-1], mask_local[ :-2, 1:-1])
-        is_wall_n = np.logical_and(mask_local[1:-1, 1:-1], mask_local[2:  , 1:-1])
+        is_wall_w = np.logical_and(mask_local[1:-1, 1:-1], ~ mask_local[1:-1,  :-2])
+        is_wall_e = np.logical_and(mask_local[1:-1, 1:-1], ~ mask_local[1:-1, 2:  ])
+        is_wall_s = np.logical_and(mask_local[1:-1, 1:-1], ~ mask_local[ :-2, 1:-1])
+        is_wall_n = np.logical_and(mask_local[1:-1, 1:-1], ~ mask_local[2:  , 1:-1])
         k_wall_w = np.argwhere(is_wall_w[mask_local[1:-1, 1:-1]].ravel()).ravel().astype('int32')
         k_wall_e = np.argwhere(is_wall_e[mask_local[1:-1, 1:-1]].ravel()).ravel().astype('int32')
         k_wall_s = np.argwhere(is_wall_s[mask_local[1:-1, 1:-1]].ravel()).ravel().astype('int32')
@@ -122,16 +123,16 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         k_top = np.arange(num_pixels).astype('int32')
         tri_top_d = np.column_stack((k_top               , k_top +   num_pixels, k_top + 3*num_pixels))
         tri_top_u = np.column_stack((k_top               , k_top + 3*num_pixels, k_top + 2*num_pixels))
-        tri_bot_d = np.column_stack((k_top + 4*num_pixels, k_top + 6*num_pixels, k_top + 7*num_pixels))
-        tri_bot_u = np.column_stack((k_top + 4*num_pixels, k_top + 7*num_pixels, k_top + 5*num_pixels))
+        tri_bot_d = np.column_stack((k_top + 4*num_pixels, k_top + 6*num_pixels, k_top + 5*num_pixels))
+        tri_bot_u = np.column_stack((k_top + 6*num_pixels, k_top + 7*num_pixels, k_top + 5*num_pixels))
         tri_w_w_d = np.column_stack((k_wall_w + 6*num_pixels, k_wall_w + 4 * num_pixels, k_wall_w               ))
         tri_w_w_u = np.column_stack((k_wall_w + 6*num_pixels, k_wall_w                 , k_wall_w + 2*num_pixels))
-        tri_w_e_d = np.column_stack((k_wall_e + 5*num_pixels, k_wall_e + 7 * num_pixels, k_wall_e + 3*num_pixels))
-        tri_w_e_u = np.column_stack((k_wall_e + 5*num_pixels, k_wall_e + 3 * num_pixels, k_wall_e +   num_pixels))
+        tri_w_e_d = np.column_stack((k_wall_e + 5*num_pixels, k_wall_e + 7 * num_pixels, k_wall_e +   num_pixels))
+        tri_w_e_u = np.column_stack((k_wall_e + 7*num_pixels, k_wall_e + 3 * num_pixels, k_wall_e +   num_pixels))
         tri_w_s_d = np.column_stack((k_wall_s + 4*num_pixels, k_wall_s + 5 * num_pixels, k_wall_s +   num_pixels))
         tri_w_s_u = np.column_stack((k_wall_s + 4*num_pixels, k_wall_s +     num_pixels, k_wall_s               ))
-        tri_w_n_d = np.column_stack((k_wall_n + 7*num_pixels, k_wall_n + 6 * num_pixels, k_wall_n + 2*num_pixels))
-        tri_w_n_u = np.column_stack((k_wall_n + 7*num_pixels, k_wall_n + 2 * num_pixels, k_wall_n + 3*num_pixels))
+        tri_w_n_d = np.column_stack((k_wall_n + 7*num_pixels, k_wall_n + 6 * num_pixels, k_wall_n + 3*num_pixels))
+        tri_w_n_u = np.column_stack((k_wall_n + 6*num_pixels, k_wall_n + 2 * num_pixels, k_wall_n + 3*num_pixels))
         faces = np.vstack((
             tri_top_d,
             tri_top_u,
@@ -149,11 +150,30 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
         mesh.fix_normals()
         if mesh.is_watertight:
-            meshes.append(mesh)
+            # meshes.append(mesh)
             if verbose:
                 print(f"  Watertight solid of object {i} generated: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces.")
         else:
             print(f"  Open edges detected on object {i}")
+            meshes.append(mesh)
+            edge_counter = Counter()
+            for face in mesh.faces:                                                                                                                                                                                        
+                edge_counter[tuple(sorted([face[0], face[1]]))] += 1
+                edge_counter[tuple(sorted([face[1], face[2]]))] += 1
+                edge_counter[tuple(sorted([face[2], face[0]]))] += 1
+            num_open_edges = 0
+            num_complex_edges = 0
+            for e, cnt in edge_counter.items():
+                if cnt < 2:
+                    num_open_edges += 1
+                elif cnt > 2:
+                    num_complex_edges += 1
+                    v1 = mesh.vertices[e[0]]
+                    v2 = mesh.vertices[e[1]]
+                    assert np.allclose(v1[:2], v2[:2])
+                    #print(f"      Edge: ({v1[0]:.4f}, {v1[1]:.4f}, {v1[2]:.4f}) - ({v2[0]:.4f}, {v2[1]:.4f}, {v2[2]:.4f})")
+            print(f"    {num_open_edges} open edges found. {num_complex_edges} non-manifold edges found.")
+            assert num_open_edges == 0
     return meshes
 
 def generate_terrain_solid_optimized(X, Y, Z, base_z):
