@@ -12,30 +12,12 @@ import cv2
 from laz2tiff import basename_without_all_extensions
 from ast import literal_eval
 from laz2tiff import CLASSES
-from shapely.geometry import Polygon
-from shapely.geometry.polygon import orient
-from shapely.geometry import Point
-from shapely.validation import make_valid
-from shapely.ops import triangulate
-from scipy.interpolate import RegularGridInterpolator
-from collections import Counter
+from scipy.interpolate import griddata, RegularGridInterpolator
+from skimage.restoration import inpaint_biharmonic
 
-def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
-                         obj_area_threshold=3.0, weld_thickness=0.1,
-                         verbose=False, use_convex_hull=False):
-    """
-    使用 trimesh.creation.extrude_polygon 生成水密实体，再通过插值调整顶面高程。
-    """
-    import cv2
-    import numpy as np
-    import trimesh
-    from scipy.interpolate import RegularGridInterpolator
-    from shapely.geometry import Polygon
-    from shapely.validation import make_valid
-    from shapely.geometry.polygon import orient
-
-    scale_x = X[0, 1] - X[0, 0] if X.shape[1] > 1 else 1.0
-    scale_y = Y[1, 0] - Y[0, 0] if Y.shape[0] > 1 else 1.0
+def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_threshold=3.0, weld_thickness=0.1, verbose=False):
+    scale_x = np.mean(np.diff(X, axis=1))
+    scale_y = np.mean(np.diff(Y, axis=0))
     origin_x = X[0, 0]
     origin_y = Y[0, 0]
     rows, cols = X.shape
@@ -49,178 +31,202 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height,
     meshes = []
 
     for i in range(1, num_labels):
-        area_pixels = stats[i, cv2.CC_STAT_AREA]
-        if area_pixels * scale_x * scale_y < obj_area_threshold:
+        num_pixels = stats[i, cv2.CC_STAT_AREA]
+        obj_area   = num_pixels * scale_x * scale_y
+        if obj_area < obj_area_threshold:
             continue
         if verbose:
-            print(f"  Object {i}, area = {area_pixels} pixels")
-
+            print(f"  Object {i}, area = {num_pixels} pixels ({obj_area} sq.m)")
         mask = (labels == i)
-        x, y, w, h = (stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP],
-                      stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT])
-        y0, y1 = max(0, y), min(rows, y + h)
-        x0, x1 = max(0, x), min(cols, x + w)
-        sub_mask = mask[y0:y1, x0:x1]
-        if sub_mask.sum() == 0:
-            continue
-
-        # 创建局部插值器 (y 递增, x 递增)
-        y_local = np.linspace(Y[y0, 0], Y[y1-1, 0], h)
-        x_local = np.linspace(X[0, x0], X[0, x1-1], w)
-
+        c0 = max(0, stats[i, cv2.CC_STAT_LEFT])
+        r0 = max(0, stats[i, cv2.CC_STAT_TOP])
+        c1 = min(cols, stats[i, cv2.CC_STAT_LEFT] + stats[i, cv2.CC_STAT_WIDTH])
+        r1 = min(rows, stats[i, cv2.CC_STAT_TOP] + stats[i, cv2.CC_STAT_HEIGHT])
+        y_local = np.linspace(Y[r0, 0]-scale_y, Y[r1-1, 0]+scale_y, r1-r0+2)
+        x_local = np.linspace(X[0, c0]-scale_x, X[0, c1-1]+scale_x, c1-c0+2)
+        if verbose:
+            print(f"  Object {i}, rectangle: row {r0} to {r1}, column {c0} to {c1}")
+            print(f"  Object {i}, rectangle: x = {x_local[0]}, {x_local[1]}, ... {x_local[-1]} ({len(x_local)} points); y = {y_local[0]}, {y_local[1]}, ... {y_local[-1]} ({len(y_local)} points)")
+        obj_height_inpaint = inpaint_biharmonic(
+            np.pad(
+                obj_height[r0:r1, c0:c1],
+                ((1,1), (1,1)),
+                mode='constant',
+                constant_values=((0., 0.), (0., 0.))),
+            np.pad(
+                np.logical_not(mask[r0:r1, c0:c1]),
+                ((1,1), (1,1)),
+                mode='constant',
+                constant_values=((1,1), (1,1)))
+        )
+        if verbose:
+            print(f"  Object {i}, local DEM (inpainted): {obj_height_inpaint.shape[0]} (rows) x {obj_height_inpaint.shape[1]} (columns)")
         interp_top = RegularGridInterpolator(
             (y_local, x_local),
-            obj_height[y0:y1, x0:x1],
-            method='linear',
-            bounds_error=False,
-            fill_value=None
+            obj_height_inpaint,
+            method='linear'
         )
         interp_bot = RegularGridInterpolator(
             (y_local, x_local),
-            terrain_height[y0:y1, x0:x1],
-            method='linear',
-            bounds_error=False,
-            fill_value=None
+            inpaint_biharmonic(
+                np.pad(
+                    terrain_height[r0:r1, c0:c1],
+                    ((1,1), (1,1)),
+                    mode='constant',
+                    constant_values=((0., 0.), (0., 0.))),
+                np.pad(
+                    np.zeros((r1-r0, c1-c0), dtype='uint8'),
+                    ((1,1), (1,1)),
+                    mode='constant',
+                    constant_values=((1,1), (1,1)))
+            ),
+            method='linear'
         )
-
-        # 提取轮廓
-        sub_mask_uint8 = (sub_mask.astype(np.uint8) * 255)
-        contours, hierarchy = cv2.findContours(sub_mask_uint8, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-        if contours is None or len(contours) == 0:
-            continue
-
-        # 处理每个外轮廓
-        for idx, cnt in enumerate(contours):
-            if hierarchy is None or hierarchy[0][idx][3] != -1:
-                continue
-
-            # 外轮廓简化
-            epsilon = 0.0001 * cv2.arcLength(cnt, True)
-            approx_outer = cv2.approxPolyDP(cnt, epsilon, True).squeeze()
-            if len(approx_outer.shape) != 2 or approx_outer.shape[0] < 3:
-                continue
-            outer_world = approx_outer.astype(np.float64).copy()
-            outer_world[:, 0] = outer_world[:, 0] * scale_x + origin_x + (x0 * scale_x)
-            outer_world[:, 1] = outer_world[:, 1] * scale_y + origin_y + (y0 * scale_y)
-
-            # 收集内孔
-            holes_world = []
-            for j, hcnt in enumerate(contours):
-                if hierarchy[0][j][3] == idx:
-                    epsilon_h = 0.001 * cv2.arcLength(hcnt, True)
-                    approx_hole = cv2.approxPolyDP(hcnt, epsilon_h, True).squeeze()
-                    if len(approx_hole.shape) != 2 or approx_hole.shape[0] < 3:
-                        continue
-                    hole_world = approx_hole.astype(np.float64).copy()
-                    hole_world[:, 0] = hole_world[:, 0] * scale_x + origin_x + (x0 * scale_x)
-                    hole_world[:, 1] = hole_world[:, 1] * scale_y + origin_y + (y0 * scale_y)
-                    holes_world.append(hole_world)
-
-            # 构建 shapely polygon
-            try:
-                poly = Polygon(outer_world, holes_world)
-                if not poly.is_valid:
-                    poly = make_valid(poly)
-                poly = orient(poly, sign=1.0)
-            except Exception as e:
-                if verbose:
-                    print(f"      Polygon creation failed: {e}")
-                continue
-
-            # 提取所有 Polygon 子几何体
-            if poly.geom_type == 'MultiPolygon':
-                polys = list(poly.geoms)
-            elif poly.geom_type == 'GeometryCollection':
-                polys = [geom for geom in poly.geoms if geom.geom_type == 'Polygon']
-            elif poly.geom_type == 'Polygon':
-                polys = [poly]
-            else:
-                if verbose:
-                    print(f"      Unexpected geometry type: {poly.geom_type}, skip")
-                continue
-
-            for sub_poly in polys:
-                if sub_poly.geom_type != 'Polygon':
-                    continue
-                if sub_poly.area < obj_area_threshold:
-                    continue
-
-                # --- 使用 extrude_polygon 生成水密实体 ---
-                # 先以一个临时高度挤出（例如 1.0 米），后面调整顶点
-                approx_height = 1.0
-                mesh = trimesh.creation.extrude_polygon(sub_poly, height=approx_height)
-
-                # 获取顶点
-                verts = mesh.vertices.copy()
-                n_verts = len(verts)
-                # extrude_polygon 先输出底面顶点（逆时针），再输出顶面顶点（相同数量，相同顺序）
-                n_base = n_verts // 2
-                if n_verts % 2 != 0:
-                    if verbose:
-                        print(f"      Unexpected vertex count {n_verts}, skip")
-                    continue
-
-                # 使用 KDTree 全局插值所有顶点（不依赖轮廓点数匹配）
-                bot_xy = verts[:n_base, :2]
-                top_xy = verts[n_base:, :2]
-
-                # 插值底面和顶面的所有顶点 Z
-                new_bot_z = interp_bot((bot_xy[:, 1], bot_xy[:, 0])) - weld_thickness
-                new_top_z = interp_top((top_xy[:, 1], top_xy[:, 0]))
-
-                # 处理 NaN
-                new_bot_z = np.nan_to_num(new_bot_z, nan=0.0)
-                new_top_z = np.nan_to_num(new_top_z, nan=0.0)
-
-                verts[:n_base, 2] = new_bot_z
-                verts[n_base:, 2] = new_top_z
-
-                mesh.vertices = verts
-                mesh.fix_normals()
-
-                # 验证水密性
-                if not mesh.is_watertight:
-                    mesh.fill_holes()
-                    mesh.remove_unreferenced_vertices()
-                    mesh.fix_normals()
-
-                if not mesh.is_watertight:
-                    if verbose:
-                        print(f"      Falling back to flat extrusion for object {i}")
-                    try:
-                        # 使用 buffer(0) 清洁多边形，修复自相交等问题
-                        cleaned_poly = sub_poly.buffer(0)
-                        if cleaned_poly.geom_type != 'Polygon':
-                            if verbose:
-                                print(f"      Not a Polygon after buffer, skip")
-                            continue  # 跳过该子多边形
-                        # 计算平均高程
-                        obj_avg = np.mean(obj_height[y0:y1, x0:x1][sub_mask])
-                        terrain_avg = np.mean(terrain_height[y0:y1, x0:x1][sub_mask])
-                        flat_height = max(1.0, obj_avg - terrain_avg + weld_thickness)
-                        mesh = trimesh.creation.extrude_polygon(cleaned_poly, height=flat_height)
-                        verts2 = mesh.vertices.copy()
-                        n_base2 = len(verts2) // 2
-                        if n_base2 * 2 == len(verts2):
-                            verts2[:n_base2, 2] = terrain_avg - weld_thickness
-                            verts2[n_base2:, 2] = obj_avg
-                        mesh.vertices = verts2
-                        mesh.fix_normals()
-                    except Exception as e:
-                        if verbose:
-                            print(f"      Fallback extrusion failed: {e}")
-                        continue  # 跳过该子多边形
-
-                if mesh.is_watertight and len(mesh.vertices) > 0:
-                    meshes.append(mesh)
-                    if verbose:
-                        print(f"  Watertight solid of object {i} generated: "
-                              f"{len(mesh.vertices)} vertices, {len(mesh.faces)} faces.")
-                else:
-                    if verbose:
-                        print(f"  Object {i} mesh not watertight after fix.")
-
+        xc = X[mask].ravel()
+        yc = Y[mask].ravel()
+        x0 = xc - 0.5 * scale_x # south west vertice
+        x1 = xc + 0.5 * scale_x # south east vertice
+        x2 = xc - 0.5 * scale_x # north west vertice
+        x3 = xc + 0.5 * scale_x # north east vertice
+        y0 = yc - 0.5 * scale_y # south west vertice
+        y1 = yc - 0.5 * scale_y # south east vertice
+        y2 = yc + 0.5 * scale_y # north west vertice
+        y3 = yc + 0.5 * scale_y # north east vertice
+        xv = np.concatenate((x0, x1, x2, x3))
+        yv = np.concatenate((y0, y1, y2, y3))
+        if verbose:
+            print(f"  Object {i}, vertices on top surface: x_min = {np.min(xv)}, x_max = {np.max(xv)}, y_min = {np.min(yv)}, y_max = {np.max(yv)}")
+        zv_obj = interp_top((yv, xv))
+        zv_terrain = interp_bot((yv, xv)) - weld_thickness
+        mask_local = np.pad(
+            mask[r0:r1, c0:c1],
+            ((1,1), (1,1)),
+            mode='constant',
+            constant_values=((0,0), (0,0)))
+        is_wall_w = np.logical_and(mask_local[1:-1, 1:-1], mask_local[1:-1,  :-2])
+        is_wall_e = np.logical_and(mask_local[1:-1, 1:-1], mask_local[1:-1, 2:  ])
+        is_wall_s = np.logical_and(mask_local[1:-1, 1:-1], mask_local[ :-2, 1:-1])
+        is_wall_n = np.logical_and(mask_local[1:-1, 1:-1], mask_local[2:  , 1:-1])
+        k_wall_w = np.argwhere(is_wall_w[mask_local[1:-1, 1:-1]].ravel()).ravel().astype('int32')
+        k_wall_e = np.argwhere(is_wall_e[mask_local[1:-1, 1:-1]].ravel()).ravel().astype('int32')
+        k_wall_s = np.argwhere(is_wall_s[mask_local[1:-1, 1:-1]].ravel()).ravel().astype('int32')
+        k_wall_n = np.argwhere(is_wall_n[mask_local[1:-1, 1:-1]].ravel()).ravel().astype('int32')
+        if verbose:
+            print(f"  {k_wall_w.size} west wall pixels detected.")
+            print(f"  {k_wall_e.size} east wall pixels detected.")
+            print(f"  {k_wall_s.size} south wall pixels detected.")
+            print(f"  {k_wall_n.size} north wall pixels detected.")
+        vtx_top = np.column_stack((xv, yv, zv_obj))
+        vtx_bot = np.column_stack((xv, yv, zv_terrain))
+        vertices = np.vstack((vtx_top, vtx_bot))
+        k_top = np.arange(num_pixels).astype('int32')
+        tri_top_d = np.column_stack((k_top               , k_top +   num_pixels, k_top + 3*num_pixels))
+        tri_top_u = np.column_stack((k_top               , k_top + 3*num_pixels, k_top + 2*num_pixels))
+        tri_bot_d = np.column_stack((k_top + 4*num_pixels, k_top + 6*num_pixels, k_top + 7*num_pixels))
+        tri_bot_u = np.column_stack((k_top + 4*num_pixels, k_top + 7*num_pixels, k_top + 5*num_pixels))
+        tri_w_w_d = np.column_stack((k_wall_w + 6*num_pixels, k_wall_w + 4 * num_pixels, k_wall_w               ))
+        tri_w_w_u = np.column_stack((k_wall_w + 6*num_pixels, k_wall_w                 , k_wall_w + 2*num_pixels))
+        tri_w_e_d = np.column_stack((k_wall_e + 5*num_pixels, k_wall_e + 7 * num_pixels, k_wall_e + 3*num_pixels))
+        tri_w_e_u = np.column_stack((k_wall_e + 5*num_pixels, k_wall_e + 3 * num_pixels, k_wall_e +   num_pixels))
+        tri_w_s_d = np.column_stack((k_wall_s + 4*num_pixels, k_wall_s + 5 * num_pixels, k_wall_s +   num_pixels))
+        tri_w_s_u = np.column_stack((k_wall_s + 4*num_pixels, k_wall_s +     num_pixels, k_wall_s               ))
+        tri_w_n_d = np.column_stack((k_wall_n + 7*num_pixels, k_wall_n + 6 * num_pixels, k_wall_n + 2*num_pixels))
+        tri_w_n_u = np.column_stack((k_wall_n + 7*num_pixels, k_wall_n + 2 * num_pixels, k_wall_n + 3*num_pixels))
+        faces = np.vstack((
+            tri_top_d,
+            tri_top_u,
+            tri_bot_d,
+            tri_bot_u,
+            tri_w_w_d,
+            tri_w_w_u,
+            tri_w_e_d,
+            tri_w_e_u,
+            tri_w_s_d,
+            tri_w_s_u,
+            tri_w_n_d,
+            tri_w_n_u
+        ))
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+        if mesh.is_watertight:
+            meshes.append(mesh)
+            if verbose:
+                print(f"  Watertight solid of object {i} generated: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces.")
+        else:
+            print(f"  Open edges detected on object {i}")
     return meshes
+
+def generate_terrain_solid_optimized(X, Y, Z, base_z):
+    rows, cols = X.shape
+    num_points = rows * cols
+    
+    # 1. 构建顶面 (完全保留你的高效逻辑)
+    V_top = np.column_stack((X.ravel(), Y.ravel(), Z.ravel()))
+    r = np.arange(rows - 1)
+    c = np.arange(cols - 1)
+    R, C = np.meshgrid(r, c, indexing='ij')
+    P1 = R * cols + C
+    P2 = P1 + 1
+    P3 = P1 + cols
+    P4 = P3 + 1
+    
+    # 保持顶面拓扑
+    T1 = np.column_stack((P1.ravel(), P2.ravel(), P4.ravel()))
+    T2 = np.column_stack((P1.ravel(), P4.ravel(), P3.ravel()))
+    valid_faces_top = np.vstack((T1, T2))
+    
+    # 2. 提取完美的外圈边界索引 (顺时针或逆时针环绕一圈)
+    # 顺序为：上边缘 -> 右边缘 -> 下边缘(倒序) -> 左边缘(倒序)
+    top_edge = np.arange(cols)
+    right_edge = np.arange(1, rows) * cols + (cols - 1)
+    bottom_edge = (rows - 1) * cols + np.arange(cols - 2, -1, -1)
+    left_edge = np.arange(rows - 2, 0, -1) * cols
+    
+    # 将边界连成一个完整的闭合环
+    boundary_indices = np.concatenate([top_edge, right_edge, bottom_edge, left_edge])
+    num_boundary = len(boundary_indices)
+    
+    # 3. 仅为边界点生成底面顶点 (极度节省内存)
+    V_bot = V_top[boundary_indices].copy()
+    V_bot[:, 2] = base_z
+    
+    # 4. 构建侧墙 (严格控制逆时针绕序，法线绝对朝外)
+    faces_side = []
+    top_offset = num_points # 底面顶点在全局数组中的起始偏移量
+    
+    for i in range(num_boundary):
+        # 当前边界点和下一个边界点 (环状连接)
+        next_i = (i + 1) % num_boundary 
+        
+        # 顶面对应的全局索引
+        t_curr = boundary_indices[i]
+        t_next = boundary_indices[next_i]
+        
+        # 底面对应的全局索引
+        b_curr = top_offset + i
+        b_next = top_offset + next_i
+        
+        # 将矩形墙面劈成两个三角形 (严格按照外视逆时针方向)
+        faces_side.append([t_curr, b_curr, b_next])
+        faces_side.append([t_curr, b_next, t_next])
+        
+    faces_side = np.array(faces_side)
+    
+    # 5. 极简底盖剖分 (仅对这几百个边界点进行 Delaunay)
+    pts_bot_2d = V_bot[:, :2]
+    tri_bot = Delaunay(pts_bot_2d)
+    
+    # 底面三角形索引加上偏移量，并翻转法线朝下 (::-1)
+    faces_bot = tri_bot.simplices + top_offset
+    faces_bot = faces_bot[:, ::-1]
+    
+    # 6. 最终拼装
+    all_vertices = np.vstack((V_top, V_bot))
+    all_faces = np.vstack((valid_faces_top, faces_side, faces_bot))
+    
+    terrain = trimesh.Trimesh(vertices=all_vertices, faces=all_faces, process=True)
+    terrain.fix_normals()
+    
+    return terrain
 
 def generate_terrain_solid(X, Y, Z, base_z):
     rows, cols = X.shape
@@ -307,12 +313,6 @@ def main():
         help="输出详细调试信息"
     )
     parser.add_argument(
-        "--convex_hull",
-        dest="convex_hull",
-        action="store_true",
-        help="使用凸包近似顶面（牺牲凹形精度换取水密性）"
-    )
-    parser.add_argument(
         "-q", "--quiet",
         action="store_true",
         help="静默运行"
@@ -396,8 +396,7 @@ def main():
             surface_height[class_name],
             obj_area_threshold = args.object_area_threshold,
             weld_thickness = args.weld_thickness,
-            verbose = args.verbose,
-            use_convex_hull = args.convex_hull
+            verbose = args.verbose
         )
         print("  {} generated {} solid objects.".format(class_name, len(meshes)))
         for i in range(len(meshes)):
