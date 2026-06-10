@@ -15,6 +15,7 @@ from laz2tiff import CLASSES
 from scipy.interpolate import griddata, RegularGridInterpolator
 from skimage.restoration import inpaint_biharmonic
 from collections import Counter
+from scipy.spatial import Delaunay
 
 x_junc_avoid = 0.01
 
@@ -363,6 +364,11 @@ def main():
         help="输出详细调试信息"
     )
     parser.add_argument(
+        "-s", "--separate_objects",
+        action="store_true",
+        help="单独生成各个地物的几何体"
+    )
+    parser.add_argument(
         "-q", "--quiet",
         action="store_true",
         help="静默运行"
@@ -395,17 +401,17 @@ def main():
             elif metadata['data'].lower() == 'intensity':
                 surface_intensity[metadata['class_name']] = p.asarray()
     X, Y = np.meshgrid(x, y)
-#    terrain_mesh = generate_terrain_solid(X, Y, surface_height['Terrain'], args.base_z)
-#    terrain_output = stl_output + '_Terrain.stl'
-#    if terrain_mesh.is_watertight:
-#        print("Watertight terrain component is generated including {} vertices and {} faces.".format(
-#            len(terrain_mesh.vertices), len(terrain_mesh.faces)))
-#        terrain_mesh.export(terrain_output)
-#        print(f"Terrain component is saved to {terrain_output}")
-#    else:
-#        print("Open edges detected.")
+    terrain_mesh = generate_terrain_solid_optimized(X, Y, surface_height['Terrain'], args.base_z)
+    terrain_output = stl_output + '_Terrain.stl'
+    if terrain_mesh.is_watertight:
+        print("Watertight terrain component is generated including {} vertices and {} faces.".format(
+            len(terrain_mesh.vertices), len(terrain_mesh.faces)))
+        terrain_mesh.export(terrain_output)
+        print(f"Terrain component is saved to {terrain_output}")
+    else:
+        print("Open edges detected.")
     scene = trimesh.Scene()
-#    scene.graph.update(frame_to='world', frame_from='Terrain', geometry=terrain_mesh)
+    scene.add_geometry(terrain_mesh, node_name='Terrain', parent_node_name='world')
     # 定义经典色卡调色板
     CLASS_PALETTES = {
         'Water': [
@@ -439,24 +445,37 @@ def main():
     for class_name in ['Water', 'Buildings', 'Vegetation']:
         if class_name.lower() == 'unclassified':
             continue
-        palette = CLASS_PALETTES.get(class_name, [(128, 128, 128)])
-        meshes = extrude_object_solid(
-            X, Y, surface_height['Terrain'],
-            surface_counts[class_name],
-            surface_height[class_name],
-            obj_area_threshold = args.object_area_threshold,
-            weld_thickness = args.weld_thickness,
-            verbose = args.verbose
-        )
-        print("  {} generated {} solid objects.".format(class_name, len(meshes)))
-        for i in range(len(meshes)):
-            color = get_class_color(palette)
-            meshes[i].visual.face_colors = color
-            node_name = f'{class_name}_Obj_{i}'
-            scene.add_geometry(meshes[i], node_name=node_name, parent_node_name='world')
-            obj_stl_output = stl_output + f'_{class_name}_Obj_{i}.stl'
-            print(obj_stl_output)
-            meshes[i].export(obj_stl_output)
+        if args.separate_objects:
+            palette = CLASS_PALETTES.get(class_name, [(128, 128, 128)])
+            meshes = extrude_object_solid(
+                X, Y, surface_height['Terrain'],
+                surface_counts[class_name],
+                surface_height[class_name],
+                obj_area_threshold = args.object_area_threshold,
+                weld_thickness = args.weld_thickness,
+                verbose = args.verbose
+            )
+            print("  {} generated {} solid objects.".format(class_name, len(meshes)))
+            for i in range(len(meshes)):
+                color = get_class_color(palette)
+                meshes[i].visual.face_colors = color
+                node_name = f'{class_name}_Obj_{i}'
+                scene.add_geometry(meshes[i], node_name=node_name, parent_node_name='world')
+        else:
+            mask_obj = (surface_counts[class_name] > 0)
+            obj_dem = surface_height[class_name].copy()
+            obj_dem[~mask_obj] = surface_height['Terrain'][~mask_obj] - args.weld_thickness
+            obj_mesh = generate_terrain_solid_optimized(X, Y, obj_dem, args.base_z)
+            obj_output = stl_output + f'_{class_name}.stl'
+            if obj_mesh.is_watertight:
+                print("Watertight {} component is generated including {} vertices and {} faces.".format(
+                    class_name, len(obj_mesh.vertices), len(obj_mesh.faces)))
+                obj_mesh.export(obj_output)
+                print(f"{class_name} component is saved to {obj_output}")
+            else:
+                print("Open edges detected.")
+            scene.add_geometry(obj_mesh, node_name=class_name, parent_node_name='world')
+
     if scene.is_empty:
         print("Scene is empty!")
     else:
