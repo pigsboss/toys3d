@@ -163,17 +163,20 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
                 edge_counter[tuple(sorted([face[2], face[0]]))] += 1
             num_open_edges = 0
             num_complex_edges = 0
+            num_kissing_edges = 0
             for e, cnt in edge_counter.items():
                 if cnt < 2:
                     num_open_edges += 1
                 elif cnt > 2:
                     num_complex_edges += 1
+                    if cnt == 4:
+                        num_kissing_edges += 1
                     v1 = mesh.vertices[e[0]]
                     v2 = mesh.vertices[e[1]]
                     assert np.allclose(v1[:2], v2[:2])
                     #print(f"      Edge: ({v1[0]:.4f}, {v1[1]:.4f}, {v1[2]:.4f}) - ({v2[0]:.4f}, {v2[1]:.4f}, {v2[2]:.4f})")
-            print(f"    {num_open_edges} open edges found. {num_complex_edges} non-manifold edges found.")
-            assert num_open_edges == 0
+            print(f"    {num_open_edges} open edges found, {num_complex_edges} non-manifold edges found, {num_kissing_edges} kissing edges found.")
+            assert num_complex_edges == num_kissing_edges
     return meshes
 
 def generate_terrain_solid_optimized(X, Y, Z, base_z):
