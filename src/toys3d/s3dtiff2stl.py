@@ -147,6 +147,7 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
             tri_w_n_u
         ))
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+        mesh.fix_normals()
         if mesh.is_watertight:
             meshes.append(mesh)
             if verbose:
