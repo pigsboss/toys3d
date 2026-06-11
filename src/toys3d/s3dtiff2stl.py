@@ -27,8 +27,7 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
     rows, cols = X.shape
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        np.uint8(obj_counts > 0), 4, cv2.CV_32S
-    )
+        np.uint8(obj_counts > 0), 4, cv2.CV_32S)
     if verbose:
         print(f"  {num_labels} objects extracted.")
 
@@ -50,7 +49,9 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         x_local = np.linspace(X[0, c0]-scale_x, X[0, c1-1]+scale_x, c1-c0+2)
         if verbose:
             print(f"  Object {i}, rectangle: row {r0} to {r1}, column {c0} to {c1}")
-            print(f"  Object {i}, rectangle: x = {x_local[0]}, {x_local[1]}, ... {x_local[-1]} ({len(x_local)} points); y = {y_local[0]}, {y_local[1]}, ... {y_local[-1]} ({len(y_local)} points)")
+            print(f"  Object {i}, rectangle: "
+                  f"x = {x_local[0]}, {x_local[1]}, ... {x_local[-1]} ({len(x_local)} points); "
+                  f"y = {y_local[0]}, {y_local[1]}, ... {y_local[-1]} ({len(y_local)} points)")
         obj_height_inpaint = inpaint_biharmonic(
             np.pad(
                 obj_height[r0:r1, c0:c1],
@@ -61,15 +62,14 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
                 np.logical_not(mask[r0:r1, c0:c1]),
                 ((1,1), (1,1)),
                 mode='constant',
-                constant_values=((1,1), (1,1)))
-        )
+                constant_values=((1,1), (1,1))))
         if verbose:
-            print(f"  Object {i}, local DEM (inpainted): {obj_height_inpaint.shape[0]} (rows) x {obj_height_inpaint.shape[1]} (columns)")
+            print(f"  Object {i}, local DEM (inpainted): "
+                  f"{obj_height_inpaint.shape[0]} (rows) x {obj_height_inpaint.shape[1]} (columns)")
         interp_top = RegularGridInterpolator(
             (y_local, x_local),
             obj_height_inpaint,
-            method='linear'
-        )
+            method='linear')
         interp_bot = RegularGridInterpolator(
             (y_local, x_local),
             inpaint_biharmonic(
@@ -82,10 +82,8 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
                     np.zeros((r1-r0, c1-c0), dtype='uint8'),
                     ((1,1), (1,1)),
                     mode='constant',
-                    constant_values=((1,1), (1,1)))
-            ),
-            method='linear'
-        )
+                    constant_values=((1,1), (1,1)))),
+            method='linear')
         xc = X[mask].ravel()
         yc = Y[mask].ravel()
         x0 = xc - 0.5 * scale_x # south west vertice
@@ -118,7 +116,9 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         num_x_junc_nw = np.sum(x_junc_nw)
         num_x_junc_ne = np.sum(x_junc_ne)
         if verbose:
-            print(f"  Object {i}, X-junctions: {num_x_junc_sw} (SW), {num_x_junc_se} (SE), {num_x_junc_nw} (NW), {num_x_junc_ne} (NE).")
+            print(f"  Object {i}, X-junctions: "
+                  f"{num_x_junc_sw} (SW), {num_x_junc_se} (SE), "
+                  f"{num_x_junc_nw} (NW), {num_x_junc_ne} (NE).")
             print(f"  {k_wall_w.size} west wall pixels detected.")
             print(f"  {k_wall_e.size} east wall pixels detected.")
             print(f"  {k_wall_s.size} south wall pixels detected.")
@@ -138,7 +138,9 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         xv = np.concatenate((x0, x1, x2, x3))
         yv = np.concatenate((y0, y1, y2, y3))
         if verbose:
-            print(f"  Object {i}, vertices on top surface: x_min = {np.min(xv)}, x_max = {np.max(xv)}, y_min = {np.min(yv)}, y_max = {np.max(yv)}")
+            print(f"  Object {i}, vertices on top surface: "
+                  f"x_min = {np.min(xv)}, x_max = {np.max(xv)}, "
+                  f"y_min = {np.min(yv)}, y_max = {np.max(yv)}")
         zv_obj = interp_top((yv, xv))
         zv_terrain = interp_bot((yv, xv)) - weld_thickness
         vtx_top = np.column_stack((xv, yv, zv_obj))
@@ -169,21 +171,24 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
             tri_w_s_d,
             tri_w_s_u,
             tri_w_n_d,
-            tri_w_n_u
-        ))
+            tri_w_n_u))
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
         mesh.fix_normals()
         if mesh.is_watertight:
             meshes.append(mesh)
             if verbose:
-                print(f"  Watertight solid of object {i} generated: {len(mesh.vertices)} vertices ({8*num_pixels} vertices added), {len(mesh.faces)} faces.")
+                print(f"  Watertight solid of object {i} generated: "
+                      f"{len(mesh.vertices)} vertices ({8*num_pixels} vertices added), "
+                      f"{len(mesh.faces)} faces.")
         else:
-            print(f"  Open edges detected on object {i}: {len(mesh.vertices)} vertices ({8*num_pixels} vertices added), {len(mesh.faces)} faces.")
+            print(f"  Open edges detected on object {i}: "
+                  f"{len(mesh.vertices)} vertices ({8*num_pixels} vertices added), "
+                  f"{len(mesh.faces)} faces.")
             mesh.merge_vertices()
             print(f"    {len(mesh.vertices)} vertices remain after merging.")
             meshes.append(mesh)
             edge_counter = Counter()
-            for face in mesh.faces:                                                                                                                                                                                        
+            for face in mesh.faces:
                 edge_counter[tuple(sorted([face[0], face[1]]))] += 1
                 edge_counter[tuple(sorted([face[1], face[2]]))] += 1
                 edge_counter[tuple(sorted([face[2], face[0]]))] += 1
@@ -200,8 +205,9 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
                     v1 = mesh.vertices[e[0]]
                     v2 = mesh.vertices[e[1]]
                     assert np.allclose(v1[:2], v2[:2])
-                    #print(f"      Edge: ({v1[0]:.4f}, {v1[1]:.4f}, {v1[2]:.4f}) - ({v2[0]:.4f}, {v2[1]:.4f}, {v2[2]:.4f})")
-            print(f"    {num_open_edges} open edges found, {num_complex_edges} non-manifold edges found, {num_kissing_edges} kissing edges found.")
+            print(f"    {num_open_edges} open edges found, "
+                  f"{num_complex_edges} non-manifold edges found, "
+                  f"{num_kissing_edges} kissing edges found.")
             assert num_complex_edges == num_kissing_edges
             assert num_kissing_edges == num_x_junc_se + num_x_junc_sw
     return meshes
@@ -456,11 +462,12 @@ def main():
                 verbose = args.verbose
             )
             print("  {} generated {} solid objects.".format(class_name, len(meshes)))
-            for i in range(len(meshes)):
-                color = get_class_color(palette)
-                meshes[i].visual.face_colors = color
-                node_name = f'{class_name}_Obj_{i}'
-                scene.add_geometry(meshes[i], node_name=node_name, parent_node_name='world')
+            scene.add_geometry(trimesh.util.concatenate(meshes), node_name=class_name, parent_node_name='world')
+#            for i in range(len(meshes)):
+#                color = get_class_color(palette)
+#                meshes[i].visual.face_colors = color
+#                node_name = f'{class_name}_Obj_{i}'
+#                scene.add_geometry(meshes[i], node_name=node_name, parent_node_name='world')
         else:
             mask_obj = (surface_counts[class_name] > 0)
             obj_dem = surface_height[class_name].copy()
