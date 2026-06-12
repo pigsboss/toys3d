@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""swissSURFACE3D LiDAR DSM TIFF to STL
+"""swissSURFACE3D LiDAR DSM TIFF to STL/OBJ/GLB/3MF
 """
 import numpy as np
 import tifffile
@@ -18,6 +18,36 @@ from collections import Counter
 from scipy.spatial import Delaunay
 
 x_junc_avoid = 0.01
+
+# 定义经典色卡调色板
+CLASS_PALETTES = {
+    'Water': [
+        (  0, 119, 190),   # 海蓝
+        (  0, 191, 255),   # 湖蓝
+        ( 25,  25, 112),   # 深蓝
+        ( 70, 130, 180),   # 钢蓝
+        (100, 149, 237),   # 矢车菊蓝
+    ],
+    'Buildings': [
+        (176, 176, 176),   # 水泥灰
+        (178,  34,  34),   # 砖红
+        (194, 178, 128),   # 沙褐
+        (128, 128, 128),   # 灰
+        ( 85,  85,  85),   # 深灰
+        (205, 133,  63),   # 铜色
+    ],
+}
+
+def get_class_color(palette):
+    """从调色板随机选一种颜色，并施加不可察觉的微小抖动"""
+    base = random.choice(palette)
+    r = max(0, min(255, base[0] + random.randint(-3, 3)))
+    g = max(0, min(255, base[1] + random.randint(-3, 3)))
+    b = max(0, min(255, base[2] + random.randint(-3, 3)))
+    a = max(0, min(255, 255 + random.randint(-10, 10)))  # 抖动 alpha
+    return [r, g, b, a]
+
+random.seed()  # 可复现（可选：设置固定数字如 random.seed(42)）
 
 def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_threshold=3.0, weld_thickness=0.1, verbose=False):
     scale_x = np.mean(np.diff(X, axis=1))
@@ -39,7 +69,8 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         if obj_area < obj_area_threshold:
             continue
         if verbose:
-            print(f"  Object {i}, area = {num_pixels} pixels ({obj_area} sq.m)")
+            print(f"  Object {i}:"
+                  f"    area = {num_pixels} pixels ({obj_area} sq.m)")
         mask = (labels == i)
         c0 = max(0, stats[i, cv2.CC_STAT_LEFT])
         r0 = max(0, stats[i, cv2.CC_STAT_TOP])
@@ -48,10 +79,10 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         y_local = np.linspace(Y[r0, 0]-scale_y, Y[r1-1, 0]+scale_y, r1-r0+2)
         x_local = np.linspace(X[0, c0]-scale_x, X[0, c1-1]+scale_x, c1-c0+2)
         if verbose:
-            print(f"  Object {i}, rectangle: row {r0} to {r1}, column {c0} to {c1}")
-            print(f"  Object {i}, rectangle: "
-                  f"x = {x_local[0]}, {x_local[1]}, ... {x_local[-1]} ({len(x_local)} points); "
-                  f"y = {y_local[0]}, {y_local[1]}, ... {y_local[-1]} ({len(y_local)} points)")
+            print("    rectangle:")
+            print(f"      row {r0} to {r1}, column {c0} to {c1}")
+            print(f"      x = {x_local[0]}, {x_local[1]}, ... {x_local[-1]} ({len(x_local)} points)")
+            print(f"      y = {y_local[0]}, {y_local[1]}, ... {y_local[-1]} ({len(y_local)} points)")
         obj_height_inpaint = inpaint_biharmonic(
             np.pad(
                 obj_height[r0:r1, c0:c1],
@@ -64,8 +95,8 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
                 mode='constant',
                 constant_values=((1,1), (1,1))))
         if verbose:
-            print(f"  Object {i}, local DEM (inpainted): "
-                  f"{obj_height_inpaint.shape[0]} (rows) x {obj_height_inpaint.shape[1]} (columns)")
+            print(f"    local DEM (inpainted): {obj_height_inpaint.shape[0]} (rows) "
+                  f"x {obj_height_inpaint.shape[1]} (columns)")
         interp_top = RegularGridInterpolator(
             (y_local, x_local),
             obj_height_inpaint,
@@ -116,13 +147,14 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         num_x_junc_nw = np.sum(x_junc_nw)
         num_x_junc_ne = np.sum(x_junc_ne)
         if verbose:
-            print(f"  Object {i}, X-junctions: "
-                  f"{num_x_junc_sw} (SW), {num_x_junc_se} (SE), "
-                  f"{num_x_junc_nw} (NW), {num_x_junc_ne} (NE).")
-            print(f"  {k_wall_w.size} west wall pixels detected.")
-            print(f"  {k_wall_e.size} east wall pixels detected.")
-            print(f"  {k_wall_s.size} south wall pixels detected.")
-            print(f"  {k_wall_n.size} north wall pixels detected.")
+            print(f"    X-junctions detected: {num_x_junc_sw} (SW), "
+                  f"{num_x_junc_se} (SE), "
+                  f"{num_x_junc_nw} (NW), "
+                  f"{num_x_junc_ne} (NE).")
+            print(f"    side wall pixels: {k_wall_w.size} (W) "
+                  f"{k_wall_e.size} (E) "
+                  f"{k_wall_s.size} (S) "
+                  f"{k_wall_n.size} (N)")
         mask_x_sw = x_junc_sw[mask_local[1:-1, 1:-1]].ravel()
         mask_x_se = x_junc_se[mask_local[1:-1, 1:-1]].ravel()
         mask_x_nw = x_junc_nw[mask_local[1:-1, 1:-1]].ravel()
@@ -138,9 +170,9 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         xv = np.concatenate((x0, x1, x2, x3))
         yv = np.concatenate((y0, y1, y2, y3))
         if verbose:
-            print(f"  Object {i}, vertices on top surface: "
-                  f"x_min = {np.min(xv)}, x_max = {np.max(xv)}, "
-                  f"y_min = {np.min(yv)}, y_max = {np.max(yv)}")
+            print("    vertices on top/bottom surface:")
+            print(f"      x_min = {np.min(xv)}, x_max = {np.max(xv)}")
+            print(f"      y_min = {np.min(yv)}, y_max = {np.max(yv)}")
         zv_obj = interp_top((yv, xv))
         zv_terrain = interp_bot((yv, xv)) - weld_thickness
         vtx_top = np.column_stack((xv, yv, zv_obj))
@@ -177,15 +209,10 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
         if mesh.is_watertight:
             meshes.append(mesh)
             if verbose:
-                print(f"  Watertight solid of object {i} generated: "
-                      f"{len(mesh.vertices)} vertices ({8*num_pixels} vertices added), "
-                      f"{len(mesh.faces)} faces.")
+                print(f"      ✅ Watertight solid generated: {len(mesh.vertices)} "
+                      f"vertices, {len(mesh.faces)} faces.")
         else:
-            print(f"  Open edges detected on object {i}: "
-                  f"{len(mesh.vertices)} vertices ({8*num_pixels} vertices added), "
-                  f"{len(mesh.faces)} faces.")
-            mesh.merge_vertices()
-            print(f"    {len(mesh.vertices)} vertices remain after merging.")
+            print("     ⚠  Non-watertight mesh generated.")
             meshes.append(mesh)
             edge_counter = Counter()
             for face in mesh.faces:
@@ -205,7 +232,7 @@ def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_
                     v1 = mesh.vertices[e[0]]
                     v2 = mesh.vertices[e[1]]
                     assert np.allclose(v1[:2], v2[:2])
-            print(f"    {num_open_edges} open edges found, "
+            print(f"      🔬 Diagnosis: {num_open_edges} open edges found, "
                   f"{num_complex_edges} non-manifold edges found, "
                   f"{num_kissing_edges} kissing edges found.")
             assert num_complex_edges == num_kissing_edges
@@ -326,7 +353,7 @@ def generate_terrain_solid(X, Y, Z, base_z):
     return terrain
 
 def main():
-    parser = argparse.ArgumentParser(description="swissSURFACE3D LiDAR DSM TIFF 图像转 STL 3D 模型")
+    parser = argparse.ArgumentParser(description="swissSURFACE3D LiDAR DSM TIFF 图像转 STL/GLB/OBJ/3MF 3D 模型")
     parser.add_argument(
         "tiff_input",
         type=str,
@@ -370,11 +397,6 @@ def main():
         help="输出详细调试信息"
     )
     parser.add_argument(
-        "-s", "--separate_objects",
-        action="store_true",
-        help="单独生成各个地物的几何体"
-    )
-    parser.add_argument(
         "-q", "--quiet",
         action="store_true",
         help="静默运行"
@@ -415,78 +437,42 @@ def main():
         terrain_mesh.export(terrain_output)
         print(f"Terrain component is saved to {terrain_output}")
     else:
-        print("Open edges detected.")
+        print("Open or non-manifold edges detected.")
     scene = trimesh.Scene()
     scene.add_geometry(terrain_mesh, node_name='Terrain', parent_node_name='world')
-    # 定义经典色卡调色板
-    CLASS_PALETTES = {
-        'Water': [
-            (  0, 119, 190),   # 海蓝
-            (  0, 191, 255),   # 湖蓝
-            ( 25,  25, 112),   # 深蓝
-            ( 70, 130, 180),   # 钢蓝
-            (100, 149, 237),   # 矢车菊蓝
-        ],
-        'Buildings': [
-            (176, 176, 176),   # 水泥灰
-            (178,  34,  34),   # 砖红
-            (194, 178, 128),   # 沙褐
-            (128, 128, 128),   # 灰
-            ( 85,  85,  85),   # 深灰
-            (205, 133,  63),   # 铜色
-        ],
-    }
-
-    def get_class_color(palette):
-        """从调色板随机选一种颜色，并施加不可察觉的微小抖动"""
-        base = random.choice(palette)
-        r = max(0, min(255, base[0] + random.randint(-3, 3)))
-        g = max(0, min(255, base[1] + random.randint(-3, 3)))
-        b = max(0, min(255, base[2] + random.randint(-3, 3)))
-        a = max(0, min(255, 255 + random.randint(-10, 10)))  # 抖动 alpha
-        return [r, g, b, a]
-
-    random.seed()  # 可复现（可选：设置固定数字如 random.seed(42)）
 
     for class_name in ['Water', 'Buildings', 'Vegetation']:
         if class_name.lower() == 'unclassified':
             continue
-        if args.separate_objects:
-            palette = CLASS_PALETTES.get(class_name, [(128, 128, 128)])
-            meshes = extrude_object_solid(
-                X, Y, surface_height['Terrain'],
-                surface_counts[class_name],
-                surface_height[class_name],
-                obj_area_threshold = args.object_area_threshold,
-                weld_thickness = args.weld_thickness,
-                verbose = args.verbose
-            )
-            print("  {} generated {} solid objects.".format(class_name, len(meshes)))
-            scene.add_geometry(trimesh.util.concatenate(meshes), node_name=class_name, parent_node_name='world')
-#            for i in range(len(meshes)):
-#                color = get_class_color(palette)
-#                meshes[i].visual.face_colors = color
-#                node_name = f'{class_name}_Obj_{i}'
-#                scene.add_geometry(meshes[i], node_name=node_name, parent_node_name='world')
-        else:
-            mask_obj = (surface_counts[class_name] > 0)
-            obj_dem = surface_height[class_name].copy()
-            obj_dem[~mask_obj] = surface_height['Terrain'][~mask_obj] - args.weld_thickness
-            obj_mesh = generate_terrain_solid_optimized(X, Y, obj_dem, args.base_z)
-            obj_output = stl_output + f'_{class_name}.stl'
-            if obj_mesh.is_watertight:
-                print("Watertight {} component is generated including {} vertices and {} faces.".format(
-                    class_name, len(obj_mesh.vertices), len(obj_mesh.faces)))
-                obj_mesh.export(obj_output)
-                print(f"{class_name} component is saved to {obj_output}")
-            else:
-                print("Open edges detected.")
-            scene.add_geometry(obj_mesh, node_name=class_name, parent_node_name='world')
+        palette = CLASS_PALETTES.get(class_name, [(128, 128, 128)])
+        meshes = extrude_object_solid(
+            X, Y, surface_height['Terrain'],
+            surface_counts[class_name],
+            surface_height[class_name],
+            obj_area_threshold = args.object_area_threshold,
+            weld_thickness = args.weld_thickness,
+            verbose = args.verbose
+        )
+        print("{} generated {} solid objects.".format(class_name, len(meshes)))
+        for i in range(len(meshes)):
+            color = get_class_color(palette)
+            meshes[i].visual.face_colors = color
+        obj_mesh = trimesh.util.concatenate(meshes)
+        obj_output = stl_output + '_{}.stl'.format(class_name)
+        obj_mesh.export(obj_output)
+        print(f"{class_name} component is saved to {obj_output}")
+        scene.add_geometry(obj_mesh, node_name=class_name, parent_node_name='world')
 
     if scene.is_empty:
         print("Scene is empty!")
     else:
         glb_output = stl_output + '_Scene.3mf'
+        scene.export(glb_output)
+        print(glb_output)
+        glb_output = stl_output + '_Scene.obj'
+        scene.export(glb_output)
+        print(glb_output)
+        glb_output = stl_output + '_Scene.glb'
         scene.export(glb_output)
         print(glb_output)
 
