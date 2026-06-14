@@ -458,6 +458,7 @@ def main():
             color = get_class_color(palette)
             meshes[i].visual.face_colors = color
         obj_mesh = trimesh.util.concatenate(meshes)
+        obj_mesh.visual.face_colors = get_class_color(palette)
         obj_output = stl_output + '_{}.stl'.format(class_name)
         obj_mesh.export(obj_output)
         print(f"{class_name} component is saved to {obj_output}")
