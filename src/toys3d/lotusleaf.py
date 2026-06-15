@@ -11,13 +11,13 @@ skirt_angle = np.deg2rad(60.0)
 skirt_radius = skirt_width / np.cos(skirt_angle)
 stalk_top_diameter = 30.0
 stalk_bottom_diameter = 8.0
-stalk_height = 80.0
+stalk_height = 90.0
 num_spokes = 12
 thickness = 2.0
 skirt_amplitude = 5.0
 stalk_amplitude = 0.5
 
-num_radius = 50
+num_radius = 100
 num_azimuth = 1000
 
 agv = np.arange(num_azimuth) / num_azimuth * 2.0 * np.pi
