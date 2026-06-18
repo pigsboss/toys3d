@@ -2,19 +2,20 @@
 import numpy as np
 import trimesh
 import os
+import argparse
 from scipy.spatial import Delaunay
 from collections import Counter
 
-leaf_diameter = 145.0
+leaf_diameter = 120.0
 skirt_width = 30.0
 skirt_angle = np.deg2rad(60.0)
 skirt_radius = skirt_width / np.cos(skirt_angle)
 stalk_top_diameter = 30.0
 stalk_bottom_diameter = 8.0
 stalk_height = 90.0
-num_spokes = 12
-thickness = 2.0
-skirt_amplitude = 5.0
+num_spokes = 18
+thickness = 1.0
+skirt_amplitude = 3.0
 stalk_amplitude = 0.5
 
 num_radius = 100
@@ -40,8 +41,8 @@ if stalk_height > 0:
     zgv_out = np.linspace(-stalk_brim_radius, -thickness/2.0, num_radius)
     z_in,  _ = np.meshgrid(zgv_in,  agv, indexing='xy')
     z_out, _ = np.meshgrid(zgv_out, agv, indexing='xy')
-    r_in  = stalk_bottom_diameter/2.0 + stalk_brim_radius - (stalk_brim_radius_in **2.0 - (z_in +stalk_brim_radius)**2.0)**0.5 + np.cos(a * num_spokes / 2.) * stalk_amplitude
-    r_out = stalk_bottom_diameter/2.0 + stalk_brim_radius - (stalk_brim_radius_out**2.0 - (z_out+stalk_brim_radius)**2.0)**0.5 + np.cos(a * num_spokes / 2.) * stalk_amplitude
+    r_in  = stalk_bottom_diameter/2.0 + stalk_brim_radius - (stalk_brim_radius_in **2.0 - (z_in +stalk_brim_radius)**2.0)**0.5 + np.cos(a * num_spokes / 3.) * stalk_amplitude
+    r_out = stalk_bottom_diameter/2.0 + stalk_brim_radius - (stalk_brim_radius_out**2.0 - (z_out+stalk_brim_radius)**2.0)**0.5 + np.cos(a * num_spokes / 3.) * stalk_amplitude
     x_in  = np.cos(a) * r_in
     y_in  = np.sin(a) * r_in
     x_out = np.cos(a) * r_out
