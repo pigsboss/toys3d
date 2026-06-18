@@ -16,6 +16,7 @@ from scipy.interpolate import griddata, RegularGridInterpolator
 from skimage.restoration import inpaint_biharmonic
 from collections import Counter
 from scipy.spatial import Delaunay
+from skimage.filters import frangi
 
 x_junc_avoid = 0.01
 
@@ -48,6 +49,34 @@ def get_class_color(palette):
     return [r, g, b, a]
 
 random.seed()  # 可复现（可选：设置固定数字如 random.seed(42)）
+
+def frangi_response(intensity, counts, min_width, max_width, frangi_beta=0.5):
+    """
+    使用基于 Hessian 矩阵的多尺度 Frangi 滤波器提取道路实体。
+    
+    参数:
+    min_width_m, max_width_m: 道路在现实世界中的物理宽度范围 (米)
+    """
+    # 1. 物理尺度到像素尺度的转换 (Sigma 对应高斯核的标淮差)
+    # 假设你的 scale_x 是 0.5m/pixel，那么 12 米的道路宽度大约是 24 个像素
+    sigmas = np.arange(min_width, max_width, 1.0)
+    
+    # 2. 预处理：对比度拉伸，排除极端值
+    p2, p98 = np.percentile(intensity[counts > 0], (2, 98))
+    intensity_norm = np.clip((intensity - p2) / (p98 - p2), 0, 1)
+    
+    # 注意：Frangi 默认寻找“亮”的管状物。
+    # 柏油路在 Intensity 图中通常是黑色的，所以我们需要将图像反转 (Invert)
+    intensity_inv = 1.0 - intensity_norm
+    
+    # 3. 多尺度管状结构滤波 (核心降维打击)
+    # black_ridges=False 因为我们已经反转了图像，寻找白色的脊
+    return intensity_inv, frangi(
+        intensity_inv,
+        sigmas=sigmas,
+        beta=frangi_beta,
+        black_ridges=False
+    )
 
 def extrude_object_solid(X, Y, terrain_height, obj_counts, obj_height, obj_area_threshold=3.0, weld_thickness=0.1, verbose=False):
     scale_x = np.mean(np.diff(X, axis=1))
@@ -352,6 +381,24 @@ def generate_terrain_solid(X, Y, Z, base_z):
     terrain.fix_normals()
     return terrain
 
+def extract_asphalt(terrain_counts, terrain_height, terrain_intensity, pixel_scale, asphalt_thickness=1., segments_acceptance=0.05, frangi_threshold=0.01, min_width_m=2.0, max_width_m=7.0, frangi_beta=0.5, verbose=False):
+    if verbose:
+        print('  Extracting asphalt with frangi filters...')
+    _, resp = frangi_response(terrain_intensity, terrain_counts, min_width_m/pixel_scale, max_width_m/pixel_scale, frangi_beta=frangi_beta)
+    fmask = np.uint8(resp > frangi_threshold)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fmask, 4, cv2.CV_32S)
+    if verbose:
+        print(f'  {num_labels-1} asphalt segments detected.')
+    mask = np.isin(labels, np.argwhere(stats[1:,cv2.CC_STAT_AREA]>np.percentile(stats[1:,cv2.CC_STAT_AREA],100.*(1-segments_acceptance)))+1)
+    asphalt_counts = np.zeros_like(terrain_counts)
+    asphalt_counts[mask] = terrain_counts[mask]
+    asphalt_height = np.zeros_like(terrain_height)
+    asphalt_height[mask] = terrain_height[mask]
+    terrain_height[mask] = terrain_height[mask] - asphalt_thickness
+    asphalt_intensity = terrain_intensity.copy()
+    asphalt_intensity[mask] = terrain_intensity[mask]
+    return terrain_height, asphalt_counts, asphalt_height, asphalt_intensity
+
 def main():
     parser = argparse.ArgumentParser(description="swissSURFACE3D LiDAR DSM TIFF 图像转 STL/GLB/OBJ/3MF 3D 模型")
     parser.add_argument(
@@ -392,9 +439,69 @@ def main():
         help="地物提取面积阈值"
     )
     parser.add_argument(
+        "--asphalt_thickness",
+        dest="asphalt_thickness",
+        type=float,
+        metavar="ASPHALT_THICKNESS",
+        default=1.0,
+        help="铺装路面厚度"
+    )
+    parser.add_argument(
+        "--asphalt_min_width",
+        dest="asphalt_min_width",
+        type=float,
+        metavar="ASPHALT_MIN_WIDTH",
+        default=2.0,
+        help="铺装路面最小宽度（单位：米）"
+    )
+    parser.add_argument(
+        "--asphalt_max_width",
+        dest="asphalt_max_width",
+        type=float,
+        metavar="ASPHALT_MAX_WIDTH",
+        default=7.0,
+        help="铺装路面最大宽度（单位：米）"
+    )
+    parser.add_argument(
+        "--asphalt_segments_acceptance",
+        dest="asphalt_segments_acceptance",
+        type=float,
+        metavar="ASPHALT_SEGMENTS_ACCEPTANCE",
+        default=0.05,
+        help="铺装路段接受比例（0.0 - 1.0）"
+    )
+    parser.add_argument(
+        "--asphalt_frangi_threshold",
+        dest="asphalt_frangi_threshold",
+        type=float,
+        metavar="ASPHALT_FRANGI_THRESHOLD",
+        default=0.01,
+        help="铺装路面提取滤波算法阈值"
+    ) 
+    parser.add_argument(
+        "--asphalt_frangi_beta",
+        dest="asphalt_frangi_beta",
+        type=float,
+        metavar="ASPHALT_FRANGI_BETA",
+        default=0.5,
+        help="铺装路面提取滤波算法 Beta 参数"
+    )
+    parser.add_argument(
+        "-C", "--classes",
+        dest="classes",
+        nargs='+',
+        default=['Water','Buildings','Vegetation'],
+        help="铺装路面提取滤波算法 Beta 参数"
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="输出详细调试信息"
+    )
+    parser.add_argument(
+        "-e", "--extract_asphalt",
+        action="store_true",
+        help="提取铺装路面"
     )
     parser.add_argument(
         "-q", "--quiet",
@@ -428,7 +535,25 @@ def main():
                 surface_height[metadata['class_name']] = p.asarray()
             elif metadata['data'].lower() == 'intensity':
                 surface_intensity[metadata['class_name']] = p.asarray()
+    scene = trimesh.Scene()
     X, Y = np.meshgrid(x, y)
+    if args.extract_asphalt:
+        surface_height['Terrain'], asphalt_counts, asphalt_height, asphalt_intensity = extract_asphalt(
+            surface_counts['Terrain'],
+            surface_height['Terrain'],
+            surface_intensity['Terrain'],
+            min(scale_x, scale_y),
+            asphalt_thickness=args.asphalt_thickness,
+            segments_acceptance=args.asphalt_segments_acceptance,
+            frangi_threshold=args.asphalt_frangi_threshold,
+            min_width_m=args.asphalt_min_width,
+            max_width_m=args.asphalt_max_width,
+            frangi_beta=args.asphalt_frangi_beta,
+            verbose=args.verbose)
+        surface_counts['Asphalt'] = asphalt_counts
+        surface_height['Asphalt'] = asphalt_height
+        surface_intensity['Asphalt'] = asphalt_intensity
+        args.classes.append('Asphalt')
     terrain_mesh = generate_terrain_solid_optimized(X, Y, surface_height['Terrain'], args.base_z)
     terrain_output = stl_output + '_Terrain.stl'
     if terrain_mesh.is_watertight:
@@ -438,10 +563,9 @@ def main():
         print(f"Terrain component is saved to {terrain_output}")
     else:
         print("Open or non-manifold edges detected.")
-    scene = trimesh.Scene()
     scene.add_geometry(terrain_mesh, node_name='Terrain', parent_node_name='world')
 
-    for class_name in ['Water', 'Buildings', 'Vegetation']:
+    for class_name in args.classes:
         if class_name.lower() == 'unclassified':
             continue
         palette = CLASS_PALETTES.get(class_name, [(128, 128, 128)])
