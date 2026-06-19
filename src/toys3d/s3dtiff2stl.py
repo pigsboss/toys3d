@@ -5,7 +5,6 @@ import numpy as np
 import tifffile
 import trimesh
 import os
-import random
 import argparse
 import trimesh
 import cv2
@@ -20,36 +19,10 @@ from skimage.filters import frangi
 
 x_junc_avoid = 0.01
 
-# 定义经典色卡调色板
-CLASS_PALETTES = {
-    'Water': [
-        (  0, 119, 190),   # 海蓝
-        (  0, 191, 255),   # 湖蓝
-        ( 25,  25, 112),   # 深蓝
-        ( 70, 130, 180),   # 钢蓝
-        (100, 149, 237),   # 矢车菊蓝
-    ],
-    'Buildings': [
-        (176, 176, 176),   # 水泥灰
-        (178,  34,  34),   # 砖红
-        (194, 178, 128),   # 沙褐
-        (128, 128, 128),   # 灰
-        ( 85,  85,  85),   # 深灰
-        (205, 133,  63),   # 铜色
-    ],
+FLOAT_THICKNESS = {
+    'Wire': 0.1,
+    'Bridge_Deck': 2.0,
 }
-
-def get_class_color(palette):
-    """从调色板随机选一种颜色，并施加不可察觉的微小抖动"""
-    base = random.choice(palette)
-    r = max(0, min(255, base[0] + random.randint(-3, 3)))
-    g = max(0, min(255, base[1] + random.randint(-3, 3)))
-    b = max(0, min(255, base[2] + random.randint(-3, 3)))
-    a = max(0, min(255, 255 + random.randint(-10, 10)))  # 抖动 alpha
-    return [r, g, b, a]
-
-random.seed()  # 可复现（可选：设置固定数字如 random.seed(42)）
-
 def frangi_response(intensity, counts, min_width, max_width, frangi_beta=0.5):
     """
     使用基于 Hessian 矩阵的多尺度 Frangi 滤波器提取道路实体。
@@ -493,7 +466,7 @@ def main():
         "-C", "--classes",
         dest="classes",
         nargs='+',
-        default=['Water','Buildings','Vegetation'],
+        default=['Water','Buildings','Vegetation','Bridge_Deck','Building_facades','Bridge_piers'],
         help="提取地物类别"
     )
     parser.add_argument(
@@ -556,6 +529,7 @@ def main():
         surface_counts['Asphalt'] = asphalt_counts
         surface_height['Asphalt'] = asphalt_height
         surface_intensity['Asphalt'] = asphalt_intensity
+        surface_classes.append('Asphalt')
         args.classes.append('Asphalt')
     terrain_mesh = generate_terrain_solid_optimized(X, Y, surface_height['Terrain'], args.base_z)
     terrain_output = stl_output + '_Terrain.stl'
@@ -571,21 +545,33 @@ def main():
     for class_name in args.classes:
         if class_name.lower() == 'unclassified':
             continue
-        palette = CLASS_PALETTES.get(class_name, [(128, 128, 128)])
-        meshes = extrude_object_solid(
-            X, Y, surface_height['Terrain'],
-            surface_counts[class_name],
-            surface_height[class_name],
-            obj_area_threshold = args.object_area_threshold,
-            weld_thickness = args.weld_thickness,
-            verbose = args.verbose
-        )
+        if class_name not in surface_classes:
+            print(f'{class_name} page not found.')
+            continue
+        if not np.any(surface_counts[class_name]):
+            print(f'{class_name} mask not found.')
+            continue
+        if class_name in ['Wire', 'Bridge_Deck']:
+            terrain_height = surface_height['Terrain'].copy()
+            mask = (surface_counts[class_name] > 0)
+            terrain_height[mask] = surface_height[class_name][mask] - FLOAT_THICKNESS[class_name]
+            meshes = extrude_object_solid(
+                X, Y, terrain_height,
+                surface_counts[class_name],
+                surface_height[class_name],
+                obj_area_threshold = args.object_area_threshold,
+                weld_thickness = args.weld_thickness,
+                verbose = args.verbose)
+        else:
+            meshes = extrude_object_solid(
+                X, Y, surface_height['Terrain'],
+                surface_counts[class_name],
+                surface_height[class_name],
+                obj_area_threshold = args.object_area_threshold,
+                weld_thickness = args.weld_thickness,
+                verbose = args.verbose)
         print("{} generated {} solid objects.".format(class_name, len(meshes)))
-        for i in range(len(meshes)):
-            color = get_class_color(palette)
-            meshes[i].visual.face_colors = color
         obj_mesh = trimesh.util.concatenate(meshes)
-        obj_mesh.visual.face_colors = get_class_color(palette)
         obj_output = stl_output + '_{}.stl'.format(class_name)
         obj_mesh.export(obj_output)
         print(f"{class_name} component is saved to {obj_output}")
