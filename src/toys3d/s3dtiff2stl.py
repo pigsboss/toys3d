@@ -386,7 +386,10 @@ def extract_asphalt(terrain_counts, terrain_height, terrain_intensity, pixel_sca
         print('  Extracting asphalt with frangi filters...')
     _, resp = frangi_response(terrain_intensity, terrain_counts, min_width_m/pixel_scale, max_width_m/pixel_scale, frangi_beta=frangi_beta)
     fmask = np.uint8(resp > frangi_threshold)
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fmask, 4, cv2.CV_32S)
+    # 优化点：形态学闭运算，防止路面因为斑马线、汽车、落叶而产生空洞
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    fmask_closed = cv2.morphologyEx(fmask, cv2.MORPH_CLOSE, kernel)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fmask_closed, 4, cv2.CV_32S)
     if verbose:
         print(f'  {num_labels-1} asphalt segments detected.')
     mask = np.isin(labels, np.argwhere(stats[1:,cv2.CC_STAT_AREA]>np.percentile(stats[1:,cv2.CC_STAT_AREA],100.*(1-segments_acceptance)))+1)
@@ -491,7 +494,7 @@ def main():
         dest="classes",
         nargs='+',
         default=['Water','Buildings','Vegetation'],
-        help="铺装路面提取滤波算法 Beta 参数"
+        help="提取地物类别"
     )
     parser.add_argument(
         "-v", "--verbose",
