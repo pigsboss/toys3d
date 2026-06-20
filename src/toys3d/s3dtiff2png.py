@@ -10,11 +10,12 @@ from laz2tiff import basename_without_all_extensions
 from ast import literal_eval
 from laz2tiff import CLASSES
 from time import time
-from s3dtiff2stl import extract_asphalt
+from s3dtiff2stl import extract_asphalt, inpaint_surface
+from skimage.restoration import inpaint_biharmonic
 
 CLASS_PALETTES = {
     'Terrain':          ((0.431, 0.333, 0.235), (0.612, 0.647, 0.529)), # 泥土 -- 灰苔
-    'Water':            ((0.000, 0.000, 0.545), (0.125, 0.698, 0.667)),
+    'Water':            ((0.125, 0.698, 0.667), (0.251, 0.878, 0.816)),
     'Buildings':        ((0.545, 0.227, 0.169), (0.824, 0.706, 0.549)), # Geneva theme
     'Vegetation':       ((0.333, 0.420, 0.184), (0.604, 0.804, 0.196)),
     'Asphalt':          ((0.176, 0.176, 0.176), (0.314, 0.314, 0.314)),
@@ -43,7 +44,7 @@ def main():
     parser.add_argument(
         "-C", "--classes",
         dest="classes",
-        nargs='+',
+        nargs='*',
         default=['Water','Buildings','Vegetation', 'Wire', 'Masts', 'Bridge_Deck', 'Building_facades', 'Bridge_piers'],
         help="绘制地物类型"
     )
@@ -113,9 +114,22 @@ def main():
         help="铺装路面提取滤波算法 Beta 参数"
     )
     parser.add_argument(
+        "--inpaint_area_threshold",
+        dest="inpaint_area_threshold",
+        type=int,
+        metavar="INPAINT_AREA_THRESHOLD",
+        default=7,
+        help="最小修补面积（单位：像素）"
+    )
+    parser.add_argument(
         "-q", "--quiet",
         action="store_true",
         help="静默运行"
+    )
+    parser.add_argument(
+        "-i", "--inpaint",
+        action="store_true",
+        help="修补地物缺失"
     )
     args = parser.parse_args()
     tiff_input = os.path.abspath(os.path.normpath(args.tiff_input))
@@ -162,13 +176,19 @@ def main():
         surface_classes.append('Asphalt')
         args.classes.insert(0, 'Asphalt')
 
-    terrain_mask = (surface_counts['Terrain'] > 0)
+
+    if args.inpaint:
+        surface_counts, surface_height, surface_intensity = inpaint_surface(surface_counts, surface_height, surface_intensity, surface_classes, inpaint_area_threshold=args.inpaint_area_threshold, verbose=args.verbose)
+
+    terrain_mask = np.ones((rows, cols), dtype='bool')
     rgb = np.zeros((rows, cols, 3), dtype = 'uint16')
     for class_name in args.classes:
-        if class_name.lower() == 'unclassified':
+        if not class_name:
             continue
         if class_name not in surface_classes:
             print(f'{class_name} not found.')
+            continue
+        if class_name.lower() == 'unclassified':
             continue
         rgb_min, rgb_max = CLASS_PALETTES[class_name]
         if args.mapping.lower().startswith('i'):
@@ -177,13 +197,13 @@ def main():
         elif args.mapping.lower().startswith('he'):
             # height map
             if class_name == 'Water':
-                v = surface_height['Water'] - surface_height['Terrain']
+                v = - surface_height['Water'] + surface_height['Terrain']
             else:
                 v = surface_height[class_name]
         elif args.mapping.lower().startswith('hy'):
             # hybrid map
             if class_name == 'Water':
-                v = surface_height['Water'] - surface_height['Terrain']
+                v = - surface_height['Water'] + surface_height['Terrain']
             else:
                 v = surface_intensity[class_name]
         else:

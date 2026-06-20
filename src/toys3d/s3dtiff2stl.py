@@ -23,6 +23,47 @@ FLOAT_THICKNESS = {
     'Wire': 0.1,
     'Bridge_Deck': 2.0,
 }
+
+def inpaint_surface(surface_counts, surface_height, surface_intensity, surface_classes, inpaint_area_threshold=7, verbose=False):
+    no_terrain = np.uint8(surface_counts['Terrain'] < 1)
+    source_classes = []
+    for class_name in np.unique(surface_classes):
+        if class_name.lower() not in ['unclassified', 'terrain']:
+            source_classes.append(class_name)
+    if np.sum(no_terrain) and len(source_classes) > 0:
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(no_terrain, 4, cv2.CV_32S)
+        cavities_indices = np.argwhere(stats[1:, 4] > inpaint_area_threshold).ravel() + 1
+        if verbose:
+            print(f'  {len(cavities_indices)} cavities found on terrain map.')
+        for i in cavities_indices:
+            c, r, w, h, area = stats[i, :]
+            if verbose:
+                print(f'    cavity {i}: x={c}, y={r}, width={w}, height={h}, area={area}')
+            current_cavity_mask = (labels == i)
+            scores_by_counts = np.zeros((len(source_classes), ))
+            scores_by_covers = np.zeros((len(source_classes), ))
+            for j in range(len(source_classes)):
+                class_name = source_classes[j]
+                scores_by_counts[j] = np.sum(surface_counts[class_name][current_cavity_mask])
+                scores_by_covers[j] = np.sum(surface_counts[class_name][current_cavity_mask] > 0)
+            rank_by_counts = np.argsort(scores_by_counts)
+            rank_by_covers = np.argsort(scores_by_covers)
+            if verbose:
+                print(f'      top counts: {source_classes[rank_by_counts[-1]]} ({scores_by_counts[rank_by_counts[-1]]})')
+                print(f'      top covers: {source_classes[rank_by_covers[-1]]} ({scores_by_covers[rank_by_covers[-1]]})')
+            if (rank_by_counts[-1] == rank_by_covers[-1]) and (scores_by_counts[rank_by_counts[-1]] > 0) and np.sum(current_cavity_mask):
+                class_name = source_classes[rank_by_counts[-1]]
+                if verbose:
+                    print(f'      inpaint {np.sum(current_cavity_mask)} missing pixels on {class_name} map')
+                source_mask = (surface_counts[class_name] < 1)
+                mask = np.logical_and(current_cavity_mask, source_mask)
+                surface_height[class_name][r:r+h, c:c+w] = inpaint_biharmonic(surface_height[class_name][r:r+h, c:c+w], source_mask[r:r+h, c:c+w])
+                surface_intensity[class_name][r:r+h, c:c+w] = inpaint_biharmonic(surface_intensity[class_name][r:r+h, c:c+w], source_mask[r:r+h, c:c+w])
+                surface_counts[class_name][mask] = 1
+
+    return surface_counts, surface_height, surface_intensity
+
+
 def frangi_response(intensity, counts, min_width, max_width, frangi_beta=0.5):
     """
     使用基于 Hessian 矩阵的多尺度 Frangi 滤波器提取道路实体。
@@ -463,6 +504,14 @@ def main():
         help="铺装路面提取滤波算法 Beta 参数"
     )
     parser.add_argument(
+        "--inpaint_area_threshold",
+        dest="inpaint_area_threshold",
+        type=int,
+        metavar="INPAINT_AREA_THRESHOLD",
+        default=7,
+        help="最小修补面积（单位：像素）"
+    )
+    parser.add_argument(
         "-C", "--classes",
         dest="classes",
         nargs='+',
@@ -483,6 +532,11 @@ def main():
         "-q", "--quiet",
         action="store_true",
         help="静默运行"
+    )
+    parser.add_argument(
+        "-i", "--inpaint",
+        action="store_true",
+        help="修补缺失地物"
     )
     args = parser.parse_args()
     tiff_input = os.path.abspath(os.path.normpath(args.tiff_input))
@@ -511,6 +565,10 @@ def main():
                 surface_height[metadata['class_name']] = p.asarray()
             elif metadata['data'].lower() == 'intensity':
                 surface_intensity[metadata['class_name']] = p.asarray()
+
+    if args.verbose:
+        print('Terrain loaded. Elevation: {} m to {} m.'.format(np.min(surface_height['Terrain']), np.max(surface_height['Terrain'])))
+
     scene = trimesh.Scene()
     X, Y = np.meshgrid(x, y)
     if args.extract_asphalt:
@@ -531,6 +589,10 @@ def main():
         surface_intensity['Asphalt'] = asphalt_intensity
         surface_classes.append('Asphalt')
         args.classes.append('Asphalt')
+
+    if args.inpaint:
+        surface_counts, surface_height, surface_intensity = inpaint_surface(surface_counts, surface_height, surface_intensity, surface_classes, inpaint_area_threshold=args.inpaint_area_threshold, verbose=args.verbose)
+
     terrain_mesh = generate_terrain_solid_optimized(X, Y, surface_height['Terrain'], args.base_z)
     terrain_output = stl_output + '_Terrain.stl'
     if terrain_mesh.is_watertight:
@@ -581,12 +643,6 @@ def main():
         print("Scene is empty!")
     else:
         glb_output = stl_output + '_Scene.3mf'
-        scene.export(glb_output)
-        print(glb_output)
-        glb_output = stl_output + '_Scene.obj'
-        scene.export(glb_output)
-        print(glb_output)
-        glb_output = stl_output + '_Scene.glb'
         scene.export(glb_output)
         print(glb_output)
 
