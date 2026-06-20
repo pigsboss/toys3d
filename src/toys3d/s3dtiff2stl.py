@@ -57,8 +57,12 @@ def inpaint_surface(surface_counts, surface_height, surface_intensity, surface_c
                     print(f'      inpaint {np.sum(current_cavity_mask)} missing pixels on {class_name} map')
                 source_mask = (surface_counts[class_name] < 1)
                 mask = np.logical_and(current_cavity_mask, source_mask)
-                surface_height[class_name][r:r+h, c:c+w] = inpaint_biharmonic(surface_height[class_name][r:r+h, c:c+w], source_mask[r:r+h, c:c+w])
-                surface_intensity[class_name][r:r+h, c:c+w] = inpaint_biharmonic(surface_intensity[class_name][r:r+h, c:c+w], source_mask[r:r+h, c:c+w])
+                if w*h>100000:
+                    split = True
+                else:
+                    split = False
+                surface_height[class_name][r:r+h, c:c+w] = inpaint_biharmonic(surface_height[class_name][r:r+h, c:c+w], source_mask[r:r+h, c:c+w], split_into_regions=split)
+                surface_intensity[class_name][r:r+h, c:c+w] = inpaint_biharmonic(surface_intensity[class_name][r:r+h, c:c+w], source_mask[r:r+h, c:c+w], split_into_regions=split)
                 surface_counts[class_name][mask] = 1
 
     return surface_counts, surface_height, surface_intensity
