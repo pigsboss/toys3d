@@ -261,3 +261,122 @@ def orthogonalize_axes(dir_x, point_x, weight_x,
     T_local_to_world[:3, 3] = origin
 
     return T_world_to_local, T_local_to_world, u_x, u_y, u_z, origin
+
+def segment_tubular_regions(normals, areas=None, threshold=0.1, min_faces=100,
+                            max_regions=5, max_iterations=1000, rng=None):
+    """
+    使用 RANSAC 根据面片法线将三角网格分割为不同的管状区域。
+
+    管状区域的特征是所有面片法线大致垂直于该区域的轴线。随机抽取两个面片，
+    其法线叉乘作为候选轴线，将法线与轴线点积绝对值小于阈值的面片作为内点。
+    重复此过程以取出多个区域。
+
+    Parameters
+    ----------
+    normals : (N, 3) np.ndarray
+        面片单位法向量（必须已归一化）。
+    areas : (N,) np.ndarray or None
+        面片面积，用于加权评分。若为 None，则使用等权（每个面片权重为 1）。
+    threshold : float
+        内点判定阈值：若 |dot(normal, axis)| <= threshold，该面片属于当前区域。
+        数值越小越严格。
+    min_faces : int
+        一个区域必须包含的最少面片数。
+    max_regions : int
+        最多提取的区域数量。
+    max_iterations : int
+        每个区域 RANSAC 的最大迭代次数。
+    rng : numpy.random.Generator or None
+        随机数生成器，用于可重复性。若为 None 则使用默认随机状态。
+
+    Returns
+    -------
+    labels : (N,) np.ndarray (int)
+        面片区域标签。0 表示未归类，1..k 表示第 k 个区域。
+    axes : list of ndarray (3,)
+        每个区域对应的单位轴线方向（顺序与标签编号一致）。
+    """
+    N = normals.shape[0]
+    if N == 0:
+        return np.zeros(0, dtype=int), []
+
+    # 确保法向量单位化（用户应保证，但做一次归一化以防万一）
+    n = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+
+    # 面积权重
+    if areas is None:
+        weights = np.ones(N, dtype=np.float64)
+    else:
+        weights = np.asarray(areas, dtype=np.float64)
+
+    # 随机数生成器
+    if rng is None:
+        rng = np.random.default_rng()
+
+    labels = np.zeros(N, dtype=int)
+    axes = []
+
+    # 当前可用的面片索引（未归类的）
+    active = np.where(labels == 0)[0]
+
+    for region_id in range(1, max_regions + 1):
+        if len(active) < 2 or len(active) < min_faces:
+            break
+
+        # 当前活动子集
+        active_n = n[active]
+        active_w = weights[active]
+
+        best_score = -1.0
+        best_axis = None
+        best_inliers = None  # 相对于 active 的布尔掩码
+
+        # 自适应迭代次数：考虑期望内点比例至少 min_faces/len(active)
+        desired_inlier_ratio = max(min_faces / len(active), 0.01)
+        # 概率采样模型所需最少迭代次数（保证至少一次全内点抽样概率 0.99）
+        iters = min(
+            max_iterations,
+            int(np.log(0.01) / np.log(1 - desired_inlier_ratio**2))
+        )
+        iters = max(1, iters)
+
+        for _ in range(iters):
+            # 随机抽取两个不同的活动面片
+            i, j = rng.choice(len(active), size=2, replace=False)
+            n1, n2 = active_n[i], active_n[j]
+
+            cross = np.cross(n1, n2)
+            norm_cross = np.linalg.norm(cross)
+            if norm_cross < 1e-9:   # 法线几乎平行，无法定义轴线
+                continue
+            axis = cross / norm_cross
+
+            # 计算所有活动面片与该轴线的点积绝对值
+            dots = np.abs(active_n @ axis)
+            inliers = dots <= threshold
+
+            # 评分 = 内点权重之和
+            score = np.sum(active_w[inliers])
+
+            # 内点数必须满足最小要求
+            if np.sum(inliers) < min_faces:
+                continue
+
+            if score > best_score:
+                best_score = score
+                best_axis = axis.copy()
+                best_inliers = inliers
+
+        # 如果没有找到合格模型，停止
+        if best_axis is None:
+            break
+
+        # 将内点标记到全局 labels
+        active_indices = active[best_inliers]
+        labels[active_indices] = region_id
+        axes.append(best_axis)
+
+        # 更新 active 列表
+        active = np.where(labels == 0)[0]
+
+    return labels, axes
