@@ -153,3 +153,111 @@ def line_line_distance_and_midpoint(dir1, point1, dir2, point2):
     midpoint = (q1 + q2) / 2.0
 
     return distance, midpoint
+
+
+def orthogonalize_axes(dir_x, point_x, weight_x,
+                       dir_y, point_y, weight_y):
+    """
+    从两条近似垂直的直线及其置信度构造正交坐标系，并输出坐标变换矩阵。
+
+    算法：
+    1. 归一化初始方向。
+    2. 权重较高的轴保持不动，另一轴投影到其正交补，确保正交。
+    3. 用正交化后的方向及原始点定义两条空间直线，计算公垂线垂足。
+    4. 以置信度为权重求垂足的加权中点作为坐标系原点。
+    5. 平移坐标轴过原点，构造右手系基向量。
+    6. 生成世界→新坐标系  及  新坐标系→世界  的 4×4 刚体变换矩阵。
+
+    Parameters
+    ----------
+    dir_x : (3,) array_like
+        x 轴初始方向向量（无需归一化）。
+    point_x : (3,) array_like
+        x 轴上的一点。
+    weight_x : float
+        x 轴的置信度（>0 表明更可信；可为 0）。
+    dir_y : (3,) array_like
+        y 轴初始方向向量（无需归一化）。
+    point_y : (3,) array_like
+        y 轴上的一点。
+    weight_y : float
+        y 轴的置信度。
+
+    Returns
+    -------
+    T_world_to_local : ndarray (4,4)
+        原世界坐标系 → 新正交坐标系的刚体变换矩阵。
+        用法：``mesh.apply_transform(T_world_to_local)`` 可将 mesh 变换到新坐标系。
+    T_local_to_world : ndarray (4,4)
+        新正交坐标系 → 原世界坐标系的刚体变换矩阵。
+    u_x : ndarray (3,)
+        新坐标系 x 轴在原世界系中的单位方向向量。
+    u_y : ndarray (3,)
+        新坐标系 y 轴在原世界系中的单位方向向量。
+    u_z : ndarray (3,)
+        新坐标系 z 轴在原世界系中的单位方向向量（通过右手定则计算）。
+    origin : ndarray (3,)
+        新坐标系原点在原世界系中的坐标。
+    """
+    # 转 numpy 数组
+    dx = np.asarray(dir_x, dtype=np.float64)
+    px = np.asarray(point_x, dtype=np.float64)
+    dy = np.asarray(dir_y, dtype=np.float64)
+    py = np.asarray(point_y, dtype=np.float64)
+
+    # 归一化初始方向
+    dx = dx / np.linalg.norm(dx)
+    dy = dy / np.linalg.norm(dy)
+
+    # 正交化：保留权重大的轴，修正另一轴
+    if weight_x >= weight_y:
+        u_x = dx
+        # dy 投影到与 u_x 正交的方向
+        u_y = dy - np.dot(dy, u_x) * u_x
+        norm_uy = np.linalg.norm(u_y)
+        if norm_uy < 1e-12:
+            # y 轴与 x 轴几乎共线，无法构造正交系
+            raise ValueError("y 轴方向与 x 轴平行，无法构造正交坐标系")
+        u_y /= norm_uy
+    else:
+        u_y = dy
+        u_x = dx - np.dot(dx, u_y) * u_y
+        norm_ux = np.linalg.norm(u_x)
+        if norm_ux < 1e-12:
+            raise ValueError("x 轴方向与 y 轴平行，无法构造正交坐标系")
+        u_x /= norm_ux
+
+    # 右手系 z 轴
+    u_z = np.cross(u_x, u_y)
+
+    # 计算两条正交但不一定共面的直线的公垂线垂足
+    # Lx: px + t * u_x; Ly: py + s * u_y
+    # 由于 u_x · u_y = 0，解 t, s 使得 (px + t*u_x) - (py + s*u_y) 垂直于两者
+    v = py - px
+    t = np.dot(v, u_x)                    # 投影到 u_x
+    s = -np.dot(v, u_y)                   # 投影到 u_y（注意符号）
+    qx = px + t * u_x
+    qy = py + s * u_y
+
+    # 加权中点作为原点
+    w_sum = weight_x + weight_y
+    if w_sum < 1e-12:
+        # 无有效权重，取普通中点
+        origin = (qx + qy) / 2.0
+    else:
+        origin = (weight_x * qx + weight_y * qy) / w_sum
+
+    # 构造基矩阵 R = [u_x, u_y, u_z] (3x3)，注意这是列向量排列
+    R = np.column_stack((u_x, u_y, u_z))
+
+    # 世界 → 新坐标系：p_local = R.T @ (p_world - origin)
+    T_world_to_local = np.eye(4)
+    T_world_to_local[:3, :3] = R.T
+    T_world_to_local[:3, 3] = -R.T @ origin
+
+    # 新坐标系 → 世界：p_world = R @ p_local + origin
+    T_local_to_world = np.eye(4)
+    T_local_to_world[:3, :3] = R
+    T_local_to_world[:3, 3] = origin
+
+    return T_world_to_local, T_local_to_world, u_x, u_y, u_z, origin
