@@ -85,3 +85,71 @@ def axis_from_plucker(C, ref_point=None):
         base_point = np.asarray(ref_point) + p_rel
 
     return d, base_point
+
+def line_line_distance_and_midpoint(dir1, point1, dir2, point2):
+    """
+    计算空间两条直线的公垂线长度及公垂线段中点。
+
+    Parameters
+    ----------
+    dir1 : (3,) np.ndarray
+        直线 1 的方向向量（无需归一化）。
+    point1 : (3,) np.ndarray
+        直线 1 上的一点。
+    dir2 : (3,) np.ndarray
+        直线 2 的方向向量（无需归一化）。
+    point2 : (3,) np.ndarray
+        直线 2 上的一点。
+
+    Returns
+    -------
+    distance : float
+        两条直线之间的最短距离（公垂线长度）。
+    midpoint : (3,) np.ndarray
+        公垂线段的中点坐标（即两垂足连线的中点）。
+    """
+    d1 = np.asarray(dir1, dtype=np.float64)
+    p1 = np.asarray(point1, dtype=np.float64)
+    d2 = np.asarray(dir2, dtype=np.float64)
+    p2 = np.asarray(point2, dtype=np.float64)
+
+    # 叉积判断是否平行
+    cross = np.cross(d1, d2)
+    cross_norm = np.linalg.norm(cross)
+
+    if cross_norm < 1e-12:                     # 平行或重合
+        v = p2 - p1
+        d1_sq = np.dot(d1, d1)
+        t1 = np.dot(v, d1) / d1_sq             # P2 在 L1 上的投影参数
+        foot = p1 + t1 * d1                    # 垂足
+        distance = np.linalg.norm(foot - p2)
+        midpoint = (foot + p2) / 2.0
+        return distance, midpoint
+
+    # 非平行情况，解线性方程组
+    d1_d1 = np.dot(d1, d1)
+    d2_d2 = np.dot(d2, d2)
+    d1_d2 = np.dot(d1, d2)
+    v = p2 - p1
+    rhs1 = np.dot(v, d1)
+    rhs2 = np.dot(v, d2)
+
+    det = d1_d1 * d2_d2 - d1_d2 * d1_d2
+    if abs(det) < 1e-12:                       # 数值退化，退化为平行处理
+        v = p2 - p1
+        t1 = np.dot(v, d1) / d1_d1
+        foot = p1 + t1 * d1
+        distance = np.linalg.norm(foot - p2)
+        midpoint = (foot + p2) / 2.0
+        return distance, midpoint
+
+    t1 = ( rhs1 * d2_d2 - rhs2 * d1_d2) / det
+    t2 = (-rhs1 * d1_d2 + rhs2 * d1_d1) / det
+
+    q1 = p1 + t1 * d1
+    q2 = p2 + t2 * d2
+
+    distance = np.linalg.norm(q2 - q1)
+    midpoint = (q1 + q2) / 2.0
+
+    return distance, midpoint
