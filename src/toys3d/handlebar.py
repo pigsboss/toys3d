@@ -95,7 +95,8 @@ def iterative_refine_axis_and_core(mesh, region_mask, init_dir, init_pt,
     ...（完整函数体见下方）
     """
     # 函数体如下（请完整复制）
-    region_idx = np.where(region_mask)[0]
+    # ensure 1D integer array (handles both array and scalar inputs)
+    region_idx = np.atleast_1d(np.asarray(np.where(region_mask)[0], dtype=int)).ravel()
     if len(region_idx) < min_core_faces:
         core = region_mask.copy()
         return core, np.zeros_like(region_mask), init_dir, init_pt
