@@ -79,103 +79,6 @@ def symmetry_score(mesh, region_mask, axis_dir, axis_point, midpoint):
     ratio_diff = abs(pos_area - neg_area) / total_area
     return 1.0 - ratio_diff
 
-def refine_axis_from_region(mesh, region_mask, deviation_thr=0.15):
-    """
-    对指定区域的面片进行轴线拟合，并划分 core / residual。
-
-    参数
-    ----
-    mesh : trimesh.Trimesh
-    region_mask : (N,) bool
-        属于该区域的三角面片掩码。
-    deviation_thr : float
-        用于分离核心与残余的点积阈值。
-
-    返回
-    -------
-    core_mask : (N,) bool （相对于全部面片）
-        该区域的核心面片。
-    residual_mask : (N,) bool
-        该区域的残余面片。
-    axis_dir : (3,) ndarray
-        拟合得到的核心轴线方向（单位向量）。
-    axis_point : (3,) ndarray
-        核心轴线上的一点（世界坐标下）。
-    confidence : float
-        置信度（核心面片的加权总面积）。
-    """
-    # 区域子集
-    centers = mesh.triangles_center[region_mask]
-    normals = mesh.face_normals[region_mask]
-    areas = mesh.area_faces[region_mask]
-
-    # 普吕克拟合 (使用全部区域面片做初值)
-    C, moments, ref = plucker_design_matrix(centers, normals, areas)
-    dir_all, base_all = axis_from_plucker(C, ref_point=ref)
-
-    # 偏差计算
-    dots = np.abs(np.dot(normals, dir_all))  # 区域内面片与轴线的点积
-
-    # 核心与残余
-    core_sub = dots <= deviation_thr
-    residual_sub = ~core_sub
-
-    # 如果核心太少，回退，全部视为核心
-    if np.sum(core_sub) < 3:
-        core_sub = np.ones_like(core_sub, dtype=bool)
-
-    # 用核心面片重新拟合轴线
-    core_centers = centers[core_sub]
-    core_normals = normals[core_sub]
-    core_areas = areas[core_sub]
-
-    C_core, _, ref_core = plucker_design_matrix(core_centers, core_normals, core_areas)
-    dir_core, base_core = axis_from_plucker(C_core, ref_point=ref_core)
-
-    # 置信度 = 核心总面积
-    confidence = np.sum(core_areas)
-
-    # 构造全局掩码
-    global_idx = np.where(region_mask)[0]
-    core_mask_global = np.zeros(mesh.faces.shape[0], dtype=bool)
-    residual_mask_global = np.zeros(mesh.faces.shape[0], dtype=bool)
-    core_mask_global[global_idx[core_sub]] = True
-    residual_mask_global[global_idx[residual_sub]] = True
-
-    return core_mask_global, residual_mask_global, dir_core, base_core, confidence
-
-def assign_final_labels(labels_ransac, masks_dict):
-    """
-    将 RANSAC 区域标签与 core/residual 掩码合并为单一 4 类标签。
-
-    masks_dict 示例:
-    {
-        'bar': (region_label_of_bar, core_bar, residual_bar),
-        'stem': (region_label_of_stem, core_stem, residual_stem)
-    }
-    最终标签:
-        0 : 未分类
-        1 : 把横核心
-        2 : 把横残余
-        3 : 把立核心
-        4 : 把立残余
-    """
-    N = len(labels_ransac)
-    final_labels = np.zeros(N, dtype=int)
-
-    # 把横
-    label_bar, core_bar, res_bar = masks_dict['bar']
-    final_labels[core_bar] = 1
-    final_labels[res_bar] = 2
-
-    # 把立
-    label_stem, core_stem, res_stem = masks_dict['stem']
-    final_labels[core_stem] = 3
-    final_labels[res_stem] = 4
-
-    return final_labels
-
-
 def rough_axis_from_mask(mesh, mask):
     """从面片掩码快速拟合轴线（普吕克），返回 direction, point。"""
     c = mesh.triangles_center[mask]
@@ -184,7 +87,6 @@ def rough_axis_from_mask(mesh, mask):
     C, _, ref = plucker_design_matrix(c, n, a)
     d, b = axis_from_plucker(C, ref_point=ref)
     return d, b
-
 
 def iterative_refine_axis_and_core(mesh, region_mask, init_dir, init_pt,
                                    n_clusters=3, n_iter=2, min_core_faces=50):
@@ -274,7 +176,6 @@ def iterative_refine_axis_and_core(mesh, region_mask, init_dir, init_pt,
         current_pt = init_pt
 
     return best_core, noncore, current_dir, current_pt
-
 
 def colorize_mesh(mesh, final_labels):
     """
@@ -374,7 +275,6 @@ def build_world_visualization(mesh, final_labels, dir_bar, point_bar, dir_stem, 
 
 def process_handlebar(mesh, 
                       ransac_threshold=0.1,
-                      deviation_thr=0.15,
                       region_label_bar=None,
                       region_label_stem=None):
     """
@@ -385,8 +285,6 @@ def process_handlebar(mesh,
     mesh : trimesh.Trimesh
     ransac_threshold : float
         RANSAC 管状区域分割的阈值。
-    deviation_thr : float
-        管状区域内部划分核心/残余的阈值。
     region_label_bar, region_label_stem : int or None
         手动指定 RANSAC 输出中哪个标签对应把横/把立。
         若为 None，则使用对称性自动判断。
@@ -515,7 +413,6 @@ def main():
     parser.add_argument("input_file", help="输入网格文件路径 (stl/ply/obj)")
     parser.add_argument("--output", help="保存处理后的网格路径 (可选)")
     parser.add_argument("--ransac_thr", type=float, default=0.1, help="RANSAC 阈值 (默认 0.1)")
-    parser.add_argument("--dev_thr", type=float, default=0.15, help="核心/残余偏差阈值 (默认 0.15)")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
     args = parser.parse_args()
 
@@ -529,8 +426,7 @@ def main():
 
     # 处理
     transformed_scene, world_scene, stats = process_handlebar(mesh,
-                                     ransac_threshold=args.ransac_thr,
-                                     deviation_thr=args.dev_thr)
+                                     ransac_threshold=args.ransac_thr)
 
     # 保存输出
     if args.output:
