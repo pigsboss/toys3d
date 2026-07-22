@@ -20,6 +20,28 @@ from toys3d.geometrics import (
 
 # ------------------------- 辅助函数 -------------------------
 
+def closest_points_on_lines(dir1, pt1, dir2, pt2):
+    """Return the two closest points of two infinite lines and their midpoint."""
+    d1 = dir1 / np.linalg.norm(dir1)
+    d2 = dir2 / np.linalg.norm(dir2)
+    w = pt1 - pt2
+    a = np.dot(d1, d1)
+    b = np.dot(d1, d2)
+    c = np.dot(d2, d2)
+    d = np.dot(d1, w)
+    e = np.dot(d2, w)
+    denom = a * c - b * b
+    if abs(denom) < 1e-9:          # parallel
+        sc = 0.0
+        tc = (b > c and d / b) or (e / c)
+    else:
+        sc = (b * e - c * d) / denom
+        tc = (a * e - b * d) / denom
+    p1 = pt1 + sc * d1
+    p2 = pt2 + tc * d2
+    midpoint = (p1 + p2) / 2.0
+    return p1, p2, midpoint
+
 def compute_mesh_stats(mesh):
     """返回网格基本统计信息字典。"""
     stats = {}
@@ -180,6 +202,69 @@ def add_axes_to_scene(scene, origin, u_x, u_y, u_z, length=0.3, radius=0.01):
     add_arrow(origin, u_y, [0,255,0,255])    # Y 绿
     add_arrow(origin, u_z, [0,0,255,255])    # Z 蓝
 
+def build_world_visualization(mesh, final_labels, dir_bar, point_bar, dir_stem, point_stem):
+    """
+    Build a trimesh.Scene in original world coordinates containing:
+    - coloured input mesh
+    - bar axis line (blue)
+    - stem axis line (red)
+    - common perpendicular segment (green)
+    - midpoint sphere (yellow)
+    - orthonormal frame: X = stem, Y = bar, origin = midpoint
+    """
+    scene = trimesh.Scene()
+
+    # Coloured mesh
+    vis_mesh = mesh.copy()
+    colorize_mesh(vis_mesh, final_labels)
+    scene.add_geometry(vis_mesh)
+
+    # Scale from bounding box
+    extents = mesh.bounding_box.extents
+    max_ext = extents.max()
+    L_axis = max_ext * 1.5
+    frame_len = max_ext * 0.6
+
+    # Bar axis (blue)
+    pbar1 = point_bar - L_axis * dir_bar
+    pbar2 = point_bar + L_axis * dir_bar
+    cyl_bar = trimesh.creation.cylinder(0.005 * max_ext, segment=[pbar1, pbar2])
+    cyl_bar.visual.face_colors = [0, 100, 200, 255]
+    scene.add_geometry(cyl_bar)
+
+    # Stem axis (red)
+    pstem1 = point_stem - L_axis * dir_stem
+    pstem2 = point_stem + L_axis * dir_stem
+    cyl_stem = trimesh.creation.cylinder(0.005 * max_ext, segment=[pstem1, pstem2])
+    cyl_stem.visual.face_colors = [200, 50, 50, 255]
+    scene.add_geometry(cyl_stem)
+
+    # Closest points and common perpendicular
+    p_close_bar, p_close_stem, midpoint = closest_points_on_lines(dir_bar, point_bar, dir_stem, point_stem)
+
+    cyl_perp = trimesh.creation.cylinder(0.008 * max_ext, segment=[p_close_bar, p_close_stem])
+    cyl_perp.visual.face_colors = [0, 180, 0, 255]
+    scene.add_geometry(cyl_perp)
+
+    sph_mid = trimesh.creation.icosphere(subdivisions=2, radius=0.015 * max_ext)
+    sph_mid.apply_translation(midpoint)
+    sph_mid.visual.face_colors = [255, 255, 0, 255]
+    scene.add_geometry(sph_mid)
+
+    # Orthogonal frame: X = stem, Y = bar (orthogonalised), origin = midpoint
+    x_raw = dir_stem / np.linalg.norm(dir_stem)
+    y_raw = dir_bar / np.linalg.norm(dir_bar)
+    y_ortho = y_raw - np.dot(y_raw, x_raw) * x_raw
+    if np.linalg.norm(y_ortho) < 1e-6:
+        y_ortho = np.array([1,0,0]) if abs(x_raw[1]) < 0.9 else np.array([0,1,0])
+        y_ortho = y_ortho - np.dot(y_ortho, x_raw) * x_raw
+    y_ortho /= np.linalg.norm(y_ortho)
+    z_ortho = np.cross(x_raw, y_ortho)
+
+    add_axes_to_scene(scene, midpoint, x_raw, y_ortho, z_ortho, length=frame_len)
+
+    return scene
+
 # ------------------------- 主流程函数 -------------------------
 
 def process_handlebar(mesh, 
@@ -203,8 +288,10 @@ def process_handlebar(mesh,
 
     返回
     -------
-    scene : trimesh.Scene
-        包含变换后网格和坐标轴的可视化场景。
+    scene_transformed : trimesh.Scene
+        变换后网格和坐标轴的可视化场景。
+    world_scene : trimesh.Scene
+        原始世界坐标系下的可视化场景（含轴线、公垂线段、中点、坐标架）。
     stats : dict
         统计信息。
     """
@@ -285,6 +372,11 @@ def process_handlebar(mesh,
     }
     final_labels = assign_final_labels(labels_ransac, masks_dict)
 
+    # Build world-coordinate visualisation (before any transformation)
+    world_scene = build_world_visualization(mesh, final_labels,
+                                            dir_bar, point_bar,
+                                            dir_stem, point_stem)
+
     # 7. 正交坐标系构建
     T_w2l, T_l2w, u_x, u_y, u_z, origin = orthogonalize_axes(
         dir_x=dir_bar, point_x=point_bar, weight_x=conf_bar,
@@ -309,7 +401,7 @@ def process_handlebar(mesh,
         count = np.sum(final_labels == i)
         print(f"  {name}: {count} triangles")
 
-    return scene, stats
+    return scene, world_scene, stats
 
 def main():
     import argparse
@@ -330,14 +422,14 @@ def main():
     print(f"Hey, loading model: {args.input_file}")
 
     # 处理
-    scene, stats = process_handlebar(mesh,
+    transformed_scene, world_scene, stats = process_handlebar(mesh,
                                      ransac_threshold=args.ransac_thr,
                                      deviation_thr=args.dev_thr)
 
     # 保存输出
     if args.output:
         # 从场景中提取着色后的网格并保存
-        out_mesh = scene.dump(concatenate=True)
+        out_mesh = transformed_scene.dump(concatenate=True)
         out_mesh.export(args.output)
         print(f"Processed mesh saved to {args.output}")
 
@@ -345,7 +437,7 @@ def main():
     if args.show:
         # 使用 vedo 避免关闭窗口退出问题
         os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
-        scene.show()
+        world_scene.show()
 
 if __name__ == "__main__":
     main()
