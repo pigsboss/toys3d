@@ -608,3 +608,83 @@ def kmeans_1d(data, k, max_iter=100, tol=1e-4, rng=None):
     label_map = {old: new for new, old in enumerate(order)}
     labels = np.array([label_map[l] for l in labels], dtype=int)
     return labels, centers_sorted
+
+
+def detect_core_segment_by_area_profile(distances, areas,
+                                        spike_factor=3.0,
+                                        min_segment_ratio=0.15):
+    """
+    根据沿轴线的截面积分布，识别最可能是核心管段的连续区间。
+
+    策略：
+    1. 轻微平滑截面积序列，抑制噪声。
+    2. 计算相邻截面的相对变化率。
+    3. 使用类 Tukey 方法标记面积突然增大的突变位置。
+    4. 在突变位置处将轴线分割为若干候选区间。
+    5. 在满足最小长度比例的区间中，选择平均截面积最小的作为核心。
+
+    Parameters
+    ----------
+    distances : (N,) ndarray
+        各截面沿轴线的距离。
+    areas : (N,) ndarray
+        对应截面的总面积。
+    spike_factor : float
+        突变阈值倍数，越大越宽容（基于 IQR）。
+    min_segment_ratio : float
+        候选区间长度占总轴长的最小比例。
+
+    Returns
+    -------
+    core_distances : (M,) ndarray
+        核心区间包含的截面距离。
+    """
+    n = len(areas)
+    if n < 5:
+        return distances
+
+    # 三点移动平均平滑
+    areas_smooth = areas.copy()
+    if n >= 3:
+        areas_smooth[1:-1] = (areas[:-2] + areas[1:-1] + areas[2:]) / 3.0
+
+    # 相邻截面相对变化率
+    d_area = np.abs(np.diff(areas_smooth))
+    denom = np.maximum(areas_smooth[:-1], 1e-12)
+    rates = d_area / denom
+
+    # Tukey 风格阈值：Q3 + factor * IQR
+    q1, q3 = np.percentile(rates, [25, 75])
+    iqr = q3 - q1
+    threshold = q3 + spike_factor * iqr
+    if threshold <= 0 or not np.isfinite(threshold):
+        threshold = np.percentile(rates, 90)
+
+    # 突变位置索引
+    spike_indices = np.flatnonzero(rates > threshold)
+
+    # 在突变位置后分割
+    split_indices = [0] + list(spike_indices + 1) + [n]
+    split_indices = sorted(set(split_indices))
+
+    total_length = distances[-1] - distances[0]
+    candidates = []
+    for i in range(len(split_indices) - 1):
+        start = split_indices[i]
+        end = split_indices[i + 1]
+        if end - start < 3:
+            continue
+        seg_areas = areas[start:end]
+        seg_dists = distances[start:end]
+        mean_area = np.mean(seg_areas)
+        length = seg_dists[-1] - seg_dists[0]
+        length_ratio = length / total_length if total_length > 0 else 0
+        if length_ratio < min_segment_ratio:
+            continue
+        candidates.append((mean_area, start, end, seg_dists))
+
+    if not candidates:
+        return distances
+
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][3]

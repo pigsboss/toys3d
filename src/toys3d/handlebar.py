@@ -20,6 +20,7 @@ from toys3d.geometrics import (
     sample_axial_section_areas,
     suggest_slice_spacing,
     compute_cross_section_area,
+    detect_core_segment_by_area_profile,
 )
 
 # ------------------------- 辅助函数 -------------------------
@@ -89,7 +90,11 @@ def rough_axis_from_mask(mesh, mask):
     return d, b
 
 def iterative_refine_axis_and_core(mesh, region_mask, init_dir, init_pt,
-                                   n_clusters=3, n_iter=2, min_core_faces=50):
+                                   n_clusters=3, n_iter=2, min_core_faces=50,
+                                   slice_spacing=None,
+                                   core_method='area_profile',
+                                   spike_factor=3.0,
+                                   min_segment_ratio=0.15):
     """
     利用横截面积聚类迭代精炼轴线与核心区域。
     ...（完整函数体见下方）
@@ -110,7 +115,10 @@ def iterative_refine_axis_and_core(mesh, region_mask, init_dir, init_pt,
     best_core = region_mask.copy()
 
     for iteration in range(n_iter):
-        spacing = suggest_slice_spacing(submesh, current_dir, min_count=15, max_count=200)
+        if slice_spacing is not None and slice_spacing > 0:
+            spacing = slice_spacing
+        else:
+            spacing = suggest_slice_spacing(submesh, current_dir, min_count=15, max_count=200)
         verts = submesh.vertices
         proj = np.dot(verts - current_pt, current_dir)
         d_min = proj.min()
@@ -126,16 +134,25 @@ def iterative_refine_axis_and_core(mesh, region_mask, init_dir, init_pt,
         areas_valid = areas[valid]
         dists_valid = dists[valid]
 
-        try:
-            labels_km, centers = kmeans_1d(areas_valid, n_clusters)
-        except Exception:
-            break
+        if core_method == 'area_profile':
+            core_distances = detect_core_segment_by_area_profile(
+                dists_valid, areas_valid,
+                spike_factor=spike_factor,
+                min_segment_ratio=min_segment_ratio
+            )
+        else:
+            # 保留原有 K-Means 方法作为备选
+            try:
+                labels_km, centers = kmeans_1d(areas_valid, n_clusters)
+            except Exception:
+                break
+            core_distances = dists_valid[labels_km == 0]
+            if len(core_distances) == 0:
+                break
 
-        min_label = 0  # 中心升序，0最小
-        core_distances = dists_valid[labels_km == min_label]
+        core_distances = np.sort(core_distances)
         if len(core_distances) == 0:
             break
-        core_distances = np.sort(core_distances)
 
         centers_region = mesh.triangles_center[region_idx]
         proj_region = np.dot(centers_region - current_pt, current_dir)
@@ -277,7 +294,9 @@ def build_world_visualization(mesh, final_labels, dir_bar, point_bar, dir_stem, 
 def process_handlebar(mesh, 
                       ransac_threshold=0.1,
                       region_label_bar=None,
-                      region_label_stem=None):
+                      region_label_stem=None,
+                      slice_spacing=None,
+                      core_method='area_profile'):
     """
     对一体把进行完整处理，返回可视化场景。
 
@@ -359,11 +378,13 @@ def process_handlebar(mesh,
 
     core_bar, noncore_bar, dir_bar, point_bar = iterative_refine_axis_and_core(
         mesh, mask_bar, init_dir_bar, init_pt_bar,
-        n_clusters=3, n_iter=2, min_core_faces=50
+        n_clusters=3, n_iter=2, min_core_faces=50,
+        slice_spacing=slice_spacing, core_method=core_method
     )
     core_stem, noncore_stem, dir_stem, point_stem = iterative_refine_axis_and_core(
         mesh, mask_stem, init_dir_stem, init_pt_stem,
-        n_clusters=3, n_iter=2, min_core_faces=50
+        n_clusters=3, n_iter=2, min_core_faces=50,
+        slice_spacing=slice_spacing, core_method=core_method
     )
 
     # 置信度 = 核心区域总面积
@@ -414,6 +435,11 @@ def main():
     parser.add_argument("input_file", help="输入网格文件路径 (stl/ply/obj)")
     parser.add_argument("--output", help="保存处理后的网格路径 (可选)")
     parser.add_argument("--ransac_thr", type=float, default=0.1, help="RANSAC 阈值 (默认 0.1)")
+    parser.add_argument("--slice-spacing", type=float, default=None,
+                        help="强制指定沿轴线的切片间距（单位：模型长度单位）。未指定时自动计算。")
+    parser.add_argument("--core-method", type=str, default='area_profile',
+                        choices=['area_profile', 'kmeans'],
+                        help="核心区域识别方法（默认 area_profile）")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
     args = parser.parse_args()
 
@@ -426,8 +452,12 @@ def main():
     print(f"Hey, loading model: {args.input_file}")
 
     # 处理
-    transformed_scene, world_scene, stats = process_handlebar(mesh,
-                                     ransac_threshold=args.ransac_thr)
+    transformed_scene, world_scene, stats = process_handlebar(
+        mesh,
+        ransac_threshold=args.ransac_thr,
+        slice_spacing=args.slice_spacing,
+        core_method=args.core_method
+    )
 
     # 保存输出
     if args.output:
