@@ -688,3 +688,25 @@ def detect_core_segment_by_area_profile(distances, areas,
 
     candidates.sort(key=lambda x: x[0])
     return candidates[0][3]
+
+
+def point_line_distance(points, line_point, line_dir):
+    """
+    计算三维点到无限直线的垂直距离。
+
+    Parameters
+    ----------
+    points : (N, 3) ndarray
+    line_point : (3,) ndarray  直线上一点
+    line_dir : (3,) ndarray    直线方向向量（无需单位化）
+
+    Returns
+    -------
+    distances : (N,) ndarray
+    """
+    line_dir = np.asarray(line_dir, dtype=np.float64)
+    line_dir = line_dir / np.linalg.norm(line_dir)
+    vec = np.asarray(points, dtype=np.float64) - np.asarray(line_point, dtype=np.float64)
+    proj_len = np.dot(vec, line_dir)
+    perp = vec - proj_len[:, None] * line_dir
+    return np.linalg.norm(perp, axis=1)

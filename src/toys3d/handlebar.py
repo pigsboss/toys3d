@@ -16,11 +16,7 @@ from toys3d.geometrics import (
     orthogonalize_axes,
     segment_tubular_regions,
     line_line_distance_and_midpoint,
-    kmeans_1d,
-    sample_axial_section_areas,
-    suggest_slice_spacing,
-    compute_cross_section_area,
-    detect_core_segment_by_area_profile,
+    point_line_distance,
 )
 
 # ------------------------- 辅助函数 -------------------------
@@ -89,123 +85,55 @@ def rough_axis_from_mask(mesh, mask):
     d, b = axis_from_plucker(C, ref_point=ref)
     return d, b
 
-def iterative_refine_axis_and_core(mesh, region_mask, init_dir, init_pt,
-                                   n_clusters=3, n_iter=2, min_core_faces=50,
-                                   slice_spacing=None,
-                                   core_method='area_profile',
-                                   spike_factor=3.0,
-                                   min_segment_ratio=0.15):
+def partition_four_regions(mesh, mask_bar, mask_stem,
+                           dir_bar, point_bar,
+                           dir_stem, point_stem,
+                           transition_radius):
     """
-    利用横截面积聚类迭代精炼轴线与核心区域。
-    ...（完整函数体见下方）
+    基于点到对侧轴线的距离，将初步分区细分为 4 个区域。
+
+    Returns
+    -------
+    bar_core, stem_core, transition_mask, residual_mask : (N,) bool
     """
-    # 函数体如下（请完整复制）
-    # ensure 1D integer array (handles both array and scalar inputs)
-    region_idx = np.flatnonzero(region_mask)
-    if len(region_idx) < min_core_faces:
-        core = region_mask.copy()
-        return core, np.zeros_like(region_mask), init_dir, init_pt
+    N = mesh.faces.shape[0]
 
-    submesh = mesh.submesh([region_idx])[0]
-    dir_u = init_dir / np.linalg.norm(init_dir)
-    pt = np.asarray(init_pt, dtype=np.float64)
+    bar_idx = np.flatnonzero(mask_bar)
+    stem_idx = np.flatnonzero(mask_stem)
 
-    current_dir = dir_u
-    current_pt = pt
-    best_core = region_mask.copy()
+    bar_centers = mesh.triangles_center[bar_idx]
+    stem_centers = mesh.triangles_center[stem_idx]
 
-    for iteration in range(n_iter):
-        if slice_spacing is not None and slice_spacing > 0:
-            spacing = slice_spacing
-        else:
-            spacing = suggest_slice_spacing(submesh, current_dir, min_count=15, max_count=200)
-        verts = submesh.vertices
-        proj = np.dot(verts - current_pt, current_dir)
-        d_min = proj.min()
-        d_max = proj.max()
-        if d_max - d_min < spacing:
-            break
-        distances = np.arange(d_min, d_max, spacing)
-        dists, areas = sample_axial_section_areas(submesh, current_dir, current_pt, distances)
+    dist_bar_to_stem = point_line_distance(bar_centers, point_stem, dir_stem)
+    dist_stem_to_bar = point_line_distance(stem_centers, point_bar, dir_bar)
 
-        valid = areas > 1e-9
-        if np.sum(valid) < n_clusters:
-            break
-        areas_valid = areas[valid]
-        dists_valid = dists[valid]
+    bar_transition = dist_bar_to_stem < transition_radius
+    stem_transition = dist_stem_to_bar < transition_radius
 
-        if core_method == 'area_profile':
-            core_distances = detect_core_segment_by_area_profile(
-                dists_valid, areas_valid,
-                spike_factor=spike_factor,
-                min_segment_ratio=min_segment_ratio
-            )
-        else:
-            # 保留原有 K-Means 方法作为备选
-            try:
-                labels_km, centers = kmeans_1d(areas_valid, n_clusters)
-            except Exception:
-                break
-            core_distances = dists_valid[labels_km == 0]
-            if len(core_distances) == 0:
-                break
+    transition_mask = np.zeros(N, dtype=bool)
+    transition_mask[bar_idx[bar_transition]] = True
+    transition_mask[stem_idx[stem_transition]] = True
 
-        core_distances = np.sort(core_distances)
-        if len(core_distances) == 0:
-            break
+    bar_core = mask_bar.copy()
+    bar_core[bar_idx[bar_transition]] = False
 
-        centers_region = mesh.triangles_center[region_idx]
-        proj_region = np.dot(centers_region - current_pt, current_dir)
+    stem_core = mask_stem.copy()
+    stem_core[stem_idx[stem_transition]] = False
 
-        idx = np.searchsorted(core_distances, proj_region, side='left')
-        idx = np.clip(idx, 0, len(core_distances) - 1)
-        left = core_distances[idx]
-        diff = np.abs(proj_region - left)
-        if len(core_distances) > 1:
-            idx_right = np.clip(idx + 1, 0, len(core_distances) - 1)
-            diff = np.minimum(diff, np.abs(proj_region - core_distances[idx_right]))
-        core_in_region = diff <= spacing * 0.6
+    residual_mask = ~(mask_bar | mask_stem)
 
-        core_global = np.zeros(mesh.faces.shape[0], dtype=bool)
-        core_global[region_idx[core_in_region]] = True
-        if np.sum(core_global) < min_core_faces:
-            break
-
-        best_core = core_global
-
-        core_indices = np.where(core_global)[0]
-        if len(core_indices) < min_core_faces:
-            break
-
-        centroids = mesh.triangles_center[core_indices]
-        norms = mesh.face_normals[core_indices]
-        ars = mesh.area_faces[core_indices]
-        C, _, ref = plucker_design_matrix(centroids, norms, ars)
-        new_dir, new_pt = axis_from_plucker(C, ref_point=ref)
-        current_dir = new_dir
-        current_pt = new_pt
-
-    noncore = region_mask & ~best_core
-
-    if np.sum(best_core) < min_core_faces:
-        best_core = region_mask.copy()
-        noncore = np.zeros_like(noncore)
-        current_dir = init_dir
-        current_pt = init_pt
-
-    return best_core, noncore, current_dir, current_pt
+    return bar_core, stem_core, transition_mask, residual_mask
 
 def colorize_mesh(mesh, final_labels):
     """
     根据最终标签设置面片颜色。
-    0: 灰色, 1: 深蓝, 2: 浅蓝, 3: 深红, 4: 浅红
+    0: 灰色, 1: 深蓝, 2: 深红, 3: 橙色
     """
     palette = np.array([
-        [180, 180, 180, 255],   # 0 未分类 灰
+        [180, 180, 180, 255],   # 0 残余/未分类 灰
         [0, 100, 200, 255],     # 1 把横核心 深蓝
-        [135, 206, 250, 255],   # 2 把横残余 浅蓝
-        [200, 50, 50, 255],     # 3 把立核心 深红
-        [250, 128, 114, 255]    # 4 把立残余 浅红
+        [200, 50, 50, 255],     # 2 把立核心 深红
+        [255, 165, 0, 255],     # 3 过渡区 橙
     ], dtype=np.uint8)
     mesh.visual.face_colors = palette[final_labels]
 
@@ -295,8 +223,7 @@ def process_handlebar(mesh,
                       ransac_threshold=0.1,
                       region_label_bar=None,
                       region_label_stem=None,
-                      slice_spacing=None,
-                      core_method='area_profile'):
+                      transition_radius=None):
     """
     对一体把进行完整处理，返回可视化场景。
 
@@ -308,6 +235,8 @@ def process_handlebar(mesh,
     region_label_bar, region_label_stem : int or None
         手动指定 RANSAC 输出中哪个标签对应把横/把立。
         若为 None，则使用对称性自动判断。
+    transition_radius : float or None
+        过渡区半径（到对侧轴线的距离阈值）。若为 None 或 <= 0，则自动估算为包围盒最大边的 5%。
 
     返回
     -------
@@ -369,34 +298,37 @@ def process_handlebar(mesh,
 
     print(f"Identification result -> bar: region {label_bar}, stem: region {label_stem}")
 
-    # 5. 截面聚类精炼区域与轴线
+    # 5. 四区域划分
     mask_bar = labels_ransac == label_bar
     mask_stem = labels_ransac == label_stem
 
     init_dir_bar, init_pt_bar = rough_axis_from_mask(mesh, mask_bar)
     init_dir_stem, init_pt_stem = rough_axis_from_mask(mesh, mask_stem)
 
-    core_bar, noncore_bar, dir_bar, point_bar = iterative_refine_axis_and_core(
-        mesh, mask_bar, init_dir_bar, init_pt_bar,
-        n_clusters=3, n_iter=2, min_core_faces=50,
-        slice_spacing=slice_spacing, core_method=core_method
-    )
-    core_stem, noncore_stem, dir_stem, point_stem = iterative_refine_axis_and_core(
-        mesh, mask_stem, init_dir_stem, init_pt_stem,
-        n_clusters=3, n_iter=2, min_core_faces=50,
-        slice_spacing=slice_spacing, core_method=core_method
+    if transition_radius is None or transition_radius <= 0:
+        max_extent = mesh.bounding_box.extents.max()
+        transition_radius = 0.05 * max_extent  # 默认取包围盒最大边的 5%
+
+    bar_core, stem_core, transition_mask, residual_mask = partition_four_regions(
+        mesh, mask_bar, mask_stem,
+        init_dir_bar, init_pt_bar,
+        init_dir_stem, init_pt_stem,
+        transition_radius=transition_radius
     )
 
-    # 置信度 = 核心区域总面积
-    conf_bar = np.sum(mesh.area_faces[core_bar]) if np.sum(core_bar) > 0 else 0.0
-    conf_stem = np.sum(mesh.area_faces[core_stem]) if np.sum(core_stem) > 0 else 0.0
+    # 用核心区域重新拟合轴线（更纯净）
+    dir_bar, point_bar = rough_axis_from_mask(mesh, bar_core)
+    dir_stem, point_stem = rough_axis_from_mask(mesh, stem_core)
+
+    conf_bar = np.sum(mesh.area_faces[bar_core]) if np.sum(bar_core) > 0 else 0.0
+    conf_stem = np.sum(mesh.area_faces[stem_core]) if np.sum(stem_core) > 0 else 0.0
 
     # 6. 构建最终标签
     final_labels = np.zeros(N, dtype=int)
-    final_labels[core_bar] = 1
-    final_labels[noncore_bar] = 2
-    final_labels[core_stem] = 3
-    final_labels[noncore_stem] = 4
+    final_labels[bar_core] = 1
+    final_labels[stem_core] = 2
+    final_labels[transition_mask] = 3
+    # 0 = residual
 
     # Build world-coordinate visualisation (before any transformation)
     world_scene = build_world_visualization(mesh, final_labels,
@@ -423,7 +355,7 @@ def process_handlebar(mesh,
 
     # 统计最终区域信息
     print("\nRegion statistics:")
-    for i, name in enumerate(['Unassigned', 'Bar core', 'Bar non-core', 'Stem core', 'Stem non-core']):
+    for i, name in enumerate(['Residual', 'Bar core', 'Stem core', 'Transition']):
         count = np.sum(final_labels == i)
         print(f"  {name}: {count} triangles")
 
@@ -435,11 +367,8 @@ def main():
     parser.add_argument("input_file", help="输入网格文件路径 (stl/ply/obj)")
     parser.add_argument("--output", help="保存处理后的网格路径 (可选)")
     parser.add_argument("--ransac_thr", type=float, default=0.1, help="RANSAC 阈值 (默认 0.1)")
-    parser.add_argument("--slice-spacing", type=float, default=None,
-                        help="强制指定沿轴线的切片间距（单位：模型长度单位）。未指定时自动计算。")
-    parser.add_argument("--core-method", type=str, default='area_profile',
-                        choices=['area_profile', 'kmeans'],
-                        help="核心区域识别方法（默认 area_profile）")
+    parser.add_argument("--transition-radius", type=float, default=None,
+                        help="过渡区半径（到对侧轴线的距离阈值）。未指定时自动估算。")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
     args = parser.parse_args()
 
@@ -455,8 +384,7 @@ def main():
     transformed_scene, world_scene, stats = process_handlebar(
         mesh,
         ransac_threshold=args.ransac_thr,
-        slice_spacing=args.slice_spacing,
-        core_method=args.core_method
+        transition_radius=args.transition_radius
     )
 
     # 保存输出
