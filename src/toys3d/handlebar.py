@@ -1,7 +1,14 @@
+import sys
+import os
+
+# Ensure src directory is on the path so that 'toys3d' can be imported
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # one level up: src/
+_src_parent = os.path.dirname(_project_root)  # parent of src, i.e., the project root
+if _src_parent not in sys.path:
+    sys.path.insert(0, _src_parent)
+
 import numpy as np
 import trimesh
-import os
-import sys
 
 from toys3d.geometrics import (
     plucker_design_matrix,
