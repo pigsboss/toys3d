@@ -1,4 +1,5 @@
 import numpy as np
+import trimesh
 
 def plucker_design_matrix(centers, normals, areas, ref_point=None):
     """
@@ -380,3 +381,179 @@ def segment_tubular_regions(normals, areas=None, threshold=0.1, min_faces=100,
         active = np.where(labels == 0)[0]
 
     return labels, axes
+
+def project_points_to_plane(points, plane_origin, plane_normal):
+    """
+    将三维点投影到切平面，返回二维坐标及平面基向量。
+
+    Parameters
+    ----------
+    points : (N, 3) np.ndarray
+    plane_origin : (3,) array_like  平面上一点
+    plane_normal : (3,) array_like  平面法向量
+
+    Returns
+    -------
+    pts_2d : (N, 2) np.ndarray
+    basis_u, basis_v : (3,) ndarray  平面内相互正交的两个基向量
+    """
+    normal = np.asarray(plane_normal, dtype=np.float64)
+    normal /= np.linalg.norm(normal)
+
+    # 构造两个与 normal 正交的基向量
+    if abs(normal[0]) > 1e-6 or abs(normal[1]) > 1e-6:
+        basis_u = np.cross(normal, [0, 0, 1])
+    else:
+        basis_u = np.cross(normal, [1, 0, 0])
+    basis_u /= np.linalg.norm(basis_u)
+    basis_v = np.cross(normal, basis_u)
+
+    vec = points - np.asarray(plane_origin)
+    pts_2d = np.column_stack([np.dot(vec, basis_u), np.dot(vec, basis_v)])
+    return pts_2d, basis_u, basis_v
+
+
+def polygon_area_from_3d_ccw(vertices, normal=None):
+    """
+    计算有序三维闭合多边形的面积（使用叉积求和，与顺序有关）。
+
+    Parameters
+    ----------
+    vertices : (M, 3) ndarray, 按顺序排列的顶点坐标
+    normal : (3,) ndarray or None  可选法向量，用于符号修正（暂未使用）
+
+    Returns
+    -------
+    area : float
+    """
+    if len(vertices) < 3:
+        return 0.0
+    total = np.zeros(3)
+    n = len(vertices)
+    for i in range(n):
+        v1 = vertices[i]
+        v2 = vertices[(i+1) % n]
+        total += np.cross(v1, v2)
+    area = 0.5 * np.linalg.norm(total)
+    return area
+
+
+def path3d_to_polygons(path3d, plane_origin, plane_normal):
+    """
+    将 trimesh.path.Path3D 投影到平面并转换为多边形列表。
+
+    Parameters
+    ----------
+    path3d : trimesh.path.Path3D  来自 mesh.section()
+    plane_origin, plane_normal : (3,)  平面定义
+
+    Returns
+    -------
+    polygons : list of trimesh.path.polygons.Polygon (每个都有 .area)
+    """
+    if path3d is None or len(path3d.entities) == 0:
+        return []
+
+    pts_2d, _, _ = project_points_to_plane(path3d.vertices, plane_origin, plane_normal)
+    path2d = trimesh.path.Path2D(entities=path3d.entities, vertices=pts_2d)
+    # polygons_full 生成所有闭合多边形（外环与内环，如有）
+    return list(path2d.polygons_full)
+
+
+def compute_cross_section_area(mesh, plane_origin, plane_normal, face_mask=None):
+    """
+    计算网格在指定平面处的截面总面积。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    plane_origin : (3,)  平面上一点
+    plane_normal : (3,)  平面法向量
+    face_mask : (N,) bool or None  仅使用指定面片，None 表示全部
+
+    Returns
+    -------
+    area : float  所有闭合环的面积之和（不区分内外）
+    """
+    if face_mask is not None:
+        indices = np.where(face_mask)[0]
+        if len(indices) == 0:
+            return 0.0
+        submesh = mesh.submesh(indices)[0]
+    else:
+        submesh = mesh
+
+    section = submesh.section(plane_origin=plane_origin, plane_normal=plane_normal)
+    if section is None:
+        return 0.0
+
+    polygons = path3d_to_polygons(section, plane_origin, plane_normal)
+    total_area = sum(poly.area for poly in polygons)
+    return total_area
+
+
+def suggest_slice_spacing(mesh, axis_dir, region_mask=None,
+                          factor=1.5, min_count=10, max_count=200):
+    """
+    根据网格边长和轴线长度推荐切片间距。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    axis_dir : (3,) ndarray  轴线方向（单位化）
+    region_mask : (N,) bool or None
+    factor : float  间距 = factor * 平均边长
+    min_count, max_count : int  切片数量的允许范围
+
+    Returns
+    -------
+    spacing : float
+    """
+    if region_mask is not None:
+        indices = np.where(region_mask)[0]
+        submesh = mesh.submesh(indices)[0]
+    else:
+        submesh = mesh
+
+    mean_edge = np.mean(submesh.edges_unique_length)
+    dir_u = axis_dir / np.linalg.norm(axis_dir)
+
+    verts = submesh.vertices
+    proj = np.dot(verts, dir_u)
+    axis_length = proj.max() - proj.min()
+
+    spacing = factor * mean_edge
+    if axis_length > 0:
+        count = max(1, int(axis_length / spacing))
+        if count < min_count:
+            spacing = axis_length / min_count
+        elif count > max_count:
+            spacing = axis_length / max_count
+    return spacing
+
+
+def sample_axial_section_areas(mesh, axis_dir, axis_point, distances,
+                               face_mask=None):
+    """
+    沿轴线在给定距离处采样横截面积。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    axis_dir : (3,) ndarray  轴线单位方向
+    axis_point : (3,) ndarray  轴线上参考点
+    distances : array_like  相对参考点的轴向距离（可为负）
+    face_mask : (N,) bool or None
+
+    Returns
+    -------
+    dists : ndarray  复制的 distances
+    areas : ndarray  各位置的截面总面积
+    """
+    dir_u = axis_dir / np.linalg.norm(axis_dir)
+    areas = []
+    for d in distances:
+        origin = axis_point + d * dir_u
+        area = compute_cross_section_area(mesh, origin, dir_u, face_mask)
+        areas.append(area)
+    return np.asarray(distances), np.asarray(areas)
