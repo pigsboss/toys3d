@@ -85,40 +85,25 @@ def rough_axis_from_mask(mesh, mask):
     d, b = axis_from_plucker(C, ref_point=ref)
     return d, b
 
-def partition_four_regions(mesh, mask_bar, mask_stem,
-                           dir_bar, point_bar,
-                           dir_stem, point_stem,
-                           transition_radius):
+def partition_four_regions_local(mesh, mask_bar, mask_stem,
+                                 local_coords,
+                                 bar_y_margin,
+                                 stem_x_margin):
     """
-    基于点到对侧轴线的距离，将初步分区细分为 4 个区域。
+    在正交局部坐标系中按轴向区间划分四区域。
 
-    Returns
-    -------
-    bar_core, stem_core, transition_mask, residual_mask : (N,) bool
+    local_coords[:, 0] = x（把立方向）
+    local_coords[:, 1] = y（把横方向）
     """
     N = mesh.faces.shape[0]
 
-    bar_idx = np.flatnonzero(mask_bar)
-    stem_idx = np.flatnonzero(mask_stem)
+    bar_transition = mask_bar & (np.abs(local_coords[:, 1]) <= bar_y_margin)
+    stem_transition = mask_stem & (np.abs(local_coords[:, 0]) <= stem_x_margin)
 
-    bar_centers = mesh.triangles_center[bar_idx]
-    stem_centers = mesh.triangles_center[stem_idx]
+    transition_mask = bar_transition | stem_transition
 
-    dist_bar_to_stem = point_line_distance(bar_centers, point_stem, dir_stem)
-    dist_stem_to_bar = point_line_distance(stem_centers, point_bar, dir_bar)
-
-    bar_transition = dist_bar_to_stem < transition_radius
-    stem_transition = dist_stem_to_bar < transition_radius
-
-    transition_mask = np.zeros(N, dtype=bool)
-    transition_mask[bar_idx[bar_transition]] = True
-    transition_mask[stem_idx[stem_transition]] = True
-
-    bar_core = mask_bar.copy()
-    bar_core[bar_idx[bar_transition]] = False
-
-    stem_core = mask_stem.copy()
-    stem_core[stem_idx[stem_transition]] = False
+    bar_core = mask_bar & ~bar_transition
+    stem_core = mask_stem & ~stem_transition
 
     residual_mask = ~(mask_bar | mask_stem)
 
@@ -219,11 +204,13 @@ def build_world_visualization(mesh, final_labels, dir_bar, point_bar, dir_stem, 
 
 # ------------------------- 主流程函数 -------------------------
 
-def process_handlebar(mesh, 
+def process_handlebar(mesh,
                       ransac_threshold=0.1,
                       region_label_bar=None,
                       region_label_stem=None,
-                      transition_radius=None):
+                      transition_radius=None,
+                      bar_y_margin=None,
+                      stem_x_margin=None):
     """
     对一体把进行完整处理，返回可视化场景。
 
@@ -237,6 +224,10 @@ def process_handlebar(mesh,
         若为 None，则使用对称性自动判断。
     transition_radius : float or None
         过渡区半径（到对侧轴线的距离阈值）。若为 None 或 <= 0，则自动估算为包围盒最大边的 5%。
+    bar_y_margin : float or None
+        把横核心区保留的 |local_y| 阈值，默认等于 transition-radius 或自动估算值。
+    stem_x_margin : float or None
+        把立核心区保留的 |local_x| 阈值，默认等于 transition-radius 或自动估算值。
 
     返回
     -------
@@ -298,25 +289,49 @@ def process_handlebar(mesh,
 
     print(f"Identification result -> bar: region {label_bar}, stem: region {label_stem}")
 
-    # 5. 四区域划分
+    # 5. 四区域划分（基于正交局部坐标系）
     mask_bar = labels_ransac == label_bar
     mask_stem = labels_ransac == label_stem
 
     init_dir_bar, init_pt_bar = rough_axis_from_mask(mesh, mask_bar)
     init_dir_stem, init_pt_stem = rough_axis_from_mask(mesh, mask_stem)
 
+    # 建立正交局部坐标系：x=把立，y=把横，z=x×y
+    u_x = init_dir_stem / np.linalg.norm(init_dir_stem)
+    y_raw = init_dir_bar - np.dot(init_dir_bar, u_x) * u_x
+    if np.linalg.norm(y_raw) < 1e-6:
+        y_raw = np.array([0, 1, 0]) if abs(u_x[1]) < 0.9 else np.array([1, 0, 0])
+        y_raw = y_raw - np.dot(y_raw, u_x) * u_x
+    u_y = y_raw / np.linalg.norm(y_raw)
+    u_z = np.cross(u_x, u_y)
+
+    _, midpoint = line_line_distance_and_midpoint(init_dir_bar, init_pt_bar,
+                                                  init_dir_stem, init_pt_stem)
+    origin = midpoint
+
+    # 面片中心在局部坐标系中的坐标
+    centers = mesh.triangles_center
+    R = np.column_stack([u_x, u_y, u_z])
+    local_coords = (centers - origin) @ R
+
+    # 阈值默认取包围盒最大边的 5%
     if transition_radius is None or transition_radius <= 0:
         max_extent = mesh.bounding_box.extents.max()
-        transition_radius = 0.05 * max_extent  # 默认取包围盒最大边的 5%
+        transition_radius = 0.05 * max_extent
 
-    bar_core, stem_core, transition_mask, residual_mask = partition_four_regions(
+    if bar_y_margin is None:
+        bar_y_margin = transition_radius
+    if stem_x_margin is None:
+        stem_x_margin = transition_radius
+
+    bar_core, stem_core, transition_mask, residual_mask = partition_four_regions_local(
         mesh, mask_bar, mask_stem,
-        init_dir_bar, init_pt_bar,
-        init_dir_stem, init_pt_stem,
-        transition_radius=transition_radius
+        local_coords,
+        bar_y_margin=bar_y_margin,
+        stem_x_margin=stem_x_margin
     )
 
-    # 用核心区域重新拟合轴线（更纯净）
+    # 用核心区域重新拟合轴线
     dir_bar, point_bar = rough_axis_from_mask(mesh, bar_core)
     dir_stem, point_stem = rough_axis_from_mask(mesh, stem_core)
 
@@ -335,10 +350,10 @@ def process_handlebar(mesh,
                                             dir_bar, point_bar,
                                             dir_stem, point_stem)
 
-    # 7. 正交坐标系构建
+    # 7. 正交坐标系构建（x=把立，y=把横）
     T_w2l, T_l2w, u_x, u_y, u_z, origin = orthogonalize_axes(
-        dir_x=dir_bar, point_x=point_bar, weight_x=conf_bar,
-        dir_y=dir_stem, point_y=point_stem, weight_y=conf_stem
+        dir_x=dir_stem, point_x=point_stem, weight_x=conf_stem,
+        dir_y=dir_bar, point_y=point_bar, weight_y=conf_bar
     )
 
     # 8. 变换网格到新坐标系
@@ -368,7 +383,11 @@ def main():
     parser.add_argument("--output", help="保存处理后的网格路径 (可选)")
     parser.add_argument("--ransac_thr", type=float, default=0.1, help="RANSAC 阈值 (默认 0.1)")
     parser.add_argument("--transition-radius", type=float, default=None,
-                        help="过渡区半径（到对侧轴线的距离阈值）。未指定时自动估算。")
+                        help="过渡区半径基准（默认包围盒最大边的 5%）")
+    parser.add_argument("--bar-y-margin", type=float, default=None,
+                        help="把横核心区保留的 |local_y| 阈值，默认等于 transition-radius")
+    parser.add_argument("--stem-x-margin", type=float, default=None,
+                        help="把立核心区保留的 |local_x| 阈值，默认等于 transition-radius")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
     args = parser.parse_args()
 
@@ -384,7 +403,9 @@ def main():
     transformed_scene, world_scene, stats = process_handlebar(
         mesh,
         ransac_threshold=args.ransac_thr,
-        transition_radius=args.transition_radius
+        transition_radius=args.transition_radius,
+        bar_y_margin=args.bar_y_margin,
+        stem_x_margin=args.stem_x_margin
     )
 
     # 保存输出
