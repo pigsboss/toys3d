@@ -92,13 +92,22 @@ def partition_four_regions_local(mesh, mask_bar, mask_stem,
     """
     在正交局部坐标系中按轴向区间划分四区域。
 
-    local_coords[:, 0] = x（把立方向）
+    坐标约定：
+    local_coords[:, 0] = x（把立方向，+x 指向车身头管，即车头到车尾）
     local_coords[:, 1] = y（把横方向）
+    local_coords[:, 2] = z（右手定则）
+
+    分区规则：
+    - 把横：排除 |y| 较小的中央部分（junction 附近）
+    - 把立：排除 x 较小的前段（junction 附近），保留 x 较大的后段（头管侧）
     """
     N = mesh.faces.shape[0]
 
+    # 把横：在 y 方向上关于 junction 对称，排除 |y| 较小的中央部分
     bar_transition = mask_bar & (np.abs(local_coords[:, 1]) <= bar_y_margin)
-    stem_transition = mask_stem & (np.abs(local_coords[:, 0]) <= stem_x_margin)
+
+    # 把立：x 正方向指向头管，排除 x 较小的前段（junction 附近）
+    stem_transition = mask_stem & (local_coords[:, 0] <= stem_x_margin)
 
     transition_mask = bar_transition | stem_transition
 
@@ -296,18 +305,28 @@ def process_handlebar(mesh,
     init_dir_bar, init_pt_bar = rough_axis_from_mask(mesh, mask_bar)
     init_dir_stem, init_pt_stem = rough_axis_from_mask(mesh, mask_stem)
 
+    # Compute midpoint (contact point) first
+    _, midpoint = line_line_distance_and_midpoint(init_dir_bar, init_pt_bar,
+                                                  init_dir_stem, init_pt_stem)
+    origin = midpoint
+
     # 建立正交局部坐标系：x=把立，y=把横，z=x×y
     u_x = init_dir_stem / np.linalg.norm(init_dir_stem)
+
+    # 确保 x 轴正方向指向把立主体（头管侧）：让把立面片多数落在 +x 侧
+    stem_centers = mesh.triangles_center[mask_stem]
+    stem_proj = np.dot(stem_centers - origin, u_x)
+    pos_area = np.sum(mesh.area_faces[mask_stem][stem_proj > 0])
+    neg_area = np.sum(mesh.area_faces[mask_stem][stem_proj < 0])
+    if neg_area > pos_area:
+        u_x = -u_x
+
     y_raw = init_dir_bar - np.dot(init_dir_bar, u_x) * u_x
     if np.linalg.norm(y_raw) < 1e-6:
         y_raw = np.array([0, 1, 0]) if abs(u_x[1]) < 0.9 else np.array([1, 0, 0])
         y_raw = y_raw - np.dot(y_raw, u_x) * u_x
     u_y = y_raw / np.linalg.norm(y_raw)
     u_z = np.cross(u_x, u_y)
-
-    _, midpoint = line_line_distance_and_midpoint(init_dir_bar, init_pt_bar,
-                                                  init_dir_stem, init_pt_stem)
-    origin = midpoint
 
     # 面片中心在局部坐标系中的坐标
     centers = mesh.triangles_center
