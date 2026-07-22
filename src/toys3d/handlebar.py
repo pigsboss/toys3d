@@ -15,7 +15,11 @@ from toys3d.geometrics import (
     axis_from_plucker,
     orthogonalize_axes,
     segment_tubular_regions,
-    line_line_distance_and_midpoint
+    line_line_distance_and_midpoint,
+    kmeans_1d,
+    sample_axial_section_areas,
+    suggest_slice_spacing,
+    compute_cross_section_area,
 )
 
 # ------------------------- 辅助函数 -------------------------
@@ -170,6 +174,107 @@ def assign_final_labels(labels_ransac, masks_dict):
     final_labels[res_stem] = 4
 
     return final_labels
+
+
+def rough_axis_from_mask(mesh, mask):
+    """从面片掩码快速拟合轴线（普吕克），返回 direction, point。"""
+    c = mesh.triangles_center[mask]
+    n = mesh.face_normals[mask]
+    a = mesh.area_faces[mask]
+    C, _, ref = plucker_design_matrix(c, n, a)
+    d, b = axis_from_plucker(C, ref_point=ref)
+    return d, b
+
+
+def iterative_refine_axis_and_core(mesh, region_mask, init_dir, init_pt,
+                                   n_clusters=3, n_iter=2, min_core_faces=50):
+    """
+    利用横截面积聚类迭代精炼轴线与核心区域。
+    ...（完整函数体见下方）
+    """
+    # 函数体如下（请完整复制）
+    region_idx = np.where(region_mask)[0]
+    if len(region_idx) < min_core_faces:
+        core = region_mask.copy()
+        return core, np.zeros_like(region_mask), init_dir, init_pt
+
+    submesh = mesh.submesh(region_idx)[0]
+    dir_u = init_dir / np.linalg.norm(init_dir)
+    pt = np.asarray(init_pt, dtype=np.float64)
+
+    current_dir = dir_u
+    current_pt = pt
+    best_core = region_mask.copy()
+
+    for iteration in range(n_iter):
+        spacing = suggest_slice_spacing(submesh, current_dir, min_count=15, max_count=200)
+        verts = submesh.vertices
+        proj = np.dot(verts - current_pt, current_dir)
+        d_min = proj.min()
+        d_max = proj.max()
+        if d_max - d_min < spacing:
+            break
+        distances = np.arange(d_min, d_max, spacing)
+        dists, areas = sample_axial_section_areas(submesh, current_dir, current_pt, distances)
+
+        valid = areas > 1e-9
+        if np.sum(valid) < n_clusters:
+            break
+        areas_valid = areas[valid]
+        dists_valid = dists[valid]
+
+        try:
+            labels_km, centers = kmeans_1d(areas_valid, n_clusters)
+        except Exception:
+            break
+
+        min_label = 0  # 中心升序，0最小
+        core_distances = dists_valid[labels_km == min_label]
+        if len(core_distances) == 0:
+            break
+        core_distances = np.sort(core_distances)
+
+        centers_region = mesh.triangles_center[region_idx]
+        proj_region = np.dot(centers_region - current_pt, current_dir)
+
+        idx = np.searchsorted(core_distances, proj_region, side='left')
+        idx = np.clip(idx, 0, len(core_distances) - 1)
+        left = core_distances[idx]
+        diff = np.abs(proj_region - left)
+        if len(core_distances) > 1:
+            idx_right = np.clip(idx + 1, 0, len(core_distances) - 1)
+            diff = np.minimum(diff, np.abs(proj_region - core_distances[idx_right]))
+        core_in_region = diff <= spacing * 0.6
+
+        core_global = np.zeros(mesh.faces.shape[0], dtype=bool)
+        core_global[region_idx[core_in_region]] = True
+        if np.sum(core_global) < min_core_faces:
+            break
+
+        best_core = core_global
+
+        core_indices = np.where(core_global)[0]
+        if len(core_indices) < min_core_faces:
+            break
+
+        centroids = mesh.triangles_center[core_indices]
+        norms = mesh.face_normals[core_indices]
+        ars = mesh.area_faces[core_indices]
+        C, _, ref = plucker_design_matrix(centroids, norms, ars)
+        new_dir, new_pt = axis_from_plucker(C, ref_point=ref)
+        current_dir = new_dir
+        current_pt = new_pt
+
+    noncore = region_mask & ~best_core
+
+    if np.sum(best_core) < min_core_faces:
+        best_core = region_mask.copy()
+        noncore = np.zeros_like(noncore)
+        current_dir = init_dir
+        current_pt = init_pt
+
+    return best_core, noncore, current_dir, current_pt
+
 
 def colorize_mesh(mesh, final_labels):
     """
@@ -326,17 +431,8 @@ def process_handlebar(mesh,
 
     # 4. 基于对称性识别把横/把立
     if region_label_bar is None:
-        # 对面积最大的两个区域进行快速轴线拟合（用于对称性计算）
-        def _rough_axis(mask):
-            c = mesh.triangles_center[mask]
-            n = mesh.face_normals[mask]
-            a = mesh.area_faces[mask]
-            C, _, ref = plucker_design_matrix(c, n, a)
-            d, b = axis_from_plucker(C, ref_point=ref)
-            return d, b
-
-        dir1, pt1 = _rough_axis(labels_ransac == area_sums[0][1])
-        dir2, pt2 = _rough_axis(labels_ransac == area_sums[1][1])
+        dir1, pt1 = rough_axis_from_mask(mesh, labels_ransac == area_sums[0][1])
+        dir2, pt2 = rough_axis_from_mask(mesh, labels_ransac == area_sums[1][1])
         _, midpoint = line_line_distance_and_midpoint(dir1, pt1, dir2, pt2)
 
         sym1 = symmetry_score(mesh, labels_ransac == area_sums[0][1], dir1, pt1, midpoint)
@@ -355,22 +451,32 @@ def process_handlebar(mesh,
 
     print(f"Identification result -> bar: region {label_bar}, stem: region {label_stem}")
 
-    # 5. 对每个区域精细轴线并划分核心/残余
+    # 5. 截面聚类精炼区域与轴线
     mask_bar = labels_ransac == label_bar
-    core_bar, residual_bar, dir_bar, point_bar, conf_bar = refine_axis_from_region(
-        mesh, mask_bar, deviation_thr
-    )
     mask_stem = labels_ransac == label_stem
-    core_stem, residual_stem, dir_stem, point_stem, conf_stem = refine_axis_from_region(
-        mesh, mask_stem, deviation_thr
+
+    init_dir_bar, init_pt_bar = rough_axis_from_mask(mesh, mask_bar)
+    init_dir_stem, init_pt_stem = rough_axis_from_mask(mesh, mask_stem)
+
+    core_bar, noncore_bar, dir_bar, point_bar = iterative_refine_axis_and_core(
+        mesh, mask_bar, init_dir_bar, init_pt_bar,
+        n_clusters=3, n_iter=2, min_core_faces=50
+    )
+    core_stem, noncore_stem, dir_stem, point_stem = iterative_refine_axis_and_core(
+        mesh, mask_stem, init_dir_stem, init_pt_stem,
+        n_clusters=3, n_iter=2, min_core_faces=50
     )
 
-    # 6. 合并最终标签
-    masks_dict = {
-        'bar': (label_bar, core_bar, residual_bar),
-        'stem': (label_stem, core_stem, residual_stem)
-    }
-    final_labels = assign_final_labels(labels_ransac, masks_dict)
+    # 置信度 = 核心区域总面积
+    conf_bar = np.sum(mesh.area_faces[core_bar]) if np.sum(core_bar) > 0 else 0.0
+    conf_stem = np.sum(mesh.area_faces[core_stem]) if np.sum(core_stem) > 0 else 0.0
+
+    # 6. 构建最终标签
+    final_labels = np.zeros(N, dtype=int)
+    final_labels[core_bar] = 1
+    final_labels[noncore_bar] = 2
+    final_labels[core_stem] = 3
+    final_labels[noncore_stem] = 4
 
     # Build world-coordinate visualisation (before any transformation)
     world_scene = build_world_visualization(mesh, final_labels,
@@ -397,7 +503,7 @@ def process_handlebar(mesh,
 
     # 统计最终区域信息
     print("\nRegion statistics:")
-    for i, name in enumerate(['Unassigned', 'Bar core', 'Bar residual', 'Stem core', 'Stem residual']):
+    for i, name in enumerate(['Unassigned', 'Bar core', 'Bar non-core', 'Stem core', 'Stem non-core']):
         count = np.sum(final_labels == i)
         print(f"  {name}: {count} triangles")
 

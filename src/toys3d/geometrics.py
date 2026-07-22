@@ -557,3 +557,54 @@ def sample_axial_section_areas(mesh, axis_dir, axis_point, distances,
         area = compute_cross_section_area(mesh, origin, dir_u, face_mask)
         areas.append(area)
     return np.asarray(distances), np.asarray(areas)
+
+
+def kmeans_1d(data, k, max_iter=100, tol=1e-4, rng=None):
+    """
+    对一维数据执行 K-Means 聚类，返回聚类标签和中心。
+
+    Parameters
+    ----------
+    data : (N,) array_like  一维观测值
+    k : int  聚类数目
+    max_iter : int
+    tol : float
+    rng : numpy.random.Generator or None
+
+    Returns
+    -------
+    labels : (N,) ndarray  从 0 开始的簇编号（按中心升序）
+    centers : (k,) ndarray  升序排列的簇中心
+    """
+    data = np.asarray(data, dtype=np.float64).ravel()
+    if rng is None:
+        rng = np.random.default_rng()
+
+    if k < 1:
+        raise ValueError("k 必须 >= 1")
+    if k == 1:
+        return np.zeros(len(data), dtype=int), np.array([np.mean(data)])
+
+    init_indices = rng.choice(len(data), size=k, replace=False)
+    centers = data[init_indices].copy()
+    centers.sort()
+
+    for _ in range(max_iter):
+        dists = np.abs(data[:, None] - centers[None, :])
+        labels = np.argmin(dists, axis=1)
+
+        new_centers = np.array([data[labels == j].mean() for j in range(k)])
+        for j in range(k):
+            if np.sum(labels == j) == 0:
+                new_centers[j] = centers[j]
+
+        shift = np.max(np.abs(new_centers - centers))
+        centers = new_centers
+        if shift < tol:
+            break
+
+    order = np.argsort(centers)
+    centers_sorted = centers[order]
+    label_map = {old: new for new, old in enumerate(order)}
+    labels = np.array([label_map[l] for l in labels], dtype=int)
+    return labels, centers_sorted
