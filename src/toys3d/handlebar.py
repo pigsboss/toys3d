@@ -28,7 +28,6 @@ def compute_mesh_stats(mesh):
     stats['edges'] = mesh.edges_unique.shape[0]
     # 边界边数 = 非重复边数 - 出现在两个面中的边数（mesh.edges 为面边对出现的索引）
     stats['boundary_edges'] = mesh.edges_unique.shape[0] - mesh.edges.shape[0]
-    stats['is_manifold'] = mesh.is_manifold
     stats['is_watertight'] = mesh.is_watertight
     return stats
 
