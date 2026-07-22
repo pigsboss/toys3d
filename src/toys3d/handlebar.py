@@ -101,7 +101,7 @@ def iterative_refine_axis_and_core(mesh, region_mask, init_dir, init_pt,
         core = region_mask.copy()
         return core, np.zeros_like(region_mask), init_dir, init_pt
 
-    submesh = mesh.submesh(region_idx)[0]
+    submesh = mesh.submesh([region_idx])[0]
     dir_u = init_dir / np.linalg.norm(init_dir)
     pt = np.asarray(init_pt, dtype=np.float64)
 
