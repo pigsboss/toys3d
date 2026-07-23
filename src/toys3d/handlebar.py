@@ -461,6 +461,12 @@ def process_handlebar(mesh,
         # ------------------------------------------------------------
         axes_pass2 = axes_pass1
 
+        # Define fallback axes for Pass 3 (same as Pass 1)
+        dir_bar_p2 = init_dir_bar
+        point_bar_p2 = init_pt_bar
+        dir_stem_p2 = init_dir_stem
+        point_stem_p2 = init_pt_stem
+
         if num_passes == 2:
             dir_bar, point_bar = init_dir_bar, init_pt_bar
             dir_stem, point_stem = init_dir_stem, init_pt_stem
