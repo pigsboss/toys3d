@@ -159,9 +159,9 @@ def pass2_t_shape_partition(mesh, mask_bar, mask_stem,
             w = 40.0
         w = max(w, 1.0)
 
-    # 全局网格顶点最小 x（已验证的稳定定义）
-    local_verts = (mesh.vertices - origin) @ R
-    x_min = local_verts[:, 0].min()
+    # 用面片中心稳健估计 x_min，避免单个极值顶点主导
+    local_face_centers = (mesh.triangles_center - origin) @ R
+    x_min = np.percentile(local_face_centers[:, 0], 1)
 
     # 全局矩形分区
     stem_rect = valid_normal & \
