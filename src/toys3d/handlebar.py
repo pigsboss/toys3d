@@ -107,33 +107,28 @@ def orient_stem_x(u_x, stem_mask, mesh, origin):
     return u_x
 
 # ----------------------------------------------------------------------
-#  修订2: pass2_t_shape_partition
+#  修订2: pass2_t_shape_partition (调试版)
 # ----------------------------------------------------------------------
 def pass2_t_shape_partition(mesh, mask_bar, mask_stem,
                             init_dir_bar, init_dir_stem,
                             u_x, u_y, u_z, origin,
                             bar_x_size=None,
-                            stem_y_size=None,
-                            ransac_threshold=0.1):
+                            stem_y_size=None):
     """
-    第二阶段：全局矩形四区域分区 + 区域内 RANSAC 法向过滤。
+    第二阶段（调试版）：纯矩形三分区，无法向过滤，无残余区，不更新轴线。
 
     坐标约定：x=把立（+x 指向头管），y=把横，z=x×y。
 
-    矩形分区：
-    - 把立 core：x > x_min + d  且  |y| <= 0.5*w
-    - 把横 core：x <= x_min + d  且  |y| > 0.5*w
-    - 过渡区：    x <= x_min + d  且  |y| <= 0.5*w
-    - 残余区：    其余
+    分区：
+    - 把立：x > x_min + d  且  |y| <= 0.5*w
+    - 把横：x <= x_min + d  且  |y| > 0.5*w
+    - 过渡：x <= x_min + d  且  |y| <= 0.5*w
 
-    然后在把横/把立区域内分别做法向过滤，剔除偏离各自轴线过大的面片。
+    第一阶段 mask 仅用于估算 d、w、x_min。
     """
     N = mesh.faces.shape[0]
     R = np.column_stack([u_x, u_y, u_z])
     local_coords = (mesh.triangles_center - origin) @ R
-
-    # 有效法向量掩码
-    valid_normal = np.isfinite(mesh.face_normals).all(axis=1)
 
     # 估算 d（把横 x 向尺寸）
     if bar_x_size is not None and bar_x_size > 0:
@@ -166,44 +161,20 @@ def pass2_t_shape_partition(mesh, mask_bar, mask_stem,
     else:
         x_min = -0.5 * d
 
-    # 全局矩形分区
-    stem_rect = valid_normal & \
-                (local_coords[:, 0] > x_min + d) & \
+    # 全局矩形三分区
+    stem_core = (local_coords[:, 0] > x_min + d) & \
                 (np.abs(local_coords[:, 1]) <= 0.5 * w)
-    bar_rect = valid_normal & \
-               (local_coords[:, 0] <= x_min + d) & \
+    bar_core = (local_coords[:, 0] <= x_min + d) & \
                (np.abs(local_coords[:, 1]) > 0.5 * w)
-    transition_mask = valid_normal & \
-                      (local_coords[:, 0] <= x_min + d) & \
+    transition_mask = (local_coords[:, 0] <= x_min + d) & \
                       (np.abs(local_coords[:, 1]) <= 0.5 * w)
+    residual_mask = np.zeros(N, dtype=bool)
 
-    # 区域内 RANSAC 法向过滤
-    def filter_by_axis(mask, axis_dir):
-        idx = np.flatnonzero(mask)
-        if len(idx) == 0:
-            return mask
-        axis_dir = np.asarray(axis_dir, dtype=np.float64)
-        axis_dir = axis_dir / np.linalg.norm(axis_dir)
-        dots = np.abs(mesh.face_normals[idx] @ axis_dir)
-        keep = dots <= ransac_threshold
-        filtered = np.zeros(N, dtype=bool)
-        filtered[idx[keep]] = True
-        return filtered
-
-    stem_core = filter_by_axis(stem_rect, init_dir_stem)
-    bar_core = filter_by_axis(bar_rect, init_dir_bar)
-
-    # 被 RANSAC 过滤掉的面片归入残余区，而非过渡区
-    filtered_out = (stem_rect & ~stem_core) | (bar_rect & ~bar_core)
-
-    residual_mask = ~(stem_core | bar_core | transition_mask) | filtered_out
-
-    print(f"[Pass2] Auto-estimated d (bar x-size) = {d:.3f}")
-    print(f"[Pass2] Auto-estimated w (stem y-size) = {w:.3f}")
-    print(f"[Pass2] x_min (bar vertices) = {x_min:.3f}")
-    print(f"[Pass2] bar_core = {np.sum(bar_core)}, stem_core = {np.sum(stem_core)}, "
-          f"transition = {np.sum(transition_mask)}, residual = {np.sum(residual_mask)}, "
-          f"filtered_out = {np.sum(filtered_out)}")
+    print(f"[Pass2] d (bar x-size) = {d:.3f}")
+    print(f"[Pass2] w (stem y-size) = {w:.3f}")
+    print(f"[Pass2] x_min = {x_min:.3f}")
+    print(f"[Pass2] bar = {np.sum(bar_core)}, stem = {np.sum(stem_core)}, "
+          f"transition = {np.sum(transition_mask)}")
 
     return bar_core, stem_core, transition_mask, residual_mask, d, w
 
@@ -476,43 +447,24 @@ def process_handlebar(mesh,
         u_y = y_raw / np.linalg.norm(y_raw)
         u_z = np.cross(u_x, u_y)
 
-        # 修订3: 传参增加 ransac_threshold
+        # 调试版：纯矩形分区，无法向过滤
         bar_core, stem_core, transition_mask, residual_mask, d_est, w_est = pass2_t_shape_partition(
             mesh, mask_bar, mask_stem,
             init_dir_bar, init_dir_stem,
             u_x, u_y, u_z, origin,
             bar_x_size=bar_x_size,
-            stem_y_size=stem_y_size,
-            ransac_threshold=ransac_threshold
+            stem_y_size=stem_y_size
         )
 
-        # 用 Pass 2 核心重新拟合轴线并更新坐标系
-        dir_bar_p2, point_bar_p2 = rough_axis_from_mask(mesh, bar_core)
-        dir_stem_p2, point_stem_p2 = rough_axis_from_mask(mesh, stem_core)
-
-        axes_pass2 = {
-            'bar': (dir_bar_p2, point_bar_p2),
-            'stem': (dir_stem_p2, point_stem_p2)
-        }
-
-        # 更新原点和坐标轴
-        _, midpoint = line_line_distance_and_midpoint(dir_bar_p2, point_bar_p2,
-                                                      dir_stem_p2, point_stem_p2)
-        origin = midpoint
-
-        u_x = dir_stem_p2 / np.linalg.norm(dir_stem_p2)
-        u_x = orient_stem_x(u_x, stem_core, mesh, origin)
-        y_raw = dir_bar_p2 - np.dot(dir_bar_p2, u_x) * u_x
-        if np.linalg.norm(y_raw) < 1e-6:
-            y_raw = np.array([0, 1, 0]) if abs(u_x[1]) < 0.9 else np.array([1, 0, 0])
-            y_raw = y_raw - np.dot(y_raw, u_x) * u_x
-        u_y = y_raw / np.linalg.norm(y_raw)
-        u_z = np.cross(u_x, u_y)
+        # ------------------------------------------------------------
+        # 调试版：第二阶段不重新拟合轴线，直接用第一阶段轴线
+        # ------------------------------------------------------------
+        axes_pass2 = axes_pass1
 
         if num_passes == 2:
-            dir_bar, point_bar = dir_bar_p2, point_bar_p2
-            dir_stem, point_stem = dir_stem_p2, point_stem_p2
-            axes_pass3 = axes_pass2
+            dir_bar, point_bar = init_dir_bar, init_pt_bar
+            dir_stem, point_stem = init_dir_stem, init_pt_stem
+            axes_pass3 = axes_pass1
         else:
             # --- Pass 3: 基于截面积精化 ---
             if np.sum(bar_core) >= 10:
