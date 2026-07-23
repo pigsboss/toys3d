@@ -148,45 +148,190 @@ def add_axes_to_scene(scene, origin, u_x, u_y, u_z, length=0.3, radius=0.01):
     add_arrow(origin, u_y, [0,255,0,255])    # Y 绿
     add_arrow(origin, u_z, [0,0,255,255])    # Z 蓝
 
-def build_world_visualization(mesh, final_labels, dir_bar, point_bar, dir_stem, point_stem):
+
+# ----------------------------------------------------------------------
+#  新辅助函数
+# ----------------------------------------------------------------------
+def orient_stem_x(u_x, stem_mask, mesh, origin):
+    """Oriente u_x so that majority of stem area lies in +x direction."""
+    stem_centers = mesh.triangles_center[stem_mask]
+    stem_proj = np.dot(stem_centers - origin, u_x)
+    pos_area = np.sum(mesh.area_faces[stem_mask][stem_proj > 0])
+    neg_area = np.sum(mesh.area_faces[stem_mask][stem_proj < 0])
+    if neg_area > pos_area:
+        u_x = -u_x
+    return u_x
+
+def pass2_t_shape_partition(mesh, mask_bar, mask_stem, u_x, u_y, u_z, origin):
     """
-    Build a trimesh.Scene in original world coordinates containing:
-    - coloured input mesh
-    - bar axis line (blue)
-    - stem axis line (red)
-    - common perpendicular segment (green)
-    - midpoint sphere (yellow)
-    - orthonormal frame: X = stem, Y = bar, origin = midpoint
+    第二阶段：纯矩形 T 字形约束分区。
+
+    坐标约定：x=把立（+x 指向头管），y=把横，z=x×y。
+
+    估算：
+    - d = 把横沿 x 方向尺寸（95% 范围）
+    - w = 把立沿 y 方向尺寸（95% 范围）
+    - x_min = 把横区域顶点的最小 x 坐标
+
+    分区：
+    - 把横过渡区 = mask_bar & (|y| <= 0.5*w)
+    - 把立过渡区 = mask_stem & (x <= x_min + d)
+    """
+    N = mesh.faces.shape[0]
+    R = np.column_stack([u_x, u_y, u_z])
+    local_coords = (mesh.triangles_center - origin) @ R
+
+    bar_x = local_coords[mask_bar, 0]
+    d = np.percentile(bar_x, 95) - np.percentile(bar_x, 5)
+    if not np.isfinite(d) or d <= 0:
+        d = 30.0
+    d = max(d, 1.0)
+
+    stem_y = local_coords[mask_stem, 1]
+    w = np.percentile(stem_y, 95) - np.percentile(stem_y, 5)
+    if not np.isfinite(w) or w <= 0:
+        w = 40.0
+    w = max(w, 1.0)
+
+    bar_verts_mask = np.zeros(len(mesh.vertices), dtype=bool)
+    bar_faces = mesh.faces[mask_bar]
+    if bar_faces.size > 0:
+        bar_verts_mask[bar_faces.ravel()] = True
+    local_verts = (mesh.vertices - origin) @ R
+    if np.any(bar_verts_mask):
+        x_min = local_verts[bar_verts_mask, 0].min()
+    else:
+        x_min = -0.5 * d
+
+    bar_overlap = np.abs(local_coords[:, 1]) <= 0.5 * w
+    stem_overlap = local_coords[:, 0] <= (x_min + d)
+
+    bar_core = mask_bar & ~bar_overlap
+    stem_core = mask_stem & ~stem_overlap
+    transition_mask = (mask_bar & bar_overlap) | (mask_stem & stem_overlap)
+    residual_mask = ~(mask_bar | mask_stem)
+
+    return bar_core, stem_core, transition_mask, residual_mask, d, w
+
+def pass3_refine_by_area(mesh, core_mask, axis_dir, axis_point, dim_est):
+    """
+    基于轴向距离剔除离群面片的简单精化。
+    保留距中位数 1.5*dim_est 范围内的面片，其余转为过渡区。
+    """
+    N = len(mesh.faces)
+    if np.sum(core_mask) < 10:
+        return core_mask, np.zeros(N, dtype=bool)
+    centers = mesh.triangles_center[core_mask]
+    vec = centers - axis_point
+    proj = np.dot(vec, axis_dir)
+    median = np.median(proj)
+    lo = median - 1.5 * dim_est
+    hi = median + 1.5 * dim_est
+    keep = (proj >= lo) & (proj <= hi)
+    global_indices = np.where(core_mask)[0]
+    global_keep = np.zeros(N, dtype=bool)
+    global_keep[global_indices[keep]] = True
+    trans = core_mask & ~global_keep
+    return global_keep, trans
+
+def _axes_are_close(ax1, ax2, angle_tol=0.99, dist_tol=1e-3):
+    """判断两组轴线是否在方向和位置上足够接近。"""
+    d1_bar, p1_bar = ax1['bar']
+    d2_bar, p2_bar = ax2['bar']
+    d1_stem, p1_stem = ax1['stem']
+    d2_stem, p2_stem = ax2['stem']
+
+    bar_dot = abs(np.dot(d1_bar / np.linalg.norm(d1_bar),
+                         d2_bar / np.linalg.norm(d2_bar)))
+    stem_dot = abs(np.dot(d1_stem / np.linalg.norm(d1_stem),
+                          d2_stem / np.linalg.norm(d2_stem)))
+    bar_dist = np.linalg.norm(p1_bar - p2_bar)
+    stem_dist = np.linalg.norm(p1_stem - p2_stem)
+
+    return (bar_dot > angle_tol and stem_dot > angle_tol and
+            bar_dist < dist_tol and stem_dist < dist_tol)
+
+def _add_dashed_line(scene, p1, p2, color, radius, segments=20):
+    """用多个短圆柱近似虚线。"""
+    t = np.linspace(0, 1, segments * 2 + 1)
+    for i in range(0, 2 * segments, 2):
+        a = p1 + t[i] * (p2 - p1)
+        b = p1 + t[i + 1] * (p2 - p1)
+        cyl = trimesh.creation.cylinder(radius, segment=[a, b])
+        cyl.visual.face_colors = color
+        scene.add_geometry(cyl)
+
+def _add_axis_pair(scene, axes, L_axis, max_ext,
+                   bar_color, stem_color,
+                   radius_factor, dashed):
+    """添加一对把横/把立轴线，可选虚线效果。"""
+    dir_bar, point_bar = axes['bar']
+    dir_stem, point_stem = axes['stem']
+
+    # 把横轴线
+    p1 = point_bar - L_axis * dir_bar
+    p2 = point_bar + L_axis * dir_bar
+    if dashed:
+        _add_dashed_line(scene, p1, p2, bar_color, radius_factor * max_ext)
+    else:
+        cyl = trimesh.creation.cylinder(radius_factor * max_ext, segment=[p1, p2])
+        cyl.visual.face_colors = bar_color
+        scene.add_geometry(cyl)
+
+    # 把立轴线
+    p1 = point_stem - L_axis * dir_stem
+    p2 = point_stem + L_axis * dir_stem
+    if dashed:
+        _add_dashed_line(scene, p1, p2, stem_color, radius_factor * max_ext)
+    else:
+        cyl = trimesh.creation.cylinder(radius_factor * max_ext, segment=[p1, p2])
+        cyl.visual.face_colors = stem_color
+        scene.add_geometry(cyl)
+
+def build_world_visualization(mesh, final_labels,
+                              axes_pass1, axes_pass2, axes_pass3,
+                              max_ext, num_passes=3):
+    """
+    在世界坐标系中可视化：
+    - 着色网格（最终分区结果）
+    - 第一/二/三阶段估计的把横、把立轴线
     """
     scene = trimesh.Scene()
 
-    # Coloured mesh
+    # 着色网格
     vis_mesh = mesh.copy()
     colorize_mesh(vis_mesh, final_labels)
     scene.add_geometry(vis_mesh)
 
-    # Scale from bounding box
-    extents = mesh.bounding_box.extents
-    max_ext = extents.max()
     L_axis = max_ext * 1.5
     frame_len = max_ext * 0.6
 
-    # Bar axis (blue)
-    pbar1 = point_bar - L_axis * dir_bar
-    pbar2 = point_bar + L_axis * dir_bar
-    cyl_bar = trimesh.creation.cylinder(0.005 * max_ext, segment=[pbar1, pbar2])
-    cyl_bar.visual.face_colors = [0, 100, 200, 255]
-    scene.add_geometry(cyl_bar)
+    # Pass 1: 虚线/半透明
+    _add_axis_pair(scene, axes_pass1, L_axis, max_ext,
+                   bar_color=[0, 100, 200, 120],
+                   stem_color=[200, 50, 50, 120],
+                   radius_factor=0.004, dashed=True)
 
-    # Stem axis (red)
-    pstem1 = point_stem - L_axis * dir_stem
-    pstem2 = point_stem + L_axis * dir_stem
-    cyl_stem = trimesh.creation.cylinder(0.005 * max_ext, segment=[pstem1, pstem2])
-    cyl_stem.visual.face_colors = [200, 50, 50, 255]
-    scene.add_geometry(cyl_stem)
+    # Pass 2: 点划线/中等透明
+    if num_passes >= 2 and not _axes_are_close(axes_pass1, axes_pass2):
+        _add_axis_pair(scene, axes_pass2, L_axis, max_ext,
+                       bar_color=[0, 150, 255, 180],
+                       stem_color=[255, 80, 80, 180],
+                       radius_factor=0.006, dashed=True)
 
-    # Closest points and common perpendicular
-    p_close_bar, p_close_stem, midpoint = closest_points_on_lines(dir_bar, point_bar, dir_stem, point_stem)
+    # Pass 3: 实线/不透明
+    if num_passes >= 3 and not _axes_are_close(axes_pass2, axes_pass3):
+        _add_axis_pair(scene, axes_pass3, L_axis, max_ext,
+                       bar_color=[0, 100, 200, 255],
+                       stem_color=[200, 50, 50, 255],
+                       radius_factor=0.008, dashed=False)
+
+    # 公垂线段与中点（基于最终轴线）
+    dir_bar, point_bar = axes_pass3['bar']
+    dir_stem, point_stem = axes_pass3['stem']
+    p_close_bar, p_close_stem, midpoint = closest_points_on_lines(
+        dir_bar, point_bar, dir_stem, point_stem
+    )
 
     cyl_perp = trimesh.creation.cylinder(0.008 * max_ext, segment=[p_close_bar, p_close_stem])
     cyl_perp.visual.face_colors = [0, 180, 0, 255]
@@ -197,16 +342,15 @@ def build_world_visualization(mesh, final_labels, dir_bar, point_bar, dir_stem, 
     sph_mid.visual.face_colors = [255, 255, 0, 255]
     scene.add_geometry(sph_mid)
 
-    # Orthogonal frame: X = stem, Y = bar (orthogonalised), origin = midpoint
+    # 最终坐标架
     x_raw = dir_stem / np.linalg.norm(dir_stem)
     y_raw = dir_bar / np.linalg.norm(dir_bar)
     y_ortho = y_raw - np.dot(y_raw, x_raw) * x_raw
     if np.linalg.norm(y_ortho) < 1e-6:
-        y_ortho = np.array([1,0,0]) if abs(x_raw[1]) < 0.9 else np.array([0,1,0])
+        y_ortho = np.array([1, 0, 0]) if abs(x_raw[1]) < 0.9 else np.array([0, 1, 0])
         y_ortho = y_ortho - np.dot(y_ortho, x_raw) * x_raw
     y_ortho /= np.linalg.norm(y_ortho)
     z_ortho = np.cross(x_raw, y_ortho)
-
     add_axes_to_scene(scene, midpoint, x_raw, y_ortho, z_ortho, length=frame_len)
 
     return scene
@@ -217,9 +361,7 @@ def process_handlebar(mesh,
                       ransac_threshold=0.1,
                       region_label_bar=None,
                       region_label_stem=None,
-                      transition_radius=None,
-                      bar_y_margin=None,
-                      stem_x_margin=None):
+                      num_passes=3):
     """
     对一体把进行完整处理，返回可视化场景。
 
@@ -231,12 +373,11 @@ def process_handlebar(mesh,
     region_label_bar, region_label_stem : int or None
         手动指定 RANSAC 输出中哪个标签对应把横/把立。
         若为 None，则使用对称性自动判断。
-    transition_radius : float or None
-        过渡区半径（到对侧轴线的距离阈值）。若为 None 或 <= 0，则自动估算为包围盒最大边的 5%。
-    bar_y_margin : float or None
-        把横核心区保留的 |local_y| 阈值，默认等于 transition-radius 或自动估算值。
-    stem_x_margin : float or None
-        把立核心区保留的 |local_x| 阈值，默认等于 transition-radius 或自动估算值。
+    num_passes : {1, 2, 3}
+        分区阶段数：
+        1 = RANSAC 初始分区
+        2 = +T 字形矩形约束
+        3 = + 截面积精化
 
     返回
     -------
@@ -298,61 +439,106 @@ def process_handlebar(mesh,
 
     print(f"Identification result -> bar: region {label_bar}, stem: region {label_stem}")
 
-    # 5. 四区域划分（基于正交局部坐标系）
+    # 5. Pass 1: 初始轴线
     mask_bar = labels_ransac == label_bar
     mask_stem = labels_ransac == label_stem
 
     init_dir_bar, init_pt_bar = rough_axis_from_mask(mesh, mask_bar)
     init_dir_stem, init_pt_stem = rough_axis_from_mask(mesh, mask_stem)
 
-    # Compute midpoint (contact point) first
-    _, midpoint = line_line_distance_and_midpoint(init_dir_bar, init_pt_bar,
-                                                  init_dir_stem, init_pt_stem)
-    origin = midpoint
+    axes_pass1 = {
+        'bar': (init_dir_bar, init_pt_bar),
+        'stem': (init_dir_stem, init_pt_stem)
+    }
 
-    # 建立正交局部坐标系：x=把立，y=把横，z=x×y
-    u_x = init_dir_stem / np.linalg.norm(init_dir_stem)
+    if num_passes == 1:
+        # 仅第一阶段：直接把 RANSAC 区域作为最终分区
+        bar_core = mask_bar
+        stem_core = mask_stem
+        transition_mask = np.zeros(N, dtype=bool)
+        dir_bar, point_bar = init_dir_bar, init_pt_bar
+        dir_stem, point_stem = init_dir_stem, init_pt_stem
+        axes_pass2 = axes_pass1
+        axes_pass3 = axes_pass1
+    else:
+        # --- Pass 2: T 字形矩形约束分区 ---
+        _, midpoint = line_line_distance_and_midpoint(init_dir_bar, init_pt_bar,
+                                                      init_dir_stem, init_pt_stem)
+        origin = midpoint
 
-    # 确保 x 轴正方向指向把立主体（头管侧）：让把立面片多数落在 +x 侧
-    stem_centers = mesh.triangles_center[mask_stem]
-    stem_proj = np.dot(stem_centers - origin, u_x)
-    pos_area = np.sum(mesh.area_faces[mask_stem][stem_proj > 0])
-    neg_area = np.sum(mesh.area_faces[mask_stem][stem_proj < 0])
-    if neg_area > pos_area:
-        u_x = -u_x
+        u_x = init_dir_stem / np.linalg.norm(init_dir_stem)
+        u_x = orient_stem_x(u_x, mask_stem, mesh, origin)
 
-    y_raw = init_dir_bar - np.dot(init_dir_bar, u_x) * u_x
-    if np.linalg.norm(y_raw) < 1e-6:
-        y_raw = np.array([0, 1, 0]) if abs(u_x[1]) < 0.9 else np.array([1, 0, 0])
-        y_raw = y_raw - np.dot(y_raw, u_x) * u_x
-    u_y = y_raw / np.linalg.norm(y_raw)
-    u_z = np.cross(u_x, u_y)
+        y_raw = init_dir_bar - np.dot(init_dir_bar, u_x) * u_x
+        if np.linalg.norm(y_raw) < 1e-6:
+            y_raw = np.array([0, 1, 0]) if abs(u_x[1]) < 0.9 else np.array([1, 0, 0])
+            y_raw = y_raw - np.dot(y_raw, u_x) * u_x
+        u_y = y_raw / np.linalg.norm(y_raw)
+        u_z = np.cross(u_x, u_y)
 
-    # 面片中心在局部坐标系中的坐标
-    centers = mesh.triangles_center
-    R = np.column_stack([u_x, u_y, u_z])
-    local_coords = (centers - origin) @ R
+        bar_core, stem_core, transition_mask, residual_mask, d_est, w_est = pass2_t_shape_partition(
+            mesh, mask_bar, mask_stem, u_x, u_y, u_z, origin
+        )
 
-    # 阈值默认取包围盒最大边的 5%
-    if transition_radius is None or transition_radius <= 0:
-        max_extent = mesh.bounding_box.extents.max()
-        transition_radius = 0.05 * max_extent
+        # 用 Pass 2 核心重新拟合轴线并更新坐标系
+        dir_bar_p2, point_bar_p2 = rough_axis_from_mask(mesh, bar_core)
+        dir_stem_p2, point_stem_p2 = rough_axis_from_mask(mesh, stem_core)
 
-    if bar_y_margin is None:
-        bar_y_margin = transition_radius
-    if stem_x_margin is None:
-        stem_x_margin = transition_radius
+        axes_pass2 = {
+            'bar': (dir_bar_p2, point_bar_p2),
+            'stem': (dir_stem_p2, point_stem_p2)
+        }
 
-    bar_core, stem_core, transition_mask, residual_mask = partition_four_regions_local(
-        mesh, mask_bar, mask_stem,
-        local_coords,
-        bar_y_margin=bar_y_margin,
-        stem_x_margin=stem_x_margin
-    )
+        # 更新原点和坐标轴
+        _, midpoint = line_line_distance_and_midpoint(dir_bar_p2, point_bar_p2,
+                                                      dir_stem_p2, point_stem_p2)
+        origin = midpoint
 
-    # 用核心区域重新拟合轴线
-    dir_bar, point_bar = rough_axis_from_mask(mesh, bar_core)
-    dir_stem, point_stem = rough_axis_from_mask(mesh, stem_core)
+        u_x = dir_stem_p2 / np.linalg.norm(dir_stem_p2)
+        u_x = orient_stem_x(u_x, stem_core, mesh, origin)
+        y_raw = dir_bar_p2 - np.dot(dir_bar_p2, u_x) * u_x
+        if np.linalg.norm(y_raw) < 1e-6:
+            y_raw = np.array([0, 1, 0]) if abs(u_x[1]) < 0.9 else np.array([1, 0, 0])
+            y_raw = y_raw - np.dot(y_raw, u_x) * u_x
+        u_y = y_raw / np.linalg.norm(y_raw)
+        u_z = np.cross(u_x, u_y)
+
+        if num_passes == 2:
+            dir_bar, point_bar = dir_bar_p2, point_bar_p2
+            dir_stem, point_stem = dir_stem_p2, point_stem_p2
+            axes_pass3 = axes_pass2
+        else:
+            # --- Pass 3: 基于截面积精化 ---
+            if np.sum(bar_core) >= 10:
+                dir_bar, point_bar = rough_axis_from_mask(mesh, bar_core)
+                bar_core, bar_trans_add = pass3_refine_by_area(
+                    mesh, bar_core, dir_bar, point_bar, d_est
+                )
+            else:
+                bar_trans_add = np.zeros(N, dtype=bool)
+                dir_bar, point_bar = dir_bar_p2, point_bar_p2
+
+            if np.sum(stem_core) >= 10:
+                dir_stem, point_stem = rough_axis_from_mask(mesh, stem_core)
+                stem_core, stem_trans_add = pass3_refine_by_area(
+                    mesh, stem_core, dir_stem, point_stem, w_est
+                )
+            else:
+                stem_trans_add = np.zeros(N, dtype=bool)
+                dir_stem, point_stem = dir_stem_p2, point_stem_p2
+
+            transition_mask = transition_mask | bar_trans_add | stem_trans_add
+
+            # 用精化后的核心重新拟合最终轴线
+            if np.sum(bar_core) >= 10:
+                dir_bar, point_bar = rough_axis_from_mask(mesh, bar_core)
+            if np.sum(stem_core) >= 10:
+                dir_stem, point_stem = rough_axis_from_mask(mesh, stem_core)
+
+            axes_pass3 = {
+                'bar': (dir_bar, point_bar),
+                'stem': (dir_stem, point_stem)
+            }
 
     conf_bar = np.sum(mesh.area_faces[bar_core]) if np.sum(bar_core) > 0 else 0.0
     conf_stem = np.sum(mesh.area_faces[stem_core]) if np.sum(stem_core) > 0 else 0.0
@@ -365,9 +551,10 @@ def process_handlebar(mesh,
     # 0 = residual
 
     # Build world-coordinate visualisation (before any transformation)
+    max_ext = mesh.bounding_box.extents.max()
     world_scene = build_world_visualization(mesh, final_labels,
-                                            dir_bar, point_bar,
-                                            dir_stem, point_stem)
+                                            axes_pass1, axes_pass2, axes_pass3,
+                                            max_ext, num_passes=num_passes)
 
     # 7. 正交坐标系构建（x=把立，y=把横）
     T_w2l, T_l2w, u_x, u_y, u_z, origin = orthogonalize_axes(
@@ -401,19 +588,14 @@ def main():
     parser.add_argument("input_file", help="输入网格文件路径 (stl/ply/obj)")
     parser.add_argument("--output", help="保存处理后的网格路径 (可选)")
     parser.add_argument("--ransac_thr", type=float, default=0.1, help="RANSAC 阈值 (默认 0.1)")
-    parser.add_argument("--transition-radius", type=float, default=None,
-                        help="过渡区半径基准（默认包围盒最大边的 5%）")
-    parser.add_argument("--bar-y-margin", type=float, default=None,
-                        help="把横核心区保留的 |local_y| 阈值，默认等于 transition-radius")
-    parser.add_argument("--stem-x-margin", type=float, default=None,
-                        help="把立核心区保留的 |local_x| 阈值，默认等于 transition-radius")
+    parser.add_argument("--num-passes", type=int, default=3, choices=[1, 2, 3],
+                        help="分区阶段数：1=RANSAC初始分区，2=+T字形约束分区，3=+截面积精化（默认3）")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
     args = parser.parse_args()
 
     # 加载网格
     mesh = trimesh.load(args.input_file)
     if not isinstance(mesh, trimesh.Trimesh):
-        # 如果是场景，尝试合并所有几何体
         mesh = mesh.dump(concatenate=True)
         print("Multiple meshes detected, merged.")
     print(f"Hey, loading model: {args.input_file}")
@@ -422,21 +604,17 @@ def main():
     transformed_scene, world_scene, stats = process_handlebar(
         mesh,
         ransac_threshold=args.ransac_thr,
-        transition_radius=args.transition_radius,
-        bar_y_margin=args.bar_y_margin,
-        stem_x_margin=args.stem_x_margin
+        num_passes=args.num_passes
     )
 
     # 保存输出
     if args.output:
-        # 从场景中提取着色后的网格并保存
         out_mesh = transformed_scene.dump(concatenate=True)
         out_mesh.export(args.output)
         print(f"Processed mesh saved to {args.output}")
 
     # 可视化
     if args.show:
-        # 使用 vedo 避免关闭窗口退出问题
         os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
         world_scene.show()
 
