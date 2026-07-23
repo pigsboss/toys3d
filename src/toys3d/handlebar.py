@@ -150,16 +150,9 @@ def pass2_t_shape_partition(mesh, mask_bar, mask_stem,
             w = 40.0
         w = max(w, 1.0)
 
-    # 把横区域顶点最小 x
-    bar_verts_mask = np.zeros(len(mesh.vertices), dtype=bool)
-    bar_faces = mesh.faces[mask_bar]
-    if bar_faces.size > 0:
-        bar_verts_mask[bar_faces.ravel()] = True
+    # 全局网格顶点最小 x
     local_verts = (mesh.vertices - origin) @ R
-    if np.any(bar_verts_mask):
-        x_min = local_verts[bar_verts_mask, 0].min()
-    else:
-        x_min = -0.5 * d
+    x_min = local_verts[:, 0].min()
 
     # 全局矩形三分区
     stem_core = (local_coords[:, 0] > x_min + d) & \
