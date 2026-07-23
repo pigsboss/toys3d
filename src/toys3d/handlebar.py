@@ -133,21 +133,17 @@ def pass2_t_shape_partition(mesh, mask_bar, mask_stem,
                             init_dir_bar, init_dir_stem,
                             u_x, u_y, u_z, origin,
                             bar_x_size=None,
-                            stem_y_size=None,
-                            ransac_threshold=0.1):
+                            stem_y_size=None):
     """
-    第二阶段：从全局网格出发，按 T 字形矩形约束重新分区。
+    第二阶段：仅从全局网格出发，按 xy 平面矩形约束重新分区。
 
     坐标约定：x=把立（+x 指向头管），y=把横，z=x×y。
 
-    流程：
-    1. 全局面片中心变换到局部坐标系。
-    2. 估算 d（把横 x 向尺寸）和 w（把立 y 向尺寸）。
-    3. 矩形约束重新分配：
-       - bar_candidate:  |y| > 0.5*w  且  x <= x_min + d
-       - stem_candidate: x > x_min + d  且  |y| <= 0.5*w
-    4. 对候选区域用法向-轴线垂直性做 RANSAC 式过滤。
-    5. 剩余未通过过滤或位于矩形过渡区的面片归入 transition。
+    矩形约束：
+    - 把横核心：|y| > 0.5*w  且  x <= x_min + d
+    - 把立核心：x > x_min + d  且  |y| <= 0.5*w
+    - 过渡区：第一阶段已分类但未被归入 bar_core/stem_core 的面片
+    - 残余区：第一阶段未分类的面片
 
     Returns
     -------
@@ -188,30 +184,13 @@ def pass2_t_shape_partition(mesh, mask_bar, mask_stem,
     else:
         x_min = -0.5 * d
 
-    # --- 矩形约束：从全局网格重新分配 ---
-    bar_candidate = (np.abs(local_coords[:, 1]) > 0.5 * w) & \
-                    (local_coords[:, 0] <= x_min + d)
-    stem_candidate = (local_coords[:, 0] > x_min + d) & \
-                     (np.abs(local_coords[:, 1]) <= 0.5 * w)
+    # --- 矩形分区（无 RANSAC 过滤）---
+    bar_core = (np.abs(local_coords[:, 1]) > 0.5 * w) & \
+               (local_coords[:, 0] <= x_min + d)
+    stem_core = (local_coords[:, 0] > x_min + d) & \
+                (np.abs(local_coords[:, 1]) <= 0.5 * w)
 
-    # --- RANSAC 式法向过滤：剔除不垂直于轴线的局部异常 ---
-    def filter_tubular(candidate_mask, axis_dir):
-        idx = np.flatnonzero(candidate_mask)
-        if len(idx) == 0:
-            return np.zeros(N, dtype=bool)
-        normals = mesh.face_normals[idx]
-        axis_dir = np.asarray(axis_dir, dtype=np.float64)
-        axis_dir = axis_dir / np.linalg.norm(axis_dir)
-        dots = np.abs(normals @ axis_dir)
-        keep_local = dots <= ransac_threshold
-        keep_global = np.zeros(N, dtype=bool)
-        keep_global[idx[keep_local]] = True
-        return keep_global
-
-    bar_core = filter_tubular(bar_candidate, init_dir_bar)
-    stem_core = filter_tubular(stem_candidate, init_dir_stem)
-
-    # 过渡区：第一阶段已分类但未被归入 bar_core/stem_core 的面片
+    # 第一阶段已分类但未被归入核心：过渡区
     transition_mask = (mask_bar | mask_stem) & ~(bar_core | stem_core)
     residual_mask = ~(mask_bar | mask_stem)
 
@@ -491,8 +470,7 @@ def process_handlebar(mesh,
             init_dir_bar, init_dir_stem,
             u_x, u_y, u_z, origin,
             bar_x_size=bar_x_size,
-            stem_y_size=stem_y_size,
-            ransac_threshold=ransac_threshold
+            stem_y_size=stem_y_size
         )
 
         # 用 Pass 2 核心重新拟合轴线并更新坐标系
