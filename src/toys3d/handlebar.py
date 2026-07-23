@@ -85,39 +85,6 @@ def rough_axis_from_mask(mesh, mask):
     d, b = axis_from_plucker(C, ref_point=ref)
     return d, b
 
-def partition_four_regions_local(mesh, mask_bar, mask_stem,
-                                 local_coords,
-                                 bar_y_margin,
-                                 stem_x_margin):
-    """
-    在正交局部坐标系中按轴向区间划分四区域。
-
-    坐标约定：
-    local_coords[:, 0] = x（把立方向，+x 指向车身头管，即车头到车尾）
-    local_coords[:, 1] = y（把横方向）
-    local_coords[:, 2] = z（右手定则）
-
-    分区规则：
-    - 把横：排除 |y| 较小的中央部分（junction 附近）
-    - 把立：排除 x 较小的前段（junction 附近），保留 x 较大的后段（头管侧）
-    """
-    N = mesh.faces.shape[0]
-
-    # 把横：在 y 方向上关于 junction 对称，排除 |y| 较小的中央部分
-    bar_transition = mask_bar & (np.abs(local_coords[:, 1]) <= bar_y_margin)
-
-    # 把立：x 正方向指向头管，排除 x 较小的前段（junction 附近）
-    stem_transition = mask_stem & (local_coords[:, 0] <= stem_x_margin)
-
-    transition_mask = bar_transition | stem_transition
-
-    bar_core = mask_bar & ~bar_transition
-    stem_core = mask_stem & ~stem_transition
-
-    residual_mask = ~(mask_bar | mask_stem)
-
-    return bar_core, stem_core, transition_mask, residual_mask
-
 def colorize_mesh(mesh, final_labels):
     """
     根据最终标签设置面片颜色。
@@ -162,27 +129,35 @@ def orient_stem_x(u_x, stem_mask, mesh, origin):
         u_x = -u_x
     return u_x
 
-def pass2_t_shape_partition(mesh, mask_bar, mask_stem, u_x, u_y, u_z, origin,
+def pass2_t_shape_partition(mesh, mask_bar, mask_stem,
+                            init_dir_bar, init_dir_stem,
+                            u_x, u_y, u_z, origin,
                             bar_x_size=None,
-                            stem_y_size=None):
+                            stem_y_size=None,
+                            ransac_threshold=0.1):
     """
-    第二阶段：纯矩形 T 字形约束分区。
+    第二阶段：从全局网格出发，按 T 字形矩形约束重新分区。
 
     坐标约定：x=把立（+x 指向头管），y=把横，z=x×y。
 
-    估算：
-    - d = 把横沿 x 方向尺寸（95% 范围）
-    - w = 把立沿 y 方向尺寸（95% 范围）
-    - x_min = 把横区域顶点的最小 x 坐标
+    流程：
+    1. 全局面片中心变换到局部坐标系。
+    2. 估算 d（把横 x 向尺寸）和 w（把立 y 向尺寸）。
+    3. 矩形约束重新分配：
+       - bar_candidate:  |y| > 0.5*w  且  x <= x_min + d
+       - stem_candidate: x > x_min + d  且  |y| <= 0.5*w
+    4. 对候选区域用法向-轴线垂直性做 RANSAC 式过滤。
+    5. 剩余未通过过滤或位于矩形过渡区的面片归入 transition。
 
-    分区：
-    - 把横过渡区 = mask_bar & (|y| <= 0.5*w)
-    - 把立过渡区 = mask_stem & (x <= x_min + d)
+    Returns
+    -------
+    bar_core, stem_core, transition_mask, residual_mask, d, w
     """
     N = mesh.faces.shape[0]
     R = np.column_stack([u_x, u_y, u_z])
     local_coords = (mesh.triangles_center - origin) @ R
 
+    # 估算 d（把横 x 向尺寸）
     if bar_x_size is not None and bar_x_size > 0:
         d = bar_x_size
     else:
@@ -192,6 +167,7 @@ def pass2_t_shape_partition(mesh, mask_bar, mask_stem, u_x, u_y, u_z, origin,
             d = 30.0
         d = max(d, 1.0)
 
+    # 估算 w（把立 y 向尺寸）
     if stem_y_size is not None and stem_y_size > 0:
         w = stem_y_size
     else:
@@ -201,6 +177,7 @@ def pass2_t_shape_partition(mesh, mask_bar, mask_stem, u_x, u_y, u_z, origin,
             w = 40.0
         w = max(w, 1.0)
 
+    # 把横区域顶点最小 x
     bar_verts_mask = np.zeros(len(mesh.vertices), dtype=bool)
     bar_faces = mesh.faces[mask_bar]
     if bar_faces.size > 0:
@@ -211,12 +188,31 @@ def pass2_t_shape_partition(mesh, mask_bar, mask_stem, u_x, u_y, u_z, origin,
     else:
         x_min = -0.5 * d
 
-    bar_overlap = np.abs(local_coords[:, 1]) <= 0.5 * w
-    stem_overlap = local_coords[:, 0] <= (x_min + d)
+    # --- 矩形约束：从全局网格重新分配 ---
+    bar_candidate = (np.abs(local_coords[:, 1]) > 0.5 * w) & \
+                    (local_coords[:, 0] <= x_min + d)
+    stem_candidate = (local_coords[:, 0] > x_min + d) & \
+                     (np.abs(local_coords[:, 1]) <= 0.5 * w)
 
-    bar_core = mask_bar & ~bar_overlap
-    stem_core = mask_stem & ~stem_overlap
-    transition_mask = (mask_bar & bar_overlap) | (mask_stem & stem_overlap)
+    # --- RANSAC 式法向过滤：剔除不垂直于轴线的局部异常 ---
+    def filter_tubular(candidate_mask, axis_dir):
+        idx = np.flatnonzero(candidate_mask)
+        if len(idx) == 0:
+            return np.zeros(N, dtype=bool)
+        normals = mesh.face_normals[idx]
+        axis_dir = np.asarray(axis_dir, dtype=np.float64)
+        axis_dir = axis_dir / np.linalg.norm(axis_dir)
+        dots = np.abs(normals @ axis_dir)
+        keep_local = dots <= ransac_threshold
+        keep_global = np.zeros(N, dtype=bool)
+        keep_global[idx[keep_local]] = True
+        return keep_global
+
+    bar_core = filter_tubular(bar_candidate, init_dir_bar)
+    stem_core = filter_tubular(stem_candidate, init_dir_stem)
+
+    # 过渡区：第一阶段已分类但未被归入 bar_core/stem_core 的面片
+    transition_mask = (mask_bar | mask_stem) & ~(bar_core | stem_core)
     residual_mask = ~(mask_bar | mask_stem)
 
     return bar_core, stem_core, transition_mask, residual_mask, d, w
@@ -491,9 +487,12 @@ def process_handlebar(mesh,
         u_z = np.cross(u_x, u_y)
 
         bar_core, stem_core, transition_mask, residual_mask, d_est, w_est = pass2_t_shape_partition(
-            mesh, mask_bar, mask_stem, u_x, u_y, u_z, origin,
+            mesh, mask_bar, mask_stem,
+            init_dir_bar, init_dir_stem,
+            u_x, u_y, u_z, origin,
             bar_x_size=bar_x_size,
-            stem_y_size=stem_y_size
+            stem_y_size=stem_y_size,
+            ransac_threshold=ransac_threshold
         )
 
         # 用 Pass 2 核心重新拟合轴线并更新坐标系
