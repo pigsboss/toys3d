@@ -54,27 +54,111 @@ def compute_mesh_stats(mesh):
     stats['is_watertight'] = mesh.is_watertight
     return stats
 
-def symmetry_score(mesh, region_mask, axis_dir, axis_point, midpoint):
+def symmetry_score(mesh, region_mask, axis_dir, axis_point, n_bins=40):
     """
-    计算管状区域相对于公垂线中点的对称性得分（0~1，越高越对称）。
-    原理：核心面片中心投影到轴线上，比较中点两侧的面积占比。
+    基于沿轴线的面积分布形状评价对称性。
+
+    思路：
+    - 把区域面片沿轴线投影；
+    - 以投影中位数为中心，建立加权直方图；
+    - 比较左右两半直方图的相似度（相关系数）。
+    - 越接近镜像对称，得分越接近 1。
+
+    优点：不关心重心位置，只关心两侧分布形状是否匹配；
+          异常大面片不会整体拉偏结果。
     """
-    indices = np.where(region_mask)[0]
-    if len(indices) < 5:
+    idx = np.flatnonzero(region_mask)
+    if len(idx) < 5:
         return 0.0
-    centers = mesh.triangles_center[indices]
-    areas = mesh.area_faces[indices]
-    vecs = centers - midpoint
-    proj = np.dot(vecs, axis_dir)
-    pos_mask = proj >= 0
-    neg_mask = ~pos_mask
-    pos_area = areas[pos_mask].sum()
-    neg_area = areas[neg_mask].sum()
-    total_area = pos_area + neg_area
-    if total_area == 0:
+
+    centers = mesh.triangles_center[idx]
+    areas = mesh.area_faces[idx]
+
+    axis_dir = np.asarray(axis_dir, dtype=np.float64)
+    axis_dir = axis_dir / np.linalg.norm(axis_dir)
+
+    # 沿轴线投影，并以中位数为中心
+    proj = np.dot(centers - axis_point, axis_dir)
+    median = np.median(proj)
+    centered = proj - median
+
+    max_abs = np.max(np.abs(centered))
+    if max_abs < 1e-6:
+        return 1.0
+
+    # 加权直方图
+    bin_edges = np.linspace(-max_abs, max_abs, n_bins + 1)
+    hist, _ = np.histogram(centered, bins=bin_edges, weights=areas)
+
+    # 分成左右两半，翻转左侧后与右侧比较
+    mid = n_bins // 2
+    left = hist[:mid][::-1]
+    right = hist[mid:2*mid]
+
+    denom = np.sqrt(np.sum(left**2) * np.sum(right**2))
+    if denom < 1e-12:
         return 0.0
-    ratio_diff = abs(pos_area - neg_area) / total_area
-    return 1.0 - ratio_diff
+
+    corr = np.sum(left * right) / denom
+    return float(np.clip(corr, 0.0, 1.0))
+
+def compute_mesh_stats(mesh):
+    """返回网格基本统计信息字典。"""
+    stats = {}
+    stats['vertices'] = mesh.vertices.shape[0]
+    stats['faces'] = mesh.faces.shape[0]
+    stats['edges'] = mesh.edges_unique.shape[0]
+    stats['boundary_edges'] = mesh.edges_unique.shape[0] - mesh.edges.shape[0]
+    stats['is_watertight'] = mesh.is_watertight
+    return stats
+
+def symmetry_score(mesh, region_mask, axis_dir, axis_point, n_bins=40):
+    """
+    基于沿轴线的面积分布形状评价对称性。
+
+    思路：
+    - 把区域面片沿轴线投影；
+    - 以投影中位数为中心，建立加权直方图；
+    - 比较左右两半直方图的相似度（相关系数）。
+    - 越接近镜像对称，得分越接近 1。
+
+    优点：不关心重心位置，只关心两侧分布形状是否匹配；
+          异常大面片不会整体拉偏结果。
+    """
+    idx = np.flatnonzero(region_mask)
+    if len(idx) < 5:
+        return 0.0
+
+    centers = mesh.triangles_center[idx]
+    areas = mesh.area_faces[idx]
+
+    axis_dir = np.asarray(axis_dir, dtype=np.float64)
+    axis_dir = axis_dir / np.linalg.norm(axis_dir)
+
+    # 沿轴线投影，并以中位数为中心
+    proj = np.dot(centers - axis_point, axis_dir)
+    median = np.median(proj)
+    centered = proj - median
+
+    max_abs = np.max(np.abs(centered))
+    if max_abs < 1e-6:
+        return 1.0
+
+    # 加权直方图
+    bin_edges = np.linspace(-max_abs, max_abs, n_bins + 1)
+    hist, _ = np.histogram(centered, bins=bin_edges, weights=areas)
+
+    # 分成左右两半，翻转左侧后与右侧比较
+    mid = n_bins // 2
+    left = hist[:mid][::-1]
+    right = hist[mid:2*mid]
+
+    denom = np.sqrt(np.sum(left**2) * np.sum(right**2))
+    if denom < 1e-12:
+        return 0.0
+
+    corr = np.sum(left * right) / denom
+    return float(np.clip(corr, 0.0, 1.0))
 
 # ----------------------------------------------------------------------
 #  修订1: rough_axis_from_mask
@@ -420,10 +504,9 @@ def process_handlebar(mesh,
     if region_label_bar is None:
         dir1, pt1 = rough_axis_from_mask(mesh, labels_ransac == area_sums[0][1])
         dir2, pt2 = rough_axis_from_mask(mesh, labels_ransac == area_sums[1][1])
-        _, midpoint = line_line_distance_and_midpoint(dir1, pt1, dir2, pt2)
 
-        sym1 = symmetry_score(mesh, labels_ransac == area_sums[0][1], dir1, pt1, midpoint)
-        sym2 = symmetry_score(mesh, labels_ransac == area_sums[1][1], dir2, pt2, midpoint)
+        sym1 = symmetry_score(mesh, labels_ransac == area_sums[0][1], dir1, pt1)
+        sym2 = symmetry_score(mesh, labels_ransac == area_sums[1][1], dir2, pt2)
         print(f"Symmetry scores - region {area_sums[0][1]}: {sym1:.3f}, region {area_sums[1][1]}: {sym2:.3f}")
 
         if sym1 >= sym2:
