@@ -162,7 +162,9 @@ def orient_stem_x(u_x, stem_mask, mesh, origin):
         u_x = -u_x
     return u_x
 
-def pass2_t_shape_partition(mesh, mask_bar, mask_stem, u_x, u_y, u_z, origin):
+def pass2_t_shape_partition(mesh, mask_bar, mask_stem, u_x, u_y, u_z, origin,
+                            bar_x_size=None,
+                            stem_y_size=None):
     """
     第二阶段：纯矩形 T 字形约束分区。
 
@@ -181,17 +183,23 @@ def pass2_t_shape_partition(mesh, mask_bar, mask_stem, u_x, u_y, u_z, origin):
     R = np.column_stack([u_x, u_y, u_z])
     local_coords = (mesh.triangles_center - origin) @ R
 
-    bar_x = local_coords[mask_bar, 0]
-    d = np.percentile(bar_x, 95) - np.percentile(bar_x, 5)
-    if not np.isfinite(d) or d <= 0:
-        d = 30.0
-    d = max(d, 1.0)
+    if bar_x_size is not None and bar_x_size > 0:
+        d = bar_x_size
+    else:
+        bar_x = local_coords[mask_bar, 0]
+        d = np.percentile(bar_x, 95) - np.percentile(bar_x, 5)
+        if not np.isfinite(d) or d <= 0:
+            d = 30.0
+        d = max(d, 1.0)
 
-    stem_y = local_coords[mask_stem, 1]
-    w = np.percentile(stem_y, 95) - np.percentile(stem_y, 5)
-    if not np.isfinite(w) or w <= 0:
-        w = 40.0
-    w = max(w, 1.0)
+    if stem_y_size is not None and stem_y_size > 0:
+        w = stem_y_size
+    else:
+        stem_y = local_coords[mask_stem, 1]
+        w = np.percentile(stem_y, 95) - np.percentile(stem_y, 5)
+        if not np.isfinite(w) or w <= 0:
+            w = 40.0
+        w = max(w, 1.0)
 
     bar_verts_mask = np.zeros(len(mesh.vertices), dtype=bool)
     bar_faces = mesh.faces[mask_bar]
@@ -361,7 +369,9 @@ def process_handlebar(mesh,
                       ransac_threshold=0.1,
                       region_label_bar=None,
                       region_label_stem=None,
-                      num_passes=3):
+                      num_passes=3,
+                      bar_x_size=None,
+                      stem_y_size=None):
     """
     对一体把进行完整处理，返回可视化场景。
 
@@ -378,6 +388,10 @@ def process_handlebar(mesh,
         1 = RANSAC 初始分区
         2 = +T 字形矩形约束
         3 = + 截面积精化
+    bar_x_size : float or None
+        把横沿 x 方向尺寸（overwrite自动估算）
+    stem_y_size : float or None
+        把立沿 y 方向尺寸（overwrite自动估算）
 
     返回
     -------
@@ -477,7 +491,9 @@ def process_handlebar(mesh,
         u_z = np.cross(u_x, u_y)
 
         bar_core, stem_core, transition_mask, residual_mask, d_est, w_est = pass2_t_shape_partition(
-            mesh, mask_bar, mask_stem, u_x, u_y, u_z, origin
+            mesh, mask_bar, mask_stem, u_x, u_y, u_z, origin,
+            bar_x_size=bar_x_size,
+            stem_y_size=stem_y_size
         )
 
         # 用 Pass 2 核心重新拟合轴线并更新坐标系
@@ -590,6 +606,10 @@ def main():
     parser.add_argument("--ransac_thr", type=float, default=0.1, help="RANSAC 阈值 (默认 0.1)")
     parser.add_argument("--num-passes", type=int, default=3, choices=[1, 2, 3],
                         help="分区阶段数：1=RANSAC初始分区，2=+T字形约束分区，3=+截面积精化（默认3）")
+    parser.add_argument("--bar-x-size", type=float, default=None,
+                        help="把横沿 x 方向尺寸 d，用于确定把立过渡区范围（默认自动估算）")
+    parser.add_argument("--stem-y-size", type=float, default=None,
+                        help="把立沿 y 方向尺寸 w，用于确定把横过渡区半宽（默认自动估算）")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
     args = parser.parse_args()
 
@@ -604,7 +624,9 @@ def main():
     transformed_scene, world_scene, stats = process_handlebar(
         mesh,
         ransac_threshold=args.ransac_thr,
-        num_passes=args.num_passes
+        num_passes=args.num_passes,
+        bar_x_size=args.bar_x_size,
+        stem_y_size=args.stem_y_size
     )
 
     # 保存输出
