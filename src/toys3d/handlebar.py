@@ -193,17 +193,17 @@ def pass2_t_shape_partition(mesh, mask_bar, mask_stem,
     stem_core = filter_by_axis(stem_rect, init_dir_stem)
     bar_core = filter_by_axis(bar_rect, init_dir_bar)
 
-    # 被 RANSAC 过滤掉的面片归入过渡区
+    # 被 RANSAC 过滤掉的面片归入残余区，而非过渡区
     filtered_out = (stem_rect & ~stem_core) | (bar_rect & ~bar_core)
-    transition_mask = transition_mask | filtered_out
 
-    residual_mask = ~(stem_core | bar_core | transition_mask)
+    residual_mask = ~(stem_core | bar_core | transition_mask) | filtered_out
 
     print(f"[Pass2] Auto-estimated d (bar x-size) = {d:.3f}")
     print(f"[Pass2] Auto-estimated w (stem y-size) = {w:.3f}")
     print(f"[Pass2] x_min (bar vertices) = {x_min:.3f}")
     print(f"[Pass2] bar_core = {np.sum(bar_core)}, stem_core = {np.sum(stem_core)}, "
-          f"transition = {np.sum(transition_mask)}, residual = {np.sum(residual_mask)}")
+          f"transition = {np.sum(transition_mask)}, residual = {np.sum(residual_mask)}, "
+          f"filtered_out = {np.sum(filtered_out)}")
 
     return bar_core, stem_core, transition_mask, residual_mask, d, w
 
