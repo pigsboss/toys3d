@@ -76,49 +76,26 @@ def symmetry_score(mesh, region_mask, axis_dir, axis_point, midpoint):
     ratio_diff = abs(pos_area - neg_area) / total_area
     return 1.0 - ratio_diff
 
+# ----------------------------------------------------------------------
+#  修订1: rough_axis_from_mask
+# ----------------------------------------------------------------------
 def rough_axis_from_mask(mesh, mask):
     """从面片掩码快速拟合轴线（普吕克），返回 direction, point。"""
-    c = mesh.triangles_center[mask]
-    n = mesh.face_normals[mask]
-    a = mesh.area_faces[mask]
+    idx = np.flatnonzero(mask)
+    if len(idx) == 0:
+        return np.array([1.0, 0.0, 0.0]), mesh.triangles_center.mean(axis=0)
+    valid = np.isfinite(mesh.face_normals[idx]).all(axis=1)
+    idx = idx[valid]
+    if len(idx) < 3:
+        centers = mesh.triangles_center[np.flatnonzero(mask)]
+        return np.array([1.0, 0.0, 0.0]), centers.mean(axis=0)
+    c = mesh.triangles_center[idx]
+    n = mesh.face_normals[idx]
+    a = mesh.area_faces[idx]
     C, _, ref = plucker_design_matrix(c, n, a)
     d, b = axis_from_plucker(C, ref_point=ref)
     return d, b
 
-def colorize_mesh(mesh, final_labels):
-    """
-    根据最终标签设置面片颜色。
-    0: 灰色, 1: 深蓝, 2: 深红, 3: 橙色
-    """
-    palette = np.array([
-        [180, 180, 180, 255],   # 0 残余/未分类 灰
-        [0, 100, 200, 255],     # 1 把横核心 深蓝
-        [200, 50, 50, 255],     # 2 把立核心 深红
-        [255, 165, 0, 255],     # 3 过渡区 橙
-    ], dtype=np.uint8)
-    mesh.visual.face_colors = palette[final_labels]
-
-def add_axes_to_scene(scene, origin, u_x, u_y, u_z, length=0.3, radius=0.01):
-    """在场景中添加红、绿、蓝三根坐标轴箭头（圆柱+小球示意）"""
-    def add_arrow(o, d, color):
-        # 圆柱体作为轴线
-        cyl = trimesh.creation.cylinder(radius=radius, segment=[o, o + d*length])
-        cyl.visual.face_colors = color
-        scene.add_geometry(cyl)
-        # 小球作为箭头尖端
-        sphere = trimesh.creation.icosphere(subdivisions=2, radius=radius*3)
-        sphere.apply_translation(o + d*length)
-        sphere.visual.face_colors = color
-        scene.add_geometry(sphere)
-
-    add_arrow(origin, u_x, [255,0,0,255])    # X 红
-    add_arrow(origin, u_y, [0,255,0,255])    # Y 绿
-    add_arrow(origin, u_z, [0,0,255,255])    # Z 蓝
-
-
-# ----------------------------------------------------------------------
-#  新辅助函数
-# ----------------------------------------------------------------------
 def orient_stem_x(u_x, stem_mask, mesh, origin):
     """Oriente u_x so that majority of stem area lies in +x direction."""
     stem_centers = mesh.triangles_center[stem_mask]
@@ -129,29 +106,34 @@ def orient_stem_x(u_x, stem_mask, mesh, origin):
         u_x = -u_x
     return u_x
 
+# ----------------------------------------------------------------------
+#  修订2: pass2_t_shape_partition
+# ----------------------------------------------------------------------
 def pass2_t_shape_partition(mesh, mask_bar, mask_stem,
                             init_dir_bar, init_dir_stem,
                             u_x, u_y, u_z, origin,
                             bar_x_size=None,
-                            stem_y_size=None):
+                            stem_y_size=None,
+                            ransac_threshold=0.1):
     """
-    第二阶段：仅从全局网格出发，按 xy 平面矩形约束重新分区。
+    第二阶段：全局矩形四区域分区 + 区域内 RANSAC 法向过滤。
 
     坐标约定：x=把立（+x 指向头管），y=把横，z=x×y。
 
-    矩形约束：
-    - 把横核心：|y| > 0.5*w  且  x <= x_min + d
-    - 把立核心：x > x_min + d  且  |y| <= 0.5*w
-    - 过渡区：第一阶段已分类但未被归入 bar_core/stem_core 的面片
-    - 残余区：第一阶段未分类的面片
+    矩形分区：
+    - 把立 core：x > x_min + d  且  |y| <= 0.5*w
+    - 把横 core：x <= x_min + d  且  |y| > 0.5*w
+    - 过渡区：    x <= x_min + d  且  |y| <= 0.5*w
+    - 残余区：    其余
 
-    Returns
-    -------
-    bar_core, stem_core, transition_mask, residual_mask, d, w
+    然后在把横/把立区域内分别做法向过滤，剔除偏离各自轴线过大的面片。
     """
     N = mesh.faces.shape[0]
     R = np.column_stack([u_x, u_y, u_z])
     local_coords = (mesh.triangles_center - origin) @ R
+
+    # 有效法向量掩码
+    valid_normal = np.isfinite(mesh.face_normals).all(axis=1)
 
     # 估算 d（把横 x 向尺寸）
     if bar_x_size is not None and bar_x_size > 0:
@@ -184,15 +166,44 @@ def pass2_t_shape_partition(mesh, mask_bar, mask_stem,
     else:
         x_min = -0.5 * d
 
-    # --- 矩形分区（无 RANSAC 过滤）---
-    bar_core = (np.abs(local_coords[:, 1]) > 0.5 * w) & \
-               (local_coords[:, 0] <= x_min + d)
-    stem_core = (local_coords[:, 0] > x_min + d) & \
+    # 全局矩形分区
+    stem_rect = valid_normal & \
+                (local_coords[:, 0] > x_min + d) & \
                 (np.abs(local_coords[:, 1]) <= 0.5 * w)
+    bar_rect = valid_normal & \
+               (local_coords[:, 0] <= x_min + d) & \
+               (np.abs(local_coords[:, 1]) > 0.5 * w)
+    transition_mask = valid_normal & \
+                      (local_coords[:, 0] <= x_min + d) & \
+                      (np.abs(local_coords[:, 1]) <= 0.5 * w)
 
-    # 第一阶段已分类但未被归入核心：过渡区
-    transition_mask = (mask_bar | mask_stem) & ~(bar_core | stem_core)
-    residual_mask = ~(mask_bar | mask_stem)
+    # 区域内 RANSAC 法向过滤
+    def filter_by_axis(mask, axis_dir):
+        idx = np.flatnonzero(mask)
+        if len(idx) == 0:
+            return mask
+        axis_dir = np.asarray(axis_dir, dtype=np.float64)
+        axis_dir = axis_dir / np.linalg.norm(axis_dir)
+        dots = np.abs(mesh.face_normals[idx] @ axis_dir)
+        keep = dots <= ransac_threshold
+        filtered = np.zeros(N, dtype=bool)
+        filtered[idx[keep]] = True
+        return filtered
+
+    stem_core = filter_by_axis(stem_rect, init_dir_stem)
+    bar_core = filter_by_axis(bar_rect, init_dir_bar)
+
+    # 被 RANSAC 过滤掉的面片归入过渡区
+    filtered_out = (stem_rect & ~stem_core) | (bar_rect & ~bar_core)
+    transition_mask = transition_mask | filtered_out
+
+    residual_mask = ~(stem_core | bar_core | transition_mask)
+
+    print(f"[Pass2] Auto-estimated d (bar x-size) = {d:.3f}")
+    print(f"[Pass2] Auto-estimated w (stem y-size) = {w:.3f}")
+    print(f"[Pass2] x_min (bar vertices) = {x_min:.3f}")
+    print(f"[Pass2] bar_core = {np.sum(bar_core)}, stem_core = {np.sum(stem_core)}, "
+          f"transition = {np.sum(transition_mask)}, residual = {np.sum(residual_mask)}")
 
     return bar_core, stem_core, transition_mask, residual_mask, d, w
 
@@ -465,12 +476,14 @@ def process_handlebar(mesh,
         u_y = y_raw / np.linalg.norm(y_raw)
         u_z = np.cross(u_x, u_y)
 
+        # 修订3: 传参增加 ransac_threshold
         bar_core, stem_core, transition_mask, residual_mask, d_est, w_est = pass2_t_shape_partition(
             mesh, mask_bar, mask_stem,
             init_dir_bar, init_dir_stem,
             u_x, u_y, u_z, origin,
             bar_x_size=bar_x_size,
-            stem_y_size=stem_y_size
+            stem_y_size=stem_y_size,
+            ransac_threshold=ransac_threshold
         )
 
         # 用 Pass 2 核心重新拟合轴线并更新坐标系
@@ -567,13 +580,55 @@ def process_handlebar(mesh,
     # 在新坐标系原点添加坐标轴（变换后原点在局部空间为 (0,0,0)）
     add_axes_to_scene(scene, origin=np.zeros(3), u_x=u_x, u_y=u_y, u_z=u_z)
 
-    # 统计最终区域信息
-    print("\nRegion statistics:")
+    # 修订4: 最终统计输出带颜色说明
+    print("\nRegion statistics (color map):")
+    print("  0 = Residual   -> gray")
+    print("  1 = Bar core   -> dark blue")
+    print("  2 = Stem core  -> dark red")
+    print("  3 = Transition -> orange")
     for i, name in enumerate(['Residual', 'Bar core', 'Stem core', 'Transition']):
         count = np.sum(final_labels == i)
         print(f"  {name}: {count} triangles")
 
     return scene, world_scene, stats
+
+
+def colorize_mesh(mesh, final_labels):
+    """
+    根据最终标签设置面片颜色。
+    0: 灰色, 1: 深蓝, 2: 深红, 3: 橙色
+    """
+    palette = np.array([
+        [180, 180, 180, 255],   # 0 残余/未分类 灰
+        [0, 100, 200, 255],     # 1 把横核心 深蓝
+        [200, 50, 50, 255],     # 2 把立核心 深红
+        [255, 165, 0, 255],     # 3 过渡区 橙
+    ], dtype=np.uint8)
+    mesh.visual.face_colors = palette[final_labels]
+
+
+def add_axes_to_scene(scene, origin, u_x, u_y, u_z, length=0.3, radius=0.01):
+    """在场景中添加红、绿、蓝三根坐标轴箭头（圆柱+小球示意）"""
+    def add_arrow(o, d, color):
+        # 圆柱体作为轴线
+        cyl = trimesh.creation.cylinder(radius=radius, segment=[o, o + d*length])
+        cyl.visual.face_colors = color
+        scene.add_geometry(cyl)
+        # 小球作为箭头尖端
+        sphere = trimesh.creation.icosphere(subdivisions=2, radius=radius*3)
+        sphere.apply_translation(o + d*length)
+        sphere.visual.face_colors = color
+        scene.add_geometry(sphere)
+
+    add_arrow(origin, u_x, [255,0,0,255])    # X 红
+    add_arrow(origin, u_y, [0,255,0,255])    # Y 绿
+    add_arrow(origin, u_z, [0,0,255,255])    # Z 蓝
+
+
+# ----------------------------------------------------------------------
+#  辅助函数（已提前定义，此处无额外内容）
+# ----------------------------------------------------------------------
+
 
 def main():
     import argparse
