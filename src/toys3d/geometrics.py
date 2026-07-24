@@ -710,3 +710,55 @@ def point_line_distance(points, line_point, line_dir):
     proj_len = np.dot(vec, line_dir)
     perp = vec - proj_len[:, None] * line_dir
     return np.linalg.norm(perp, axis=1)
+
+
+# ------------------------------------------------------------------
+#  新增通用几何工具函数（气动把三分区需要）
+# ------------------------------------------------------------------
+def reflect_vector_across_plane(v, plane_normal):
+    """
+    将向量关于法向量为 plane_normal 的平面做镜像反射。
+    平面过原点；若需关于任意平面镜像，先平移。
+    """
+    n = np.asarray(plane_normal, dtype=np.float64)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    v = np.asarray(v, dtype=np.float64)
+    return v - 2.0 * np.dot(v, n) * n
+
+
+def signed_distance_to_plane(points, plane_origin, plane_normal):
+    """计算三维点到平面的有向距离（点在法向同侧为正）。"""
+    n = np.asarray(plane_normal, dtype=np.float64)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    pts = np.asarray(points, dtype=np.float64)
+    return np.dot(pts - np.asarray(plane_origin, dtype=np.float64), n)
+
+
+def intersect_line_plane(line_dir, line_point, plane_origin, plane_normal):
+    """
+    计算无限直线与平面的交点。
+    若直线与平面平行，返回 None。
+    """
+    d = np.asarray(line_dir, dtype=np.float64)
+    p = np.asarray(line_point, dtype=np.float64)
+    n = np.asarray(plane_normal, dtype=np.float64)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    denom = np.dot(d, n)
+    if abs(denom) < 1e-12:
+        return None
+    t = np.dot(np.asarray(plane_origin, dtype=np.float64) - p, n) / denom
+    return p + t * d
+
+
+def average_antiparallel_directions(d1, d2):
+    """
+    对两个方向向量做平均，自动处理符号歧义（d 与 -d 视为同一方向）。
+    """
+    d1 = np.asarray(d1, dtype=np.float64)
+    d2 = np.asarray(d2, dtype=np.float64)
+    d1 = d1 / (np.linalg.norm(d1) + 1e-12)
+    d2 = d2 / (np.linalg.norm(d2) + 1e-12)
+    if np.dot(d1, d2) < 0:
+        d2 = -d2
+    avg = d1 + d2
+    return avg / (np.linalg.norm(avg) + 1e-12)
