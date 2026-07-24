@@ -641,7 +641,7 @@ def build_world_visualization(mesh, final_labels,
     sph_mid.visual.face_colors = [255, 255, 0, 255]
     scene.add_geometry(sph_mid)
 
-    add_axes_to_scene(scene, origin=np.zeros(3), u_x=u_x, u_y=u_y, u_z=u_z, length=frame_len)
+    add_axes_to_scene(scene, origin=origin, u_x=u_x, u_y=u_y, u_z=u_z, length=frame_len)
 
     return scene
 
@@ -909,6 +909,9 @@ def process_handlebar(mesh,
             if origin is None:
                 origin = mid_lr
 
+            u_x = orient_stem_x(u_x, mask_stem, mesh, origin)
+            u_z = np.cross(u_x, u_y)
+
             left_core, right_core, stem_core, transition_mask, residual_mask, d_est, w_est = pass2_aero_shape_partition(
                 mesh, mask_stem, mask_left, mask_right,
                 init_dir_stem, init_pt_stem,
@@ -957,6 +960,9 @@ def process_handlebar(mesh,
             origin = intersect_line_plane(dir_stem_p2, point_stem_p2, mid_lr, u_y)
             if origin is None:
                 origin = mid_lr
+
+            u_x = orient_stem_x(u_x, stem_core, mesh, origin)
+            u_z = np.cross(u_x, u_y)
 
             if num_passes == 2:
                 dir_stem, point_stem = dir_stem_p2, point_stem_p2
@@ -1037,6 +1043,9 @@ def process_handlebar(mesh,
         origin = intersect_line_plane(dir_stem, point_stem, mid_lr, u_y)
         if origin is None:
             origin = mid_lr
+
+        u_x = orient_stem_x(u_x, stem_core, mesh, origin)
+        u_z = np.cross(u_x, u_y)
 
         R = np.column_stack([u_x, u_y, u_z])
         T_w2l = np.eye(4)
@@ -1158,8 +1167,13 @@ def main():
 
     # 可视化
     if args.show:
-        os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
-        world_scene.show()
+        try:
+            os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
+            world_scene.show()
+        except Exception as e:
+            print(f"\n[ERROR] Visualization failed: {e}")
+            import traceback
+            traceback.print_exc()
 
 if __name__ == "__main__":
     main()
