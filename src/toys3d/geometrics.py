@@ -807,6 +807,9 @@ def voxel_symmetry_score_watertight(mesh, plane_normal, plane_offset=None,
     """
     基于三值体素立方的对称性评分。
 
+    在体素索引空间完成关于平面 n·x = offset 的镜像，然后比较原始网格与
+    镜像网格的 occupancy 差异。
+
     返回负的加权均方误差，越大表示越对称。
     """
     from scipy import ndimage
@@ -817,44 +820,38 @@ def voxel_symmetry_score_watertight(mesh, plane_normal, plane_offset=None,
     if plane_offset is None:
         plane_offset = float(np.median(mesh.vertices @ n))
 
-    grid, origin, pitch = voxelize_mesh_watertight(mesh, grid_size)
+    grid, translation, pitch = voxelize_mesh_watertight(mesh, grid_size)
 
-    # 构造局部坐标系
-    if abs(n[2]) < 0.9:
-        u = np.cross(n, [0, 0, 1])
-    else:
-        u = np.cross(n, [1, 0, 0])
-    u = u / (np.linalg.norm(u) + 1e-12)
-    v = np.cross(n, u)
+    # 镜像矩阵：关于法向 n 的反射
+    A = np.eye(3) - 2.0 * np.outer(n, n)
 
-    center_world = mesh.bounding_box.centroid
-
-    # 世界 -> 局部旋转
-    R_w2l = np.column_stack([u, n, v])
-    M = R_w2l @ np.diag([1, -1, 1]) @ R_w2l.T
+    # 平移：使镜像平面过 plane_offset
+    # 推导：
+    #   p  = translation + pitch * q
+    #   p' = p - 2*(n·p - offset)*n
+    #   q' = (p' - translation) / pitch
+    #      = q - 2*(n·translation - offset)/pitch * n - 2*(n·q)*n
+    #      = A @ q + b
+    b = -2.0 * (np.dot(translation, n) - plane_offset) / pitch * n
 
     mirrored = ndimage.affine_transform(
         grid.astype(np.float32),
-        M.T,
-        offset=np.zeros(3),
+        A,
+        offset=b,
         order=1,
         mode='constant',
         cval=2.0
     )
 
-    # 沿 n 方向平移，使镜像平面过 plane_offset
-    shift = (plane_offset - np.dot(center_world, n)) / pitch
-    mirrored = ndimage.shift(mirrored, shift * n, order=1, mode='constant', cval=2.0)
-
     a = grid.astype(np.float32)
-    b = mirrored
+    b_grid = mirrored
 
-    mask = (a > 0) | (b > 0)
+    mask = (a > 0) | (b_grid > 0)
     if not np.any(mask):
         return 0.0
 
     a0 = a[mask] - np.mean(a[mask])
-    b0 = b[mask] - np.mean(b[mask])
+    b0 = b_grid[mask] - np.mean(b_grid[mask])
     diff = a0 - b0
 
     if metric == 'identity':
