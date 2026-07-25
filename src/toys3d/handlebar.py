@@ -19,7 +19,8 @@ from toys3d.geometrics import (
     point_line_distance,
     intersect_line_plane,
     kmeans_1d,
-    estimate_symmetry_plane_voxel,   # 新增
+    average_antiparallel_directions,
+    estimate_symmetry_plane_voxel,
 )
 
 # ------------------------- 辅助函数 -------------------------
@@ -748,36 +749,227 @@ def identify_three_tubular_regions(mesh, labels_ransac, axes_ransac, areas,
 # ----------------------------------------------------------------------
 #  新增：左右把横对称约束
 # ----------------------------------------------------------------------
-def enforce_bar_symmetry(dir_left, pt_left, dir_right, pt_right):
+def enforce_bar_symmetry(dir_left, pt_left, dir_right, pt_right,
+                         plane_normal=None, plane_offset=0.0):
     """
-    强制左右把横关于 zx 平面对称（y 分量相反，x/z 分量相等）。
-    约定：左把横 y < 0，右把横 y > 0。
+    强制左右把横关于给定平面对称。
+    默认 plane_normal=(0,1,0), plane_offset=0 对应 zx 平面。
+    约定：左把横位于平面法向负侧，右把横位于正侧。
     """
+    if plane_normal is None:
+        plane_normal = np.array([0., 1., 0.])
+    n = np.asarray(plane_normal, dtype=np.float64)
+    n = n / (np.linalg.norm(n) + 1e-12)
     dl = np.asarray(dir_left, dtype=np.float64)
     dr = np.asarray(dir_right, dtype=np.float64)
     pl = np.asarray(pt_left, dtype=np.float64)
     pr = np.asarray(pt_right, dtype=np.float64)
 
-    # 统一符号
-    if dl[1] > 0:
+    # 方向符号统一：左负右正
+    if np.dot(dl, n) > 0:
         dl = -dl
-    if dr[1] < 0:
+    if np.dot(dr, n) < 0:
         dr = -dr
 
-    # 方向对称化
-    xz = (np.abs(dl[[0, 2]]) + np.abs(dr[[0, 2]])) / 2.0
-    y_avg = (abs(dl[1]) + abs(dr[1])) / 2.0
-    norm = np.sqrt(xz[0]**2 + y_avg**2 + xz[1]**2) + 1e-12
-    dl_new = np.array([xz[0], -y_avg, xz[1]]) / norm
-    dr_new = np.array([xz[0],  y_avg, xz[1]]) / norm
+    # 投影到对称平面
+    dl_n = np.dot(dl, n)
+    dr_n = np.dot(dr, n)
+    dl_in = dl - dl_n * n
+    dr_in = dr - dr_n * n
+    d_in = average_antiparallel_directions(dl_in, dr_in)
+    d_in = d_in - np.dot(d_in, n) * n
+    d_in = d_in / (np.linalg.norm(d_in) + 1e-12)
+
+    y_avg = (abs(dl_n) + abs(dr_n)) / 2.0
+
+    dl_new = d_in - y_avg * n
+    dr_new = d_in + y_avg * n
+    norm_l = np.linalg.norm(dl_new)
+    norm_r = np.linalg.norm(dr_new)
+    dl_new = dl_new / (norm_l + 1e-12)
+    dr_new = dr_new / (norm_r + 1e-12)
 
     # 基点对称化
-    xz_pt = (pl[[0, 2]] + pr[[0, 2]]) / 2.0
-    half_y = (abs(pl[1]) + abs(pr[1])) / 2.0
-    pl_new = np.array([xz_pt[0], -half_y, xz_pt[1]])
-    pr_new = np.array([xz_pt[0],  half_y, xz_pt[1]])
+    signed_l = np.dot(pl, n) - plane_offset
+    signed_r = np.dot(pr, n) - plane_offset
+    pl_in = pl - signed_l * n
+    pr_in = pr - signed_r * n
+    p_in = (pl_in + pr_in) / 2.0
+    half_y = (abs(signed_l) + abs(signed_r)) / 2.0
+
+    pl_new = p_in - half_y * n
+    pr_new = p_in + half_y * n
 
     return dl_new, pl_new, dr_new, pr_new
+
+
+def _mirror_axis_pair(axis_pair, plane_normal, plane_offset):
+    """将一个轴线的方向和基点关于平面对称镜像。"""
+    d, p = axis_pair
+    n = np.asarray(plane_normal, dtype=np.float64)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    d_m = d - 2.0 * np.dot(d, n) * n
+    p_m = p - 2.0 * (np.dot(p, n) - plane_offset) * n
+    return d_m, p_m
+
+
+def _mirror_side_result(result, plane_normal, plane_offset, N):
+    """根据一侧结果镜像生成另一侧的占位结果（mask 为空）。"""
+    mirrored = {}
+    for key in ['stem', 'bar']:
+        if result[key] is not None:
+            mirrored[key] = _mirror_axis_pair(result[key], plane_normal, plane_offset)
+        else:
+            mirrored[key] = None
+        mask_key = 'stem_mask' if key == 'stem' else 'bar_mask'
+        if result[mask_key] is not None:
+            mirrored[mask_key] = np.zeros(N, dtype=bool)
+        else:
+            mirrored[mask_key] = None
+    return mirrored
+
+
+def identify_three_tubular_regions_symmetric(mesh, u_y_sym, offset_y,
+                                             ransac_threshold=0.1,
+                                             min_faces_ratio=0.05,
+                                             tol_percentile=10.0,
+                                             rng=None):
+    """
+    基于已估计的镜面对称平面，对左右子空间分别执行 RANSAC 管状分割，
+    再按对称约束合并为 {stem, left, right} 三分区。
+    """
+    N = mesh.faces.shape[0]
+    centers = mesh.triangles_center
+    n = np.asarray(u_y_sym, dtype=np.float64)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    signed = centers @ n - offset_y
+    abs_signed = np.abs(signed)
+
+    tol = np.percentile(abs_signed, tol_percentile) if tol_percentile > 0 else 0.0
+    tol = max(tol, 1e-6)
+
+    left_mask = signed < -tol
+    right_mask = signed > tol
+    middle_mask = ~left_mask & ~right_mask
+
+    print(f"\n[SymRANSAC] tol={tol:.4f}, left={np.sum(left_mask)}, "
+          f"right={np.sum(right_mask)}, middle={np.sum(middle_mask)}")
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    def process_side(side_mask, side_name):
+        n_faces = np.sum(side_mask)
+        if n_faces < 10:
+            print(f"[SymRANSAC] {side_name}: too few faces ({n_faces})")
+            return None
+        sub = mesh.submesh(np.flatnonzero(side_mask))[0]
+        labels, axes = segment_tubular_regions(
+            sub.face_normals, areas=sub.area_faces,
+            threshold=ransac_threshold,
+            min_faces=max(int(min_faces_ratio * n_faces), 10),
+            max_regions=2, max_iterations=1000, rng=rng
+        )
+        n_regions = len(axes)
+        if n_regions == 0:
+            print(f"[SymRANSAC] {side_name}: no tubular region found")
+            return None
+
+        side_indices = np.flatnonzero(side_mask)
+        regions = []
+        for i in range(1, n_regions + 1):
+            sub_idx = np.flatnonzero(labels == i)
+            orig_idx = side_indices[sub_idx]
+            mask = np.zeros(N, dtype=bool)
+            mask[orig_idx] = True
+            d, p = rough_axis_from_mask(mesh, mask)
+            regions.append({
+                'mask': mask,
+                'axis': (d, p),
+                'abs_dot_y': abs(np.dot(d, n)),
+            })
+
+        if n_regions == 1:
+            r = regions[0]
+            if r['abs_dot_y'] < 0.5:
+                return {'stem': r['axis'], 'bar': None,
+                        'stem_mask': r['mask'], 'bar_mask': None}
+            else:
+                return {'stem': None, 'bar': r['axis'],
+                        'stem_mask': None, 'bar_mask': r['mask']}
+        else:
+            stem_idx = int(np.argmin([r['abs_dot_y'] for r in regions]))
+            bar_idx = 1 - stem_idx
+            return {
+                'stem': regions[stem_idx]['axis'],
+                'bar': regions[bar_idx]['axis'],
+                'stem_mask': regions[stem_idx]['mask'],
+                'bar_mask': regions[bar_idx]['mask'],
+            }
+
+    left_res = process_side(left_mask, 'left')
+    right_res = process_side(right_mask, 'right')
+
+    if left_res is None and right_res is None:
+        raise RuntimeError("左右两侧 RANSAC 均失败")
+    if left_res is None:
+        left_res = _mirror_side_result(right_res, n, offset_y, N)
+    if right_res is None:
+        right_res = _mirror_side_result(left_res, n, offset_y, N)
+
+    # 补齐缺失的 stem/bar
+    if left_res['stem'] is None:
+        left_res['stem'] = right_res['stem']
+        left_res['stem_mask'] = right_res['stem_mask'].copy()
+    if right_res['stem'] is None:
+        right_res['stem'] = left_res['stem']
+        right_res['stem_mask'] = left_res['stem_mask'].copy()
+    if left_res['bar'] is None:
+        left_res['bar'] = _mirror_axis_pair(right_res['bar'], n, offset_y)
+        left_res['bar_mask'] = np.zeros(N, dtype=bool)
+    if right_res['bar'] is None:
+        right_res['bar'] = _mirror_axis_pair(left_res['bar'], n, offset_y)
+        right_res['bar_mask'] = np.zeros(N, dtype=bool)
+
+    # 合并把立轴线：投影到对称平面后平均
+    d_stem_L, p_stem_L = left_res['stem']
+    d_stem_R, p_stem_R = right_res['stem']
+    d_stem = average_antiparallel_directions(d_stem_L, d_stem_R)
+    d_stem = d_stem - np.dot(d_stem, n) * n
+    norm = np.linalg.norm(d_stem)
+    if norm < 1e-12:
+        d_stem = np.array([1.0, 0.0, 0.0])
+        d_stem = d_stem - np.dot(d_stem, n) * n
+        d_stem = d_stem / (np.linalg.norm(d_stem) + 1e-12)
+    else:
+        d_stem = d_stem / norm
+
+    def proj_to_plane(p):
+        return p - (np.dot(p, n) - offset_y) * n
+
+    p_stem = (proj_to_plane(p_stem_L) + proj_to_plane(p_stem_R)) / 2.0
+
+    # 合并把横轴线：强制关于对称平面对称
+    d_bar_L, p_bar_L = left_res['bar']
+    d_bar_R, p_bar_R = right_res['bar']
+    d_bar_L, p_bar_L, d_bar_R, p_bar_R = enforce_bar_symmetry(
+        d_bar_L, p_bar_L, d_bar_R, p_bar_R,
+        plane_normal=n, plane_offset=offset_y
+    )
+
+    axes = {
+        'stem': (d_stem, p_stem),
+        'left': (d_bar_L, p_bar_L),
+        'right': (d_bar_R, p_bar_R),
+    }
+    mask_stem = left_res['stem_mask'] | right_res['stem_mask'] | middle_mask
+    mask_left = left_res['bar_mask']
+    mask_right = right_res['bar_mask']
+
+    print(f"[SymRANSAC] merged: stem={np.sum(mask_stem)}, "
+          f"left={np.sum(mask_left)}, right={np.sum(mask_right)}")
+    return axes, mask_stem, mask_left, mask_right
+
 
 # ----------------------------------------------------------------------
 #  新增：三分区第二阶段约束
@@ -1182,9 +1374,21 @@ def process_handlebar(mesh,
     if aero_mode:
         if len(axes_ransac) < 2:
             raise RuntimeError("气动把模式至少需要 2 个管状区域。")
-        axes_init, mask_stem, mask_left, mask_right = identify_three_tubular_regions(
-            mesh, labels_ransac, axes_ransac, areas, ransac_threshold
-        )
+
+        # 对称平面参数（未估计时退化为世界 y=0 平面）
+        sym_n = u_y_sym if u_y_sym is not None else np.array([0., 1., 0.])
+        sym_offset = offset_y if u_y_sym is not None else 0.0
+
+        if mesh.is_watertight and u_y_sym is not None:
+            print("\n[SymRANSAC] Using symmetry-aware three-region identification.")
+            axes_init, mask_stem, mask_left, mask_right = identify_three_tubular_regions_symmetric(
+                mesh, u_y_sym, offset_y, ransac_threshold=ransac_threshold
+            )
+        else:
+            print("\n[SymRANSAC] Falling back to global RANSAC three-region identification.")
+            axes_init, mask_stem, mask_left, mask_right = identify_three_tubular_regions(
+                mesh, labels_ransac, axes_ransac, areas, ransac_threshold
+            )
     else:
         if len(axes_ransac) < 2:
             raise RuntimeError("未能检测到两个主要管状区域，请检查阈值或模型方向。")
@@ -1349,7 +1553,8 @@ def process_handlebar(mesh,
         init_dir_right, init_pt_right = axes_init['right']
 
         init_dir_left, init_pt_left, init_dir_right, init_pt_right = enforce_bar_symmetry(
-            init_dir_left, init_pt_left, init_dir_right, init_pt_right
+            init_dir_left, init_pt_left, init_dir_right, init_pt_right,
+            plane_normal=sym_n, plane_offset=sym_offset
         )
 
         axes_pass1 = {
@@ -1414,7 +1619,8 @@ def process_handlebar(mesh,
                 dir_stem_p2, point_stem_p2 = init_dir_stem, init_pt_stem
 
             dir_left_p2, point_left_p2, dir_right_p2, point_right_p2 = enforce_bar_symmetry(
-                dir_left_p2, point_left_p2, dir_right_p2, point_right_p2
+                dir_left_p2, point_left_p2, dir_right_p2, point_right_p2,
+                plane_normal=sym_n, plane_offset=sym_offset
             )
 
             axes_pass2 = {
@@ -1481,7 +1687,8 @@ def process_handlebar(mesh,
                     dir_stem, point_stem = rough_axis_from_mask(mesh, stem_core)
 
                 dir_left, point_left, dir_right, point_right = enforce_bar_symmetry(
-                    dir_left, point_left, dir_right, point_right
+                    dir_left, point_left, dir_right, point_right,
+                    plane_normal=sym_n, plane_offset=sym_offset
                 )
 
                 axes_pass3 = {
