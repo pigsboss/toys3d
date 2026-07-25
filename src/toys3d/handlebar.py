@@ -51,8 +51,15 @@ def compute_mesh_stats(mesh):
     stats['vertices'] = mesh.vertices.shape[0]
     stats['faces'] = mesh.faces.shape[0]
     stats['edges'] = mesh.edges_unique.shape[0]
-    # 边界边数 = 非重复边数 - 出现在两个面中的边数（mesh.edges 为面边对出现的索引）
-    stats['boundary_edges'] = int(np.sum(mesh.edges_boundary))
+    # 手动计算边界边：只属于一个面的边
+    edge_face_map = {}
+    for face_idx, face in enumerate(mesh.faces):
+        for i in range(3):
+            v1, v2 = int(face[i]), int(face[(i + 1) % 3])
+            key = tuple(sorted((v1, v2)))
+            edge_face_map.setdefault(key, []).append(face_idx)
+    boundary_edges = sum(1 for faces in edge_face_map.values() if len(faces) == 1)
+    stats['boundary_edges'] = boundary_edges
     stats['is_watertight'] = mesh.is_watertight
     return stats
 
