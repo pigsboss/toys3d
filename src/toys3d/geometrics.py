@@ -301,14 +301,17 @@ def segment_tubular_regions(normals, areas=None, threshold=0.1, min_faces=100,
     if N == 0:
         return np.zeros(0, dtype=int), []
 
-    # 确保法向量单位化（用户应保证，但做一次归一化以防万一）
-    n = normals / np.linalg.norm(normals, axis=1, keepdims=True)
-
     # 面积权重
     if areas is None:
         weights = np.ones(N, dtype=np.float64)
     else:
         weights = np.asarray(areas, dtype=np.float64)
+
+    # 检查并过滤零/无效法向量，避免除零
+    norms = np.linalg.norm(normals, axis=1, keepdims=True)
+    valid_mask = norms[:, 0] > 1e-12
+    n = np.zeros_like(normals, dtype=np.float64)
+    n[valid_mask] = normals[valid_mask] / norms[valid_mask]
 
     # 随机数生成器
     if rng is None:
@@ -317,8 +320,8 @@ def segment_tubular_regions(normals, areas=None, threshold=0.1, min_faces=100,
     labels = np.zeros(N, dtype=int)
     axes = []
 
-    # 当前可用的面片索引（未归类的）
-    active = np.where(labels == 0)[0]
+    # 当前可用的面片索引（未归类的且法向有效）
+    active = np.where((labels == 0) & valid_mask)[0]
 
     for region_id in range(1, max_regions + 1):
         if len(active) < 2 or len(active) < min_faces:
