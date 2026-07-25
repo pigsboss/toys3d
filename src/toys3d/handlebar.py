@@ -160,6 +160,106 @@ def build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask):
                       length=max_ext * 0.5)
     return scene
 
+
+# -------------------------------------------------------------------
+#  新增：对称平面着色及可视化
+# -------------------------------------------------------------------
+def colorize_by_symmetry_plane(mesh, plane_normal, plane_offset, threshold=1e-3):
+    """
+    根据对称平面将面片分为左/右/中性三类并着色。
+
+    参数
+    ----
+    plane_normal : (3,)  对称平面法向（y轴方向）
+    plane_offset : float 平面偏移（n·x = offset）
+    threshold : float    有向距离绝对值小于该值视为中性面
+
+    返回
+    ----
+    labels : (F,) int    0=左, 1=右, 2=中性
+    """
+    n = np.asarray(plane_normal, dtype=np.float64)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    centers = mesh.triangles_center
+    dists = centers @ n - plane_offset
+
+    labels = np.zeros(len(centers), dtype=int)
+    labels[dists > threshold] = 1   # 右侧
+    labels[np.abs(dists) <= threshold] = 2  # 中性
+
+    palette = np.array([
+        [0,   100, 200, 255],   # 0 left   -> 深蓝
+        [0,   180, 255, 255],   # 1 right  -> 青色
+        [180, 180, 180, 255],   # 2 neutral -> 灰
+    ], dtype=np.uint8)
+    mesh.visual.face_colors = palette[labels]
+    return labels
+
+
+def build_symmetry_visualization(mesh, plane_normal, plane_offset):
+    """
+    构建对称性分析可视化场景：网格按左右着色 + 半透明镜面。
+    """
+    scene = trimesh.Scene()
+
+    # 着色后的网格
+    vis_mesh = mesh.copy()
+    colorize_by_symmetry_plane(vis_mesh, plane_normal, plane_offset)
+    scene.add_geometry(vis_mesh)
+
+    # 镜面
+    max_ext = mesh.bounding_box.extents.max()
+    n = np.asarray(plane_normal, dtype=np.float64)
+    n = n / (np.linalg.norm(n) + 1e-12)
+
+    center = mesh.bounding_box.centroid
+    point_on_plane = center - (np.dot(center, n) - plane_offset) * n
+
+    # 构造镜面局部正交基
+    if abs(n[2]) < 0.9:
+        mirror_u = np.cross(n, [0, 0, 1])
+    else:
+        mirror_u = np.cross(n, [1, 0, 0])
+    mirror_u = mirror_u / np.linalg.norm(mirror_u)
+    mirror_v = np.cross(n, mirror_u)
+
+    span = max_ext * 0.8
+
+    # 创建薄板（局部 x=span, y=0.01, z=span）
+    mirror = trimesh.creation.box(extents=[span, 0.01, span])
+
+    # 旋转：局部 z 轴对齐法向 n
+    z_axis = np.array([0, 0, 1.0])
+    if np.allclose(n, z_axis):
+        R = np.eye(3)
+    elif np.allclose(n, -z_axis):
+        R = np.diag([1, -1, -1])
+    else:
+        v = np.cross(z_axis, n)
+        s = np.linalg.norm(v)
+        c = np.dot(z_axis, n)
+        vx = np.array([[0, -v[2], v[1]],
+                       [v[2], 0, -v[0]],
+                       [-v[1], v[0], 0]])
+        R = np.eye(3) + vx + vx @ vx * (1 - c) / (s * s)
+
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = point_on_plane
+    mirror.apply_transform(T)
+    mirror.visual.face_colors = [255, 255, 0, 80]  # 半透明黄
+    scene.add_geometry(mirror)
+
+    # 坐标架
+    add_axes_to_scene(scene, origin=center,
+                      u_x=np.array([1, 0, 0]),
+                      u_y=np.array([0, 1, 0]),
+                      u_z=np.array([0, 0, 1]),
+                      length=max_ext * 0.5)
+
+    return scene
+
+
 def repair_mesh_by_removing_duplicates(mesh):
     """
     通过去除重复/退化面片来修复网格，消除部分非流形边。
@@ -989,32 +1089,20 @@ def process_handlebar(mesh,
     print(f"  both-defect faces  : {defect_stats['both_defect_faces']}")
     print(f"  watertight (no open edges): {defect_stats['watertight_by_count']}")
 
-    # 新增：基于体素化的对称平面估计（诊断用）
-    if mesh.is_watertight:
-        print("\n[Symmetry] Estimating symmetry plane from watertight voxelization...")
-        u_y_sym, offset_y, sym_score = estimate_symmetry_plane_voxel(
-            mesh, grid_size=96, metric='gradient'
-        )
-        print(f"  symmetry_score = {sym_score:.6f}  (closer to 0 means more symmetric)")
-        print(f"  estimated y    = {u_y_sym.round(4)}")
-        print(f"  plane offset   = {offset_y:.4f}")
-    else:
-        print("\n[Symmetry] Mesh is not watertight; skipping voxel-based symmetry estimation.")
-
-    # 如果需要修复且存在缺陷
+    # 修复（如果需要）
     if repair_mode and (defect_stats['open_edges'] > 0 or defect_stats['nonmanifold_edges'] > 0):
         print("\n[Repair mode] Attempting to fix mesh...")
 
         # 策略1：去重复/退化面
         mesh = repair_mesh_by_removing_duplicates(mesh)
 
-        # 策略2：消除非流形边（保留法向最一致的两个面）
+        # 策略2：消除非流形边
         mesh = repair_nonmanifold_edges(mesh)
 
-        # 补洞：封闭删除面片产生的小边界环
+        # 补洞
         mesh = fill_small_holes(mesh)
 
-        # 修复后重新计算统计信息
+        # 修复后重新统计
         stats = compute_mesh_stats(mesh)
         print("After repair:")
         for k, v in stats.items():
@@ -1031,23 +1119,51 @@ def process_handlebar(mesh,
         print(f"  both-defect faces  : {defect_stats['both_defect_faces']}")
         print(f"  watertight (no open edges): {defect_stats['watertight_by_count']}")
 
+    # 对称性估计（修复后，此时网格应水密）
+    if mesh.is_watertight:
+        print("\n[Symmetry] Estimating symmetry plane from watertight voxelization...")
+        u_y_sym, offset_y, sym_score = estimate_symmetry_plane_voxel(
+            mesh, grid_size=96, metric='gradient'
+        )
+        print(f"  symmetry_score = {sym_score:.6f}  (closer to 0 means more symmetric)")
+        print(f"  estimated y    = {u_y_sym.round(4)}")
+        print(f"  plane offset   = {offset_y:.4f}")
+    else:
+        u_y_sym = None
+        offset_y = 0.0
+        print("\n[Symmetry] Mesh is not watertight; skipping voxel-based symmetry estimation.")
+
     # 仅检测模式
     if num_passes == 0:
         print("\n[--num-passes 0] Only performing mesh defect inspection.")
-        world_scene = build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask)
+
+        if u_y_sym is not None:
+            print("[Symmetry] Displaying symmetry analysis visualization.")
+            world_scene = build_symmetry_visualization(mesh, u_y_sym, offset_y)
+        else:
+            world_scene = build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask)
 
         mesh_copy = mesh.copy()
-        colorize_defects(mesh_copy, open_face_mask, nonmanifold_face_mask)
+        if u_y_sym is not None:
+            colorize_by_symmetry_plane(mesh_copy, u_y_sym, offset_y)
+        else:
+            colorize_defects(mesh_copy, open_face_mask, nonmanifold_face_mask)
         scene = trimesh.Scene(mesh_copy)
         add_axes_to_scene(scene, origin=mesh.bounding_box.centroid,
                           u_x=np.array([1,0,0]), u_y=np.array([0,1,0]), u_z=np.array([0,0,1]),
                           length=mesh.bounding_box.extents.max()*0.5)
 
-        print("\nDefect face color map:")
-        print("  0 = Normal face            -> gray")
-        print("  1 = Open-edge face          -> red")
-        print("  2 = Nonmanifold-edge face   -> yellow")
-        print("  3 = Both defects            -> purple")
+        print("\nColor map:")
+        if u_y_sym is not None:
+            print("  0 = Left side   -> dark blue")
+            print("  1 = Right side  -> cyan")
+            print("  2 = Neutral     -> gray")
+            print("  Mirror plane    -> translucent yellow")
+        else:
+            print("  0 = Normal face            -> gray")
+            print("  1 = Open-edge face          -> red")
+            print("  2 = Nonmanifold-edge face   -> yellow")
+            print("  3 = Both defects            -> purple")
         return scene, world_scene, stats
 
     # 2. 准备数据
