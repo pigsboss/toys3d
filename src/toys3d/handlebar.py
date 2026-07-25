@@ -52,9 +52,104 @@ def compute_mesh_stats(mesh):
     stats['faces'] = mesh.faces.shape[0]
     stats['edges'] = mesh.edges_unique.shape[0]
     # 边界边数 = 非重复边数 - 出现在两个面中的边数（mesh.edges 为面边对出现的索引）
-    stats['boundary_edges'] = mesh.edges_unique.shape[0] - mesh.edges.shape[0]
+    stats['boundary_edges'] = int(np.sum(mesh.edges_boundary))
     stats['is_watertight'] = mesh.is_watertight
     return stats
+
+def analyze_mesh_defects(mesh):
+    """
+    分析网格拓扑缺陷：开放边、非流形边，以及涉及的面片。
+
+    Returns
+    -------
+    stats : dict
+    open_face_mask : (F,) bool
+    nonmanifold_face_mask : (F,) bool
+    """
+    edge_face_map = {}
+    for face_idx, face in enumerate(mesh.faces):
+        for i in range(3):
+            v1, v2 = int(face[i]), int(face[(i + 1) % 3])
+            key = tuple(sorted((v1, v2)))
+            edge_face_map.setdefault(key, []).append(face_idx)
+
+    open_edges = []
+    manifold_edges = []
+    nonmanifold_edges = []
+    for edge, face_list in edge_face_map.items():
+        k = len(face_list)
+        if k == 1:
+            open_edges.append(edge)
+        elif k == 2:
+            manifold_edges.append(edge)
+        else:
+            nonmanifold_edges.append(edge)
+
+    open_face_mask = np.zeros(len(mesh.faces), dtype=bool)
+    nonmanifold_face_mask = np.zeros(len(mesh.faces), dtype=bool)
+
+    for edge in open_edges:
+        for fi in edge_face_map[edge]:
+            open_face_mask[fi] = True
+    for edge in nonmanifold_edges:
+        for fi in edge_face_map[edge]:
+            nonmanifold_face_mask[fi] = True
+
+    stats = {
+        'total_faces': len(mesh.faces),
+        'raw_edges_count': mesh.edges.shape[0],
+        'unique_edges_count': len(edge_face_map),
+        'open_edges': len(open_edges),
+        'manifold_edges': len(manifold_edges),
+        'nonmanifold_edges': len(nonmanifold_edges),
+        'open_faces': int(np.sum(open_face_mask)),
+        'nonmanifold_faces': int(np.sum(nonmanifold_face_mask)),
+        'both_defect_faces': int(np.sum(open_face_mask & nonmanifold_face_mask)),
+        'watertight_by_count': (len(open_edges) == 0),
+    }
+    return stats, open_face_mask, nonmanifold_face_mask
+
+
+def colorize_defects(mesh, open_face_mask, nonmanifold_face_mask):
+    """
+    缺陷面片着色。
+      0: 正常面           -> 浅灰
+      1: 仅含开放边       -> 红色
+      2: 仅含非流形边     -> 黄色
+      3: 同时含两种       -> 紫色
+    """
+    labels = np.zeros(len(mesh.faces), dtype=int)
+    labels[open_face_mask & ~nonmanifold_face_mask] = 1
+    labels[~open_face_mask & nonmanifold_face_mask] = 2
+    labels[open_face_mask & nonmanifold_face_mask] = 3
+
+    palette = np.array([
+        [200, 200, 200, 255],   # 0 normal
+        [255,   0,   0, 255],   # 1 open edge
+        [255, 255,   0, 255],   # 2 nonmanifold edge
+        [160,  32, 240, 255],   # 3 both
+    ], dtype=np.uint8)
+    mesh.visual.face_colors = palette[labels]
+    return labels
+
+
+def build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask):
+    """构建仅显示网格缺陷的世界坐标系场景。"""
+    scene = trimesh.Scene()
+
+    vis_mesh = mesh.copy()
+    colorize_defects(vis_mesh, open_face_mask, nonmanifold_face_mask)
+    scene.add_geometry(vis_mesh)
+
+    origin = mesh.bounding_box.centroid
+    max_ext = mesh.bounding_box.extents.max()
+    add_axes_to_scene(scene, origin=origin,
+                      u_x=np.array([1, 0, 0]),
+                      u_y=np.array([0, 1, 0]),
+                      u_z=np.array([0, 0, 1]),
+                      length=max_ext * 0.5)
+    return scene
+
 
 def symmetry_score(mesh, region_mask, axis_dir, axis_point, n_bins=40):
     """
@@ -666,8 +761,9 @@ def process_handlebar(mesh,
     region_label_bar, region_label_stem : int or None
         手动指定 RANSAC 输出中哪个标签对应把横/把立。
         若为 None，则使用对称性自动判断。
-    num_passes : {1, 2, 3}
+    num_passes : {0, 1, 2, 3}
         分区阶段数：
+        0 = 仅检测网格缺陷
         1 = RANSAC 初始分区
         2 = +T 字形矩形约束
         3 = + 截面积精化
@@ -692,6 +788,38 @@ def process_handlebar(mesh,
     print("Hey, mesh stats:")
     for k, v in stats.items():
         print(f"  {k}: {v}")
+
+    # 网格缺陷分析
+    defect_stats, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+    print("\nMesh defect analysis:")
+    print(f"  total unique edges : {defect_stats['unique_edges_count']}")
+    print(f"  raw edges count    : {defect_stats['raw_edges_count']}")
+    print(f"  open edges         : {defect_stats['open_edges']}")
+    print(f"  manifold edges     : {defect_stats['manifold_edges']}")
+    print(f"  nonmanifold edges  : {defect_stats['nonmanifold_edges']}")
+    print(f"  open faces         : {defect_stats['open_faces']}")
+    print(f"  nonmanifold faces  : {defect_stats['nonmanifold_faces']}")
+    print(f"  both-defect faces  : {defect_stats['both_defect_faces']}")
+    print(f"  watertight (no open edges): {defect_stats['watertight_by_count']}")
+
+    # 仅检测模式
+    if num_passes == 0:
+        print("\n[--num-passes 0] Only performing mesh defect inspection.")
+        world_scene = build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask)
+
+        mesh_copy = mesh.copy()
+        colorize_defects(mesh_copy, open_face_mask, nonmanifold_face_mask)
+        scene = trimesh.Scene(mesh_copy)
+        add_axes_to_scene(scene, origin=mesh.bounding_box.centroid,
+                          u_x=np.array([1,0,0]), u_y=np.array([0,1,0]), u_z=np.array([0,0,1]),
+                          length=mesh.bounding_box.extents.max()*0.5)
+
+        print("\nDefect face color map:")
+        print("  0 = Normal face            -> gray")
+        print("  1 = Open-edge face          -> red")
+        print("  2 = Nonmanifold-edge face   -> yellow")
+        print("  3 = Both defects            -> purple")
+        return scene, world_scene, stats
 
     # 2. 准备数据
     areas = mesh.area_faces
@@ -1131,8 +1259,8 @@ def main():
     parser.add_argument("input_file", help="输入网格文件路径 (stl/ply/obj)")
     parser.add_argument("--output", help="保存处理后的网格路径 (可选)")
     parser.add_argument("--ransac_thr", type=float, default=0.1, help="RANSAC 阈值 (默认 0.1)")
-    parser.add_argument("--num-passes", type=int, default=3, choices=[1, 2, 3],
-                        help="分区阶段数：1=RANSAC初始分区，2=+T字形约束分区，3=+截面积精化（默认3）")
+    parser.add_argument("--num-passes", type=int, default=3, choices=[0, 1, 2, 3],
+                        help="分区阶段数：0=仅检测网格缺陷，1=RANSAC初始分区，2=+T字形约束分区，3=+截面积精化（默认3）")
     parser.add_argument("--bar-x-size", type=float, default=None,
                         help="把横沿 x 方向尺寸 d，用于确定把立过渡区范围（默认自动估算）")
     parser.add_argument("--stem-y-size", type=float, default=None,
