@@ -47,18 +47,20 @@ def closest_points_on_lines(dir1, pt1, dir2, pt2):
 
 def compute_mesh_stats(mesh):
     """返回网格基本统计信息字典。"""
+    faces = np.asarray(mesh.faces, dtype=np.int64)
     stats = {}
     stats['vertices'] = mesh.vertices.shape[0]
-    stats['faces'] = mesh.faces.shape[0]
+    stats['faces'] = faces.shape[0]
     stats['edges'] = mesh.edges_unique.shape[0]
     # 手动计算边界边：只属于一个面的边
     edge_face_map = {}
-    for face_idx, face in enumerate(mesh.faces):
+    for face_idx, face in enumerate(faces):
         for i in range(3):
-            v1, v2 = int(face[i]), int(face[(i + 1) % 3])
-            key = tuple(sorted((v1, v2)))
+            v1 = int(face[i])
+            v2 = int(face[(i + 1) % 3])
+            key = (v1, v2) if v1 < v2 else (v2, v1)
             edge_face_map.setdefault(key, []).append(face_idx)
-    boundary_edges = sum(1 for faces in edge_face_map.values() if len(faces) == 1)
+    boundary_edges = sum(1 for faces_list in edge_face_map.values() if len(faces_list) == 1)
     stats['boundary_edges'] = boundary_edges
     stats['is_watertight'] = mesh.is_watertight
     return stats
@@ -73,11 +75,13 @@ def analyze_mesh_defects(mesh):
     open_face_mask : (F,) bool
     nonmanifold_face_mask : (F,) bool
     """
+    faces = np.asarray(mesh.faces, dtype=np.int64)
     edge_face_map = {}
-    for face_idx, face in enumerate(mesh.faces):
+    for face_idx, face in enumerate(faces):
         for i in range(3):
-            v1, v2 = int(face[i]), int(face[(i + 1) % 3])
-            key = tuple(sorted((v1, v2)))
+            v1 = int(face[i])
+            v2 = int(face[(i + 1) % 3])
+            key = (v1, v2) if v1 < v2 else (v2, v1)
             edge_face_map.setdefault(key, []).append(face_idx)
 
     open_edges = []
@@ -92,8 +96,8 @@ def analyze_mesh_defects(mesh):
         else:
             nonmanifold_edges.append(edge)
 
-    open_face_mask = np.zeros(len(mesh.faces), dtype=bool)
-    nonmanifold_face_mask = np.zeros(len(mesh.faces), dtype=bool)
+    open_face_mask = np.zeros(len(faces), dtype=bool)
+    nonmanifold_face_mask = np.zeros(len(faces), dtype=bool)
 
     for edge in open_edges:
         for fi in edge_face_map[edge]:
@@ -103,7 +107,7 @@ def analyze_mesh_defects(mesh):
             nonmanifold_face_mask[fi] = True
 
     stats = {
-        'total_faces': len(mesh.faces),
+        'total_faces': len(faces),
         'raw_edges_count': mesh.edges.shape[0],
         'unique_edges_count': len(edge_face_map),
         'open_edges': len(open_edges),
