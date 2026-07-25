@@ -791,7 +791,8 @@ def process_handlebar(mesh,
                       num_passes=3,
                       bar_x_size=None,
                       stem_y_size=None,
-                      aero_mode=False):
+                      aero_mode=False,
+                      repair_mode=False):
     """
     对一体把进行完整处理，返回可视化场景。
 
@@ -815,6 +816,8 @@ def process_handlebar(mesh,
         把立沿 y 方向尺寸（overwrite自动估算）
     aero_mode : bool
         启用气动把三分区模式（把立 + 左把横 + 右把横）。
+    repair_mode : bool
+        启用网格修复模式（去除重复/退化面）。
 
     返回
     -------
@@ -843,6 +846,28 @@ def process_handlebar(mesh,
     print(f"  nonmanifold faces  : {defect_stats['nonmanifold_faces']}")
     print(f"  both-defect faces  : {defect_stats['both_defect_faces']}")
     print(f"  watertight (no open edges): {defect_stats['watertight_by_count']}")
+
+    # 如果需要修复且存在缺陷
+    if repair_mode and (defect_stats['open_edges'] > 0 or defect_stats['nonmanifold_edges'] > 0):
+        print("\n[Repair mode] Attempting to fix mesh...")
+        mesh = repair_mesh_by_removing_duplicates(mesh)
+
+        # 修复后重新计算统计信息
+        stats = compute_mesh_stats(mesh)
+        print("After repair:")
+        for k, v in stats.items():
+            print(f"  {k}: {v}")
+
+        defect_stats, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+        print(f"  total unique edges : {defect_stats['unique_edges_count']}")
+        print(f"  raw edges count    : {defect_stats['raw_edges_count']}")
+        print(f"  open edges         : {defect_stats['open_edges']}")
+        print(f"  manifold edges     : {defect_stats['manifold_edges']}")
+        print(f"  nonmanifold edges  : {defect_stats['nonmanifold_edges']}")
+        print(f"  open faces         : {defect_stats['open_faces']}")
+        print(f"  nonmanifold faces  : {defect_stats['nonmanifold_faces']}")
+        print(f"  both-defect faces  : {defect_stats['both_defect_faces']}")
+        print(f"  watertight (no open edges): {defect_stats['watertight_by_count']}")
 
     # 仅检测模式
     if num_passes == 0:
@@ -1321,10 +1346,6 @@ def main():
         print("Multiple meshes detected, merged.")
     print(f"Hey, loading model: {args.input_file}")
 
-    # 可选修复
-    if args.repair:
-        mesh = repair_mesh_by_removing_duplicates(mesh)
-
     # 处理
     transformed_scene, world_scene, stats = process_handlebar(
         mesh,
@@ -1332,7 +1353,8 @@ def main():
         num_passes=args.num_passes,
         bar_x_size=args.bar_x_size,
         stem_y_size=args.stem_y_size,
-        aero_mode=args.aero
+        aero_mode=args.aero,
+        repair_mode=args.repair
     )
 
     # 保存输出
