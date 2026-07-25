@@ -193,6 +193,148 @@ def repair_mesh_by_removing_duplicates(mesh):
     print(f"  Faces before: {orig_faces}, after: {mesh.faces.shape[0]}")
     return mesh
 
+
+# ----------------------------------------------------------------------
+#  新增修复函数：repair_nonmanifold_edges 和 fill_small_holes
+# ----------------------------------------------------------------------
+def repair_nonmanifold_edges(mesh, max_iterations=10, verbose=True):
+    """
+    策略2：对每个非流形边，保留法向最一致的两个面，删除其余面片。
+    迭代直到没有非流形边（或达到迭代上限）。
+    """
+    for it in range(max_iterations):
+        faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+
+        # 构建 edge -> faces 映射
+        edge_face_map = {}
+        for fi, face in enumerate(faces):
+            v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+            for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+                key = (a, b) if a < b else (b, a)
+                edge_face_map.setdefault(key, []).append(fi)
+
+        nonmanifold = {e: fl for e, fl in edge_face_map.items() if len(fl) > 2}
+        if not nonmanifold:
+            if verbose:
+                print(f"  [Iter {it}] No nonmanifold edges remain.")
+            break
+
+        if verbose:
+            print(f"  [Iter {it}] {len(nonmanifold)} nonmanifold edges, removing extra faces...")
+
+        normals = mesh.face_normals
+        areas = mesh.area_faces
+        faces_to_remove = set()
+
+        for edge, fl in nonmanifold.items():
+            if verbose:
+                va, vb = mesh.vertices[edge[0]], mesh.vertices[edge[1]]
+                print(f"    edge {edge} at {va} <-> {vb}, shared by {len(fl)} faces")
+                for fi in fl:
+                    print(f"      face {fi}: area={areas[fi]:.4f}, normal={normals[fi].round(3)}")
+
+            # 选法向最一致的一对（点积最大；平局时选面积较大的组合）
+            best_pair, best_key = None, -np.inf
+            for i in range(len(fl)):
+                for j in range(i + 1, len(fl)):
+                    dot = np.dot(normals[fl[i]], normals[fl[j]])
+                    score = dot + 1e-6 * min(areas[fl[i]], areas[fl[j]])
+                    if score > best_key:
+                        best_key = score
+                        best_pair = (fl[i], fl[j])
+
+            for fi in fl:
+                if fi not in best_pair:
+                    faces_to_remove.add(fi)
+
+        keep = np.ones(len(faces), dtype=bool)
+        keep[list(faces_to_remove)] = False
+        mesh = trimesh.Trimesh(vertices=mesh.vertices,
+                               faces=faces[keep], process=False)
+
+    mesh = mesh.copy()
+    mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+def fill_small_holes(mesh, max_loop_edges=50, verbose=True):
+    """
+    用质心扇形三角化封闭小边界环。
+    只处理边数不超过 max_loop_edges 的环。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+
+    # 找边界边
+    edge_face_map = {}
+    for fi, face in enumerate(faces):
+        v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
+            edge_face_map.setdefault(key, []).append(fi)
+    boundary_edges = [e for e, fl in edge_face_map.items() if len(fl) == 1]
+
+    if not boundary_edges:
+        if verbose:
+            print("  No boundary edges, nothing to fill.")
+        return mesh
+
+    # 把边界边连成环
+    adjacency = {}
+    for a, b in boundary_edges:
+        adjacency.setdefault(a, []).append(b)
+        adjacency.setdefault(b, []).append(a)
+
+    visited = set()
+    loops = []
+    for start in adjacency:
+        if start in visited:
+            continue
+        loop = [start]
+        visited.add(start)
+        prev, curr = None, start
+        while True:
+            neighbors = [v for v in adjacency[curr] if v != prev]
+            if not neighbors:
+                break
+            nxt = neighbors[0]
+            if nxt == start and len(loop) > 2:
+                break
+            if nxt in visited:
+                break
+            loop.append(nxt)
+            visited.add(nxt)
+            prev, curr = curr, nxt
+        if len(loop) >= 3:
+            loops.append(loop)
+
+    # 扇形封闭
+    new_vertices = [mesh.vertices]
+    new_faces = [faces]
+    for loop in loops:
+        if len(loop) > max_loop_edges:
+            if verbose:
+                print(f"  Skipping large boundary loop ({len(loop)} edges).")
+            continue
+        loop_pts = mesh.vertices[np.array(loop)]
+        centroid = loop_pts.mean(axis=0)
+        c_idx = sum(len(v) for v in new_vertices)
+        new_vertices.append(centroid[None, :])
+        tris = []
+        for i in range(len(loop)):
+            tris.append([c_idx, loop[i], loop[(i + 1) % len(loop)]])
+        new_faces.append(np.array(tris))
+        if verbose:
+            print(f"  Filled boundary loop with {len(loop)} edges.")
+
+    vertices = np.vstack(new_vertices)
+    faces = np.vstack(new_faces)
+    out = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    # 统一新面片朝向
+    out.fix_normals()
+    return out
+
+
 def symmetry_score(mesh, region_mask, axis_dir, axis_point, n_bins=40):
     """
     基于沿轴线的面积分布形状评价对称性。
@@ -241,7 +383,6 @@ def symmetry_score(mesh, region_mask, axis_dir, axis_point, n_bins=40):
     corr = np.sum(left * right) / denom
     return float(np.clip(corr, 0.0, 1.0))
 
-# (注意：compute_mesh_stats 和 symmetry_score 只在上面定义一次，下面重复的定义已被删除)
 
 # ----------------------------------------------------------------------
 #  修订1: rough_axis_from_mask
@@ -850,7 +991,15 @@ def process_handlebar(mesh,
     # 如果需要修复且存在缺陷
     if repair_mode and (defect_stats['open_edges'] > 0 or defect_stats['nonmanifold_edges'] > 0):
         print("\n[Repair mode] Attempting to fix mesh...")
+
+        # 策略1：去重复/退化面
         mesh = repair_mesh_by_removing_duplicates(mesh)
+
+        # 策略2：消除非流形边（保留法向最一致的两个面）
+        mesh = repair_nonmanifold_edges(mesh)
+
+        # 补洞：封闭删除面片产生的小边界环
+        mesh = fill_small_holes(mesh)
 
         # 修复后重新计算统计信息
         stats = compute_mesh_stats(mesh)
