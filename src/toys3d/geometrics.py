@@ -479,7 +479,7 @@ def compute_cross_section_area(mesh, plane_origin, plane_normal, face_mask=None)
         indices = np.where(face_mask)[0]
         if len(indices) == 0:
             return 0.0
-        submesh = mesh.submesh(indices)[0]
+        submesh = mesh.submesh([indices])[0]
     else:
         submesh = mesh
 

@@ -864,7 +864,7 @@ def identify_three_tubular_regions_symmetric(mesh, u_y_sym, offset_y,
             print(f"[SymRANSAC] {side_name}: too few faces ({n_faces})")
             return None
         face_indices = np.where(side_mask)[0]
-        sub = mesh.submesh(face_indices)[0]
+        sub = mesh.submesh([face_indices])[0]
         labels, axes = segment_tubular_regions(
             sub.face_normals, areas=sub.area_faces,
             threshold=ransac_threshold,
