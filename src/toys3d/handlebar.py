@@ -225,8 +225,9 @@ def build_symmetry_visualization(mesh, plane_normal, plane_offset):
 
     span = max_ext * 0.8
 
-    # 创建薄板（局部 x=span, y=0.01, z=span）
-    mirror = trimesh.creation.box(extents=[span, 0.01, span])
+    # 创建薄板（局部 x=span, y=span, z=0.01）
+    # 薄方向为 z 轴，旋转后 z 轴与法向 n 对齐，使镜面正确垂直于对称平面
+    mirror = trimesh.creation.box(extents=[span, span, 0.01])
 
     # 旋转：局部 z 轴对齐法向 n
     z_axis = np.array([0, 0, 1.0])
