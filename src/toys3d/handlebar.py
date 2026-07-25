@@ -19,6 +19,7 @@ from toys3d.geometrics import (
     point_line_distance,
     intersect_line_plane,
     kmeans_1d,
+    estimate_symmetry_plane_voxel,   # 新增
 )
 
 # ------------------------- 辅助函数 -------------------------
@@ -987,6 +988,18 @@ def process_handlebar(mesh,
     print(f"  nonmanifold faces  : {defect_stats['nonmanifold_faces']}")
     print(f"  both-defect faces  : {defect_stats['both_defect_faces']}")
     print(f"  watertight (no open edges): {defect_stats['watertight_by_count']}")
+
+    # 新增：基于体素化的对称平面估计（诊断用）
+    if mesh.is_watertight:
+        print("\n[Symmetry] Estimating symmetry plane from watertight voxelization...")
+        u_y_sym, offset_y, sym_score = estimate_symmetry_plane_voxel(
+            mesh, grid_size=96, metric='gradient'
+        )
+        print(f"  symmetry_score = {sym_score:.6f}  (closer to 0 means more symmetric)")
+        print(f"  estimated y    = {u_y_sym.round(4)}")
+        print(f"  plane offset   = {offset_y:.4f}")
+    else:
+        print("\n[Symmetry] Mesh is not watertight; skipping voxel-based symmetry estimation.")
 
     # 如果需要修复且存在缺陷
     if repair_mode and (defect_stats['open_edges'] > 0 or defect_stats['nonmanifold_edges'] > 0):

@@ -762,3 +762,156 @@ def average_antiparallel_directions(d1, d2):
         d2 = -d2
     avg = d1 + d2
     return avg / (np.linalg.norm(avg) + 1e-12)
+
+
+# ------------------------------------------------------------------
+#  基于水密网格体素化的对称平面估计
+# ------------------------------------------------------------------
+
+def voxelize_mesh_watertight(mesh, grid_size=96, margin=1.1):
+    """
+    将水密网格体素化为三值数据立方：0=内部，1=表面，2=外部。
+
+    Returns
+    -------
+    grid : (G, G, G) ndarray uint8
+    origin : (3,)  世界坐标系中网格原点（体素 [0,0,0] 的位置）
+    pitch : float  体素边长
+    """
+    from scipy import ndimage
+
+    bbox = mesh.bounding_box
+    extents = bbox.extents
+    pitch = extents.max() / grid_size
+    voxel = mesh.voxelized(pitch)
+    surface = voxel.matrix.astype(bool)
+
+    grid = np.zeros_like(surface, dtype=np.uint8)
+    grid[surface] = 1
+
+    outside = ~surface
+    labeled, num = ndimage.label(outside)
+    if num == 0:
+        grid.fill(2)
+        grid[surface] = 1
+        return grid, voxel.translation, voxel.pitch
+
+    corner_label = labeled[0, 0, 0]
+    grid[labeled == corner_label] = 2
+
+    return grid, voxel.translation, voxel.pitch
+
+
+def voxel_symmetry_score_watertight(mesh, plane_normal, plane_offset=None,
+                                    grid_size=96, metric='gradient'):
+    """
+    基于三值体素立方的对称性评分。
+
+    返回负的加权均方误差，越大表示越对称。
+    """
+    from scipy import ndimage
+
+    n = np.asarray(plane_normal, dtype=np.float64)
+    n = n / (np.linalg.norm(n) + 1e-12)
+
+    if plane_offset is None:
+        plane_offset = float(np.median(mesh.vertices @ n))
+
+    grid, origin, pitch = voxelize_mesh_watertight(mesh, grid_size)
+
+    # 构造局部坐标系
+    if abs(n[2]) < 0.9:
+        u = np.cross(n, [0, 0, 1])
+    else:
+        u = np.cross(n, [1, 0, 0])
+    u = u / (np.linalg.norm(u) + 1e-12)
+    v = np.cross(n, u)
+
+    center_world = mesh.bounding_box.centroid
+
+    # 世界 -> 局部旋转
+    R_w2l = np.column_stack([u, n, v])
+    M = R_w2l @ np.diag([1, -1, 1]) @ R_w2l.T
+
+    mirrored = ndimage.affine_transform(
+        grid.astype(np.float32),
+        M.T,
+        offset=np.zeros(3),
+        order=1,
+        mode='constant',
+        cval=2.0
+    )
+
+    # 沿 n 方向平移，使镜像平面过 plane_offset
+    shift = (plane_offset - np.dot(center_world, n)) / pitch
+    mirrored = ndimage.shift(mirrored, shift * n, order=1, mode='constant', cval=2.0)
+
+    a = grid.astype(np.float32)
+    b = mirrored
+
+    mask = (a > 0) | (b > 0)
+    if not np.any(mask):
+        return 0.0
+
+    a0 = a[mask] - np.mean(a[mask])
+    b0 = b[mask] - np.mean(b[mask])
+    diff = a0 - b0
+
+    if metric == 'identity':
+        W = np.ones_like(diff)
+    elif metric == 'gradient':
+        gx, gy, gz = np.gradient(a)
+        Gmag = np.sqrt(gx * gx + gy * gy + gz * gz)
+        W = Gmag[mask]
+    elif metric == 'structure':
+        gx, gy, gz = np.gradient(a)
+        Gmag = gx * gx + gy * gy + gz * gz
+        W = Gmag[mask]
+    else:
+        raise ValueError(f"Unknown metric: {metric}")
+
+    W = np.maximum(W, 1e-12)
+    W = W / W.sum()
+
+    score = -np.sum(W * diff * diff)
+    return float(score)
+
+
+def estimate_symmetry_plane_voxel(mesh, candidate_normals=None,
+                                  grid_size=96, metric='gradient'):
+    """
+    在候选法向中搜索最佳对称平面（基于水密网格体素化）。
+
+    Returns
+    -------
+    best_normal : (3,)
+    best_offset : float
+    best_score : float
+    """
+    pts = mesh.vertices
+    if candidate_normals is None:
+        cov = np.cov(pts.T)
+        _, evec = np.linalg.eigh(cov)
+        candidate_normals = [evec[:, i] for i in range(3)]
+
+    best_score = -np.inf
+    best_n = None
+    best_offset = 0.0
+
+    for n in candidate_normals:
+        signed = pts @ np.asarray(n, dtype=np.float64)
+        offset = float(np.median(signed))
+        score = voxel_symmetry_score_watertight(
+            mesh, n, offset, grid_size, metric
+        )
+        if score > best_score:
+            best_score = score
+            best_n = np.asarray(n, dtype=np.float64)
+            best_offset = offset
+
+    if best_n is None:
+        best_n = np.array([0.0, 1.0, 0.0])
+        best_offset = 0.0
+        best_score = 0.0
+
+    return best_n, best_offset, best_score
