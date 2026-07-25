@@ -157,6 +157,18 @@ def build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask):
                       length=max_ext * 0.5)
     return scene
 
+def repair_mesh_by_removing_duplicates(mesh):
+    """
+    通过去除重复/退化面片来修复网格，消除部分非流形边。
+    操作后可能仍需检查非流形边是否完全消失。
+    """
+    print("Applying duplicate face removal...")
+    orig_faces = mesh.faces.shape[0]
+    mesh.remove_duplicate_faces()
+    mesh.remove_degenerate_faces()
+    mesh.remove_unreferenced_vertices()
+    print(f"  Faces before: {orig_faces}, after: {mesh.faces.shape[0]}")
+    return mesh
 
 def symmetry_score(mesh, region_mask, axis_dir, axis_point, n_bins=40):
     """
@@ -1274,6 +1286,8 @@ def main():
                         help="把立沿 y 方向尺寸 w，用于确定把横过渡区半宽（默认自动估算）")
     parser.add_argument("--aero", action="store_true",
                         help="启用气动把三分区模式：把立 + 左把横 + 右把横")
+    parser.add_argument("--repair", action="store_true",
+                        help="尝试自动修复网格（去除重复/退化面）以消除非流形边")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
     args = parser.parse_args()
 
@@ -1283,6 +1297,10 @@ def main():
         mesh = mesh.dump(concatenate=True)
         print("Multiple meshes detected, merged.")
     print(f"Hey, loading model: {args.input_file}")
+
+    # 可选修复
+    if args.repair:
+        mesh = repair_mesh_by_removing_duplicates(mesh)
 
     # 处理
     transformed_scene, world_scene, stats = process_handlebar(
