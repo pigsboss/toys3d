@@ -47,7 +47,7 @@ def closest_points_on_lines(dir1, pt1, dir2, pt2):
 
 def compute_mesh_stats(mesh):
     """返回网格基本统计信息字典。"""
-    faces = np.asarray(mesh.faces, dtype=np.int64)
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
     stats = {}
     stats['vertices'] = mesh.vertices.shape[0]
     stats['faces'] = faces.shape[0]
@@ -55,10 +55,9 @@ def compute_mesh_stats(mesh):
     # 手动计算边界边：只属于一个面的边
     edge_face_map = {}
     for face_idx, face in enumerate(faces):
-        for i in range(3):
-            v1 = int(face[i])
-            v2 = int(face[(i + 1) % 3])
-            key = (v1, v2) if v1 < v2 else (v2, v1)
+        v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
             edge_face_map.setdefault(key, []).append(face_idx)
     boundary_edges = sum(1 for faces_list in edge_face_map.values() if len(faces_list) == 1)
     stats['boundary_edges'] = boundary_edges
@@ -75,13 +74,12 @@ def analyze_mesh_defects(mesh):
     open_face_mask : (F,) bool
     nonmanifold_face_mask : (F,) bool
     """
-    faces = np.asarray(mesh.faces, dtype=np.int64)
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
     edge_face_map = {}
     for face_idx, face in enumerate(faces):
-        for i in range(3):
-            v1 = int(face[i])
-            v2 = int(face[(i + 1) % 3])
-            key = (v1, v2) if v1 < v2 else (v2, v1)
+        v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
             edge_face_map.setdefault(key, []).append(face_idx)
 
     open_edges = []
@@ -172,15 +170,25 @@ def repair_mesh_by_removing_duplicates(mesh):
     # 1. 去除重复面片（保留出现顺序中的第一个）
     unique_faces, unique_inverse = np.unique(mesh.faces, axis=0, return_inverse=True)
     if unique_faces.shape[0] < orig_faces:
-        mesh.update_faces(unique_faces)
-        mesh.remove_unreferenced_vertices()
+        mesh = trimesh.Trimesh(
+            vertices=mesh.vertices,
+            faces=unique_faces,
+            process=True
+        )
 
     # 2. 去除退化（面积为零或极小的）面片
     areas = mesh.area_faces
     non_degenerate = areas > 1e-12
     if np.sum(~non_degenerate) > 0:
-        mesh.update_faces(mesh.faces[non_degenerate])
-        mesh.remove_unreferenced_vertices()
+        mesh = trimesh.Trimesh(
+            vertices=mesh.vertices,
+            faces=mesh.faces[non_degenerate],
+            process=True
+        )
+
+    # 3. 清理未引用顶点
+    mesh = mesh.copy()
+    mesh.remove_unreferenced_vertices()
 
     print(f"  Faces before: {orig_faces}, after: {mesh.faces.shape[0]}")
     return mesh
