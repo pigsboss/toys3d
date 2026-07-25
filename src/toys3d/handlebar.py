@@ -164,9 +164,20 @@ def repair_mesh_by_removing_duplicates(mesh):
     """
     print("Applying duplicate face removal...")
     orig_faces = mesh.faces.shape[0]
-    mesh.remove_duplicate_faces()
-    mesh.remove_degenerate_faces()
-    mesh.remove_unreferenced_vertices()
+
+    # 1. 去除重复面片（保留出现顺序中的第一个）
+    unique_faces, unique_inverse = np.unique(mesh.faces, axis=0, return_inverse=True)
+    if unique_faces.shape[0] < orig_faces:
+        mesh.update_faces(unique_faces)
+        mesh.remove_unreferenced_vertices()
+
+    # 2. 去除退化（面积为零或极小的）面片
+    areas = mesh.area_faces
+    non_degenerate = areas > 1e-12
+    if np.sum(~non_degenerate) > 0:
+        mesh.update_faces(mesh.faces[non_degenerate])
+        mesh.remove_unreferenced_vertices()
+
     print(f"  Faces before: {orig_faces}, after: {mesh.faces.shape[0]}")
     return mesh
 
