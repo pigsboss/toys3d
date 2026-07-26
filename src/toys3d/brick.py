@@ -229,6 +229,11 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
         for k, v in stats.items():
             print(f"  {k}: {v}")
 
+        # 重新计算缺陷统计和掩码，使其与修复后的网格面数匹配
+        defect_stats, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+        print(f"  After repair defects: open_edges={defect_stats['open_edges']}, "
+              f"nonmanifold_edges={defect_stats['nonmanifold_edges']}")
+
     # num-passes 0: 仅检测/修复
     if num_passes == 0:
         world_scene = build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask)
