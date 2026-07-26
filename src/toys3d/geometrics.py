@@ -1458,3 +1458,241 @@ def build_box_aligned_frame_normal(mesh, n_clusters=6, rng=None):
     fit_info = evaluate_box_fit(mesh, origin, (ux, uy, uz), extents)
 
     return T_w2l, T_l2w, ux, uy, uz, origin, extents, fit_info
+
+# ------------------------------------------------------------------
+#  新增：网格缺陷检测与修复工具
+# ------------------------------------------------------------------
+
+def compute_mesh_stats(mesh):
+    """返回网格基本统计信息字典。"""
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+    stats = {}
+    stats['vertices'] = mesh.vertices.shape[0]
+    stats['faces'] = faces.shape[0]
+    stats['edges'] = mesh.edges_unique.shape[0]
+    edge_face_map = {}
+    for face_idx, face in enumerate(faces):
+        v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
+            edge_face_map.setdefault(key, []).append(face_idx)
+    boundary_edges = sum(1 for faces_list in edge_face_map.values()
+                         if len(faces_list) == 1)
+    stats['boundary_edges'] = boundary_edges
+    stats['is_watertight'] = mesh.is_watertight
+    return stats
+
+
+def analyze_mesh_defects(mesh):
+    """
+    分析网格拓扑缺陷：开放边、非流形边，以及涉及的面片。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+    edge_face_map = {}
+    for face_idx, face in enumerate(faces):
+        v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
+            edge_face_map.setdefault(key, []).append(face_idx)
+
+    open_edges = []
+    manifold_edges = []
+    nonmanifold_edges = []
+    for edge, face_list in edge_face_map.items():
+        k = len(face_list)
+        if k == 1:
+            open_edges.append(edge)
+        elif k == 2:
+            manifold_edges.append(edge)
+        else:
+            nonmanifold_edges.append(edge)
+
+    open_face_mask = np.zeros(len(faces), dtype=bool)
+    nonmanifold_face_mask = np.zeros(len(faces), dtype=bool)
+
+    for edge in open_edges:
+        for fi in edge_face_map[edge]:
+            open_face_mask[fi] = True
+    for edge in nonmanifold_edges:
+        for fi in edge_face_map[edge]:
+            nonmanifold_face_mask[fi] = True
+
+    stats = {
+        'total_faces': len(faces),
+        'raw_edges_count': mesh.edges.shape[0],
+        'unique_edges_count': len(edge_face_map),
+        'open_edges': len(open_edges),
+        'manifold_edges': len(manifold_edges),
+        'nonmanifold_edges': len(nonmanifold_edges),
+        'open_faces': int(np.sum(open_face_mask)),
+        'nonmanifold_faces': int(np.sum(nonmanifold_face_mask)),
+        'both_defect_faces': int(np.sum(open_face_mask & nonmanifold_face_mask)),
+        'watertight_by_count': (len(open_edges) == 0),
+    }
+    return stats, open_face_mask, nonmanifold_face_mask
+
+
+def repair_mesh_by_removing_duplicates(mesh):
+    """
+    通过去除重复/退化面片来修复网格，消除部分非流形边。
+    """
+    print("Applying duplicate face removal...")
+    orig_faces = mesh.faces.shape[0]
+
+    unique_faces, _ = np.unique(mesh.faces, axis=0, return_inverse=True)
+    if unique_faces.shape[0] < orig_faces:
+        mesh = trimesh.Trimesh(
+            vertices=mesh.vertices,
+            faces=unique_faces,
+            process=True
+        )
+
+    areas = mesh.area_faces
+    non_degenerate = areas > 1e-12
+    if np.sum(~non_degenerate) > 0:
+        mesh = trimesh.Trimesh(
+            vertices=mesh.vertices,
+            faces=mesh.faces[non_degenerate],
+            process=True
+        )
+
+    mesh = mesh.copy()
+    mesh.remove_unreferenced_vertices()
+
+    print(f"  Faces before: {orig_faces}, after: {mesh.faces.shape[0]}")
+    return mesh
+
+
+def repair_nonmanifold_edges(mesh, max_iterations=10, verbose=True):
+    """
+    策略2：对每个非流形边，保留法向最一致的两个面，删除其余面片。
+    迭代直到没有非流形边（或达到迭代上限）。
+    """
+    for it in range(max_iterations):
+        faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+
+        edge_face_map = {}
+        for fi, face in enumerate(faces):
+            v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+            for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+                key = (a, b) if a < b else (b, a)
+                edge_face_map.setdefault(key, []).append(fi)
+
+        nonmanifold = {e: fl for e, fl in edge_face_map.items()
+                       if len(fl) > 2}
+        if not nonmanifold:
+            if verbose:
+                print(f"  [Iter {it}] No nonmanifold edges remain.")
+            break
+
+        if verbose:
+            print(f"  [Iter {it}] {len(nonmanifold)} nonmanifold edges, "
+                  f"removing extra faces...")
+
+        normals = mesh.face_normals
+        areas = mesh.area_faces
+        faces_to_remove = set()
+
+        for edge, fl in nonmanifold.items():
+            if verbose:
+                va, vb = mesh.vertices[edge[0]], mesh.vertices[edge[1]]
+                print(f"    edge {edge} at {va} <-> {vb}, "
+                      f"shared by {len(fl)} faces")
+                for fi in fl:
+                    print(f"      face {fi}: area={areas[fi]:.4f}, "
+                          f"normal={normals[fi].round(3)}")
+
+            best_pair, best_key = None, -np.inf
+            for i in range(len(fl)):
+                for j in range(i + 1, len(fl)):
+                    dot = np.dot(normals[fl[i]], normals[fl[j]])
+                    score = dot + 1e-6 * min(areas[fl[i]], areas[fl[j]])
+                    if score > best_key:
+                        best_key = score
+                        best_pair = (fl[i], fl[j])
+
+            for fi in fl:
+                if fi not in best_pair:
+                    faces_to_remove.add(fi)
+
+        keep = np.ones(len(faces), dtype=bool)
+        keep[list(faces_to_remove)] = False
+        mesh = trimesh.Trimesh(vertices=mesh.vertices,
+                               faces=faces[keep], process=False)
+
+    mesh = mesh.copy()
+    mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+def fill_small_holes(mesh, max_loop_edges=50, verbose=True):
+    """
+    用质心扇形三角化封闭小边界环。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+
+    edge_face_map = {}
+    for fi, face in enumerate(faces):
+        v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
+            edge_face_map.setdefault(key, []).append(fi)
+    boundary_edges = [e for e, fl in edge_face_map.items()
+                      if len(fl) == 1]
+
+    if not boundary_edges:
+        if verbose:
+            print("  No boundary edges, nothing to fill.")
+        return mesh
+
+    adjacency = {}
+    for a, b in boundary_edges:
+        adjacency.setdefault(a, []).append(b)
+        adjacency.setdefault(b, []).append(a)
+
+    visited = set()
+    loops = []
+    for start in adjacency:
+        if start in visited:
+            continue
+        loop = [start]
+        visited.add(start)
+        prev, curr = None, start
+        while True:
+            neighbors = [v for v in adjacency[curr] if v != prev]
+            if not neighbors:
+                break
+            nxt = neighbors[0]
+            if nxt == start and len(loop) > 2:
+                break
+            if nxt in visited:
+                break
+            loop.append(nxt)
+            visited.add(nxt)
+            prev, curr = curr, nxt
+        if len(loop) >= 3:
+            loops.append(loop)
+
+    new_vertices = [mesh.vertices]
+    new_faces = [faces]
+    for loop in loops:
+        if len(loop) > max_loop_edges:
+            if verbose:
+                print(f"  Skipping large boundary loop ({len(loop)} edges).")
+            continue
+        loop_pts = mesh.vertices[np.array(loop)]
+        centroid = loop_pts.mean(axis=0)
+        c_idx = sum(len(v) for v in new_vertices)
+        new_vertices.append(centroid[None, :])
+        tris = []
+        for i in range(len(loop)):
+            tris.append([c_idx, loop[i], loop[(i + 1) % len(loop)]])
+        new_faces.append(np.array(tris))
+        if verbose:
+            print(f"  Filled boundary loop with {len(loop)} edges.")
+
+    vertices = np.vstack(new_vertices)
+    faces = np.vstack(new_faces)
+    out = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    out.fix_normals()
+    return out
