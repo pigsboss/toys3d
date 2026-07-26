@@ -915,3 +915,260 @@ def estimate_symmetry_plane_voxel(mesh, candidate_normals=None,
         best_score = 0.0
 
     return best_n, best_offset, best_score
+
+# ------------------------------------------------------------------
+#  新增：长方体/盒状物体体素化 OBB 坐标系估计
+# ------------------------------------------------------------------
+
+def normalize(v):
+    """返回单位向量；零向量返回原数组。"""
+    v = np.asarray(v, dtype=np.float64)
+    n = np.linalg.norm(v)
+    if n < 1e-12:
+        return v
+    return v / n
+
+
+def angle_between(v1, v2):
+    """返回两向量间夹角（弧度），范围 [0, pi]。"""
+    v1 = normalize(v1)
+    v2 = normalize(v2)
+    dot = np.clip(np.dot(v1, v2), -1.0, 1.0)
+    return np.arccos(dot)
+
+
+def is_right_handed(u_x, u_y, u_z):
+    """判断三轴是否为右手系。"""
+    return np.dot(np.cross(normalize(u_x), normalize(u_y)), normalize(u_z)) > 0
+
+
+def make_right_handed(u_x, u_y):
+    """由 x, y 轴生成右手系的 z 轴。"""
+    u_x = normalize(u_x)
+    u_y = normalize(u_y - np.dot(u_y, u_x) * u_x)
+    u_z = np.cross(u_x, u_y)
+    nz = np.linalg.norm(u_z)
+    if nz < 1e-12:
+        raise ValueError("u_x 与 u_y 共线，无法构造右手系")
+    return u_x, u_y, u_z / nz
+
+
+def orthogonalize_axes_from_triad(u1, u2):
+    """
+    从两个近似正交的方向构造右手正交基。
+    u1 -> x 轴，u2 投影到 u1 正交补后 -> y 轴，z = x × y。
+    """
+    u1 = normalize(u1)
+    u2 = normalize(u2 - np.dot(u2, u1) * u1)
+    u3 = np.cross(u1, u2)
+    return np.vstack([u1, u2, u3])
+
+
+def voxelize_mesh(mesh, grid_size=128, method='surface'):
+    """
+    将网格体素化为 trimesh VoxelGrid 对象。
+    method: 'surface' 或 'filled'（若不支持 filled 则回退到 surface）
+    """
+    bbox = mesh.bounding_box
+    pitch = bbox.extents.max() / grid_size
+    if pitch <= 0:
+        pitch = 1.0
+    voxel = mesh.voxelized(pitch)
+    if method == 'filled' and hasattr(voxel, 'fill'):
+        voxel = voxel.fill()
+    return voxel
+
+
+def get_occupied_voxels(voxel, method='surface'):
+    """
+    从 VoxelGrid 中提取被占据体素的世界坐标。
+    """
+    if method == 'filled' and hasattr(voxel, 'matrix_filled'):
+        coords = np.argwhere(voxel.matrix_filled)
+    else:
+        coords = np.argwhere(voxel.matrix)
+    return coords * voxel.pitch + voxel.translation
+
+
+def compute_obb_volume(points, axes):
+    """
+    计算点集在给定正交轴下的轴对齐包围盒体积。
+
+    axes: (3, 3)，每行是一个单位轴方向
+    """
+    proj = points @ axes.T
+    extents = proj.max(axis=0) - proj.min(axis=0)
+    return float(np.prod(extents))
+
+
+def points_bounding_box(points, axes):
+    """
+    计算点集在给定正交轴下的包围盒中心和尺寸。
+
+    Returns
+    -------
+    origin : (3,)  世界坐标系中的中心点
+    extents : (3,)  三个轴方向的尺寸
+    """
+    proj = points @ axes.T
+    mins = proj.min(axis=0)
+    maxs = proj.max(axis=0)
+    center_local = (mins + maxs) / 2.0
+    extents = maxs - mins
+    origin = center_local @ axes
+    return origin, extents
+
+
+def initial_obb_axes_pca(points, weights=None):
+    """
+    用 PCA 估计初始 OBB 三轴。
+
+    Returns
+    -------
+    axes : (3, 3)，每行一个轴方向，右手系
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    if weights is None:
+        cov = np.cov(pts.T)
+    else:
+        w = np.asarray(weights, dtype=np.float64)
+        w = w / (w.sum() + 1e-12)
+        mean = np.sum(w[:, None] * pts, axis=0)
+        centered = pts - mean
+        cov = (w[:, None] * centered).T @ centered
+
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(-eigvals)
+    axes = eigvecs[:, order].T.copy()
+
+    if np.linalg.det(axes) < 0:
+        axes[2] = -axes[2]
+    return axes
+
+
+def rotation_matrix_from_euler(angles, order='xyz'):
+    """
+    由欧拉角构造旋转矩阵。
+
+    Parameters
+    ----------
+    angles : (3,)  rx, ry, rz（弧度）
+    order : 'xyz' 或 'zyx'
+
+    Returns
+    -------
+    R : (3, 3)
+    """
+    ax, ay, az = angles
+    cx, sx = np.cos(ax), np.sin(ax)
+    cy, sy = np.cos(ay), np.sin(ay)
+    cz, sz = np.cos(az), np.sin(az)
+
+    Rx = np.array([[1, 0, 0],
+                   [0, cx, -sx],
+                   [0, sx, cx]], dtype=np.float64)
+    Ry = np.array([[cy, 0, sy],
+                   [0, 1, 0],
+                   [-sy, 0, cy]], dtype=np.float64)
+    Rz = np.array([[cz, -sz, 0],
+                   [sz, cz, 0],
+                   [0, 0, 1]], dtype=np.float64)
+
+    if order == 'xyz':
+        return Rx @ Ry @ Rz
+    elif order == 'zyx':
+        return Rz @ Ry @ Rx
+    else:
+        raise ValueError(f"Unknown euler order: {order}")
+
+
+def optimize_obb_axes(points, initial_axes, method='Powell', max_iter=200):
+    """
+    数值优化最小化包围盒体积，从 initial_axes 出发搜索最佳旋转。
+    """
+    from scipy.optimize import minimize
+
+    def objective(angles):
+        R = rotation_matrix_from_euler(angles)
+        axes = initial_axes @ R.T
+        for i in range(3):
+            axes[i] = normalize(axes[i])
+        return compute_obb_volume(points, axes)
+
+    res = minimize(objective, x0=np.zeros(3), method=method,
+                   options={'maxiter': max_iter})
+    R_opt = rotation_matrix_from_euler(res.x)
+    axes = initial_axes @ R_opt.T
+    for i in range(3):
+        axes[i] = normalize(axes[i])
+    if np.linalg.det(axes) < 0:
+        axes[2] = -axes[2]
+    return axes
+
+
+def build_frame_from_obb(points, axes):
+    """
+    由 OBB 轴和点集构造世界↔局部变换矩阵。
+    """
+    origin, extents = points_bounding_box(points, axes)
+    R = axes.T  # 局部 -> 世界的旋转
+
+    T_world_to_local = np.eye(4)
+    T_world_to_local[:3, :3] = axes
+    T_world_to_local[:3, 3] = -axes @ origin
+
+    T_local_to_world = np.eye(4)
+    T_local_to_world[:3, :3] = R
+    T_local_to_world[:3, 3] = origin
+
+    return T_world_to_local, T_local_to_world, axes[0], axes[1], axes[2], origin, extents
+
+
+def evaluate_obb_fit(mesh, origin, axes, extents):
+    """
+    评估网格与拟合 OBB 的吻合程度。
+    """
+    centers = mesh.triangles_center
+    local = (centers - origin) @ axes.T
+    half = extents / 2.0
+    inside = np.all(np.abs(local) <= half, axis=1)
+    areas = mesh.area_faces
+    total_area = areas.sum()
+    inside_ratio = float(np.sum(areas[inside]) / total_area) if total_area > 0 else 0.0
+
+    outside_dist = np.maximum(0, np.max(np.abs(local) - half, axis=1))
+    outside_mask = outside_dist > 0
+
+    return {
+        'inside_ratio': inside_ratio,
+        'max_outside_distance': float(np.max(outside_dist)),
+        'mean_outside_distance': float(np.mean(outside_dist[outside_mask])) if np.any(outside_mask) else 0.0,
+        'rms_outside_distance': float(np.sqrt(np.mean(outside_dist[outside_mask]**2))) if np.any(outside_mask) else 0.0,
+    }
+
+
+def build_box_aligned_frame_voxel(mesh, grid_size=128, optimize=True,
+                                  voxel_method='surface'):
+    """
+    针对音箱、手机等长方体扫描网格，基于体素 OBB 建立局部正交坐标系。
+
+    坐标系约定：
+      u_x : PCA 第一主成分（最长方向）
+      u_y : PCA 第二主成分
+      u_z : u_x × u_y
+      原点：OBB 几何中心
+    """
+    voxel = voxelize_mesh(mesh, grid_size=grid_size, method=voxel_method)
+    points = get_occupied_voxels(voxel, method=voxel_method)
+
+    if len(points) < 3:
+        raise ValueError("Too few occupied voxels to estimate OBB.")
+
+    axes = initial_obb_axes_pca(points)
+    if optimize:
+        axes = optimize_obb_axes(points, axes)
+
+    T_w2l, T_l2w, u_x, u_y, u_z, origin, extents = build_frame_from_obb(points, axes)
+    fit_info = evaluate_obb_fit(mesh, origin, axes, extents)
+
+    return T_w2l, T_l2w, u_x, u_y, u_z, origin, extents, fit_info
