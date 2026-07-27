@@ -154,19 +154,12 @@ def build_initial_visualization(mesh, axes, origin, extents=None, method='voxel'
     return scene
 
 
-def build_final_visualization(mesh, axes, origin, extents):
-    """精细处理可视化：变换后网格 + 局部坐标架 + 拟合长方体盒子。"""
+def build_final_visualization(mesh_transformed, axes, origin, extents):
+    """精细处理可视化：已变换网格 + 局部坐标架 + 拟合长方体盒子。"""
     scene = trimesh.Scene()
 
-    R = axes.T
-    T_w2l = np.eye(4)
-    T_w2l[:3, :3] = axes
-    T_w2l[:3, 3] = -axes @ origin
-
-    vis_mesh = mesh.copy()
-    vis_mesh.apply_transform(T_w2l)
-    colorize_by_box_faces(vis_mesh, np.eye(3), np.zeros(3))
-    scene.add_geometry(vis_mesh)
+    colorize_by_box_faces(mesh_transformed, np.eye(3), np.zeros(3))
+    scene.add_geometry(mesh_transformed)
 
     box = create_oriented_box(np.zeros(3), np.eye(3), extents, color=[255, 165, 0, 40])
     scene.add_geometry(box)
@@ -204,6 +197,8 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
         最终或中间可视化场景。
     world_scene : trimesh.Scene
         世界坐标系下的可视化场景。
+    transformed_mesh : trimesh.Trimesh
+        已变换到新坐标系的原始网格（不含拟合盒子）。
     stats : dict
         统计信息。
     """
@@ -242,7 +237,7 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
         scene = trimesh.Scene(mesh.copy())
         colorize_defects(scene.geometry[list(scene.geometry.keys())[0]],
                          open_face_mask, nonmanifold_face_mask)
-        return scene, world_scene, stats
+        return scene, world_scene, mesh.copy(), stats
 
     # num-passes 1: 初步处理
     if num_passes == 1:
@@ -262,9 +257,12 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
         print(f"  extents = {extents.round(4)}")
         print(f"  fit     = {fit}")
 
+        mesh_transformed = mesh.copy()
+        mesh_transformed.apply_transform(T_w2l)
+
         world_scene = build_initial_visualization(mesh, axes, origin, extents=extents, method=method)
-        scene = build_final_visualization(mesh, axes, origin, extents)
-        return scene, world_scene, stats
+        scene = build_final_visualization(mesh_transformed, axes, origin, extents)
+        return scene, world_scene, mesh_transformed, stats
 
     # num-passes 2: 精细处理
     if num_passes == 2:
@@ -284,9 +282,12 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
         print(f"  extents = {extents.round(4)}")
         print(f"  fit     = {fit}")
 
+        mesh_transformed = mesh.copy()
+        mesh_transformed.apply_transform(T_w2l)
+
         world_scene = build_initial_visualization(mesh, axes, origin, extents=extents, method=method)
-        scene = build_final_visualization(mesh, axes, origin, extents)
-        return scene, world_scene, stats
+        scene = build_final_visualization(mesh_transformed, axes, origin, extents)
+        return scene, world_scene, mesh_transformed, stats
 
 
 def main():
@@ -329,7 +330,7 @@ def main():
         else:
             raise ValueError("--shell 需要 1、3 或 6 个数值")
 
-    scene, world_scene, stats = process_brick(
+    scene, world_scene, transformed_mesh, stats = process_brick(
         mesh,
         method=args.method,
         num_passes=args.num_passes,
@@ -339,8 +340,7 @@ def main():
     )
 
     if args.output:
-        out_mesh = scene.dump(concatenate=True)
-        out_mesh.export(args.output)
+        transformed_mesh.export(args.output)
         print(f"Processed mesh saved to {args.output}")
 
     if args.show:
