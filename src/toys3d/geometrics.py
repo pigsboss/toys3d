@@ -1461,7 +1461,225 @@ def build_box_aligned_frame_normal(mesh, n_clusters=6, rng=None):
 
 
 # ------------------------------------------------------------------
-#  新增：基于网格几何的平面检测 + 二维 OBB 建立长方体坐标系
+#  新增辅助函数：侧面检测与合并
+# ------------------------------------------------------------------
+
+def detect_side_planes(centers, normals, areas, u_z, n_side_planes=4,
+                       distance_thr_ratio=0.02, normal_thr_deg=30.0,
+                       max_iter=5000, rng=None):
+    """
+    在侧壁带内用 RANSAC 检测侧面平面。
+    侧面法向必须接近水平（垂直于 u_z）。
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    N = len(centers)
+    bbox_diag = np.linalg.norm(centers.max(axis=0) - centers.min(axis=0))
+    d_thr = distance_thr_ratio * bbox_diag
+    cos_thr = np.cos(np.deg2rad(normal_thr_deg))
+    z_cos_thr = np.sin(np.deg2rad(30.0))  # 法向与水平面夹角不超过 30 度
+
+    remaining = np.ones(N, dtype=bool)
+    planes = []
+
+    for _ in range(n_side_planes):
+        idx_rem = np.flatnonzero(remaining)
+        if len(idx_rem) < 10:
+            break
+
+        c_rem = centers[idx_rem]
+        n_rem = normals[idx_rem]
+        a_rem = areas[idx_rem]
+
+        best_score = 0.0
+        best_plane = None
+        best_inliers = None
+
+        for _ in range(max_iter):
+            sample = rng.choice(len(idx_rem), size=3, replace=False)
+            p = c_rem[sample]
+            pn = np.cross(p[1] - p[0], p[2] - p[0])
+            pn_norm = np.linalg.norm(pn)
+            if pn_norm < 1e-12:
+                continue
+            pn = pn / pn_norm
+
+            # 侧面法向应接近水平
+            if abs(np.dot(pn, u_z)) > z_cos_thr:
+                continue
+
+            dists = signed_distance_to_plane(c_rem, p.mean(axis=0), pn)
+            normal_dots = np.abs(n_rem @ pn)
+            inliers = (np.abs(dists) <= d_thr) & (normal_dots >= cos_thr)
+
+            score = float(np.sum(a_rem[inliers]))
+            if score > best_score:
+                best_score = score
+                best_plane = (pn, p.mean(axis=0))
+                best_inliers = inliers
+
+        if best_plane is None:
+            break
+
+        global_inliers = np.zeros(N, dtype=bool)
+        global_inliers[idx_rem] = best_inliers
+
+        # 精化平面
+        pts_in = centers[global_inliers]
+        weights = areas[global_inliers]
+        mean = np.sum(weights[:, None] * pts_in, axis=0) / np.sum(weights)
+        centered = pts_in - mean
+        cov = (weights[:, None] * centered).T @ centered
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        refined_normal = eigvecs[:, np.argmin(eigvals)]
+        if np.dot(refined_normal, best_plane[0]) < 0:
+            refined_normal = -refined_normal
+
+        # 重新选择内点，保持水平约束
+        dists = signed_distance_to_plane(centers, mean, refined_normal)
+        normal_dots = np.abs(normals @ refined_normal)
+        global_inliers = (np.abs(dists) <= d_thr) & \
+                         (normal_dots >= cos_thr) & \
+                         (np.abs(normals @ u_z) <= z_cos_thr)
+
+        planes.append({'normal': refined_normal, 'origin': mean})
+        remaining &= ~global_inliers
+
+    return planes
+
+
+def merge_side_planes_to_xy(planes, u_z):
+    """
+    把检测到的侧面法向合并为 x、y 两个正交水平方向。
+    """
+    # 投影到水平面
+    horizontals = []
+    for p in planes:
+        n = p['normal']
+        h = n - np.dot(n, u_z) * u_z
+        hn = np.linalg.norm(h)
+        if hn > 1e-12:
+            horizontals.append(h / hn)
+
+    if len(horizontals) < 2:
+        raise ValueError(f"Only {len(horizontals)} horizontal normals, need 2.")
+
+    # 用迭代聚类把法向分成两组（应近似正交）
+    g0 = np.array(horizontals[0])
+    g1 = np.cross(u_z, g0)
+    for _ in range(10):
+        cluster0, cluster1 = [], []
+        for h in horizontals:
+            if abs(np.dot(h, g0)) >= abs(np.dot(h, g1)):
+                cluster0.append(h)
+            else:
+                cluster1.append(h)
+        if len(cluster0) == 0 or len(cluster1) == 0:
+            break
+        new_g0 = np.mean(cluster0, axis=0)
+        new_g1 = np.mean(cluster1, axis=0)
+        new_g0 = new_g0 - np.dot(new_g0, u_z) * u_z
+        new_g1 = new_g1 - np.dot(new_g1, u_z) * u_z
+        if np.linalg.norm(new_g0) < 1e-12 or np.linalg.norm(new_g1) < 1e-12:
+            break
+        g0, g1 = new_g0, new_g1
+
+    u_x = normalize(g0)
+    u_y = normalize(g1 - np.dot(g1, u_x) * u_x)
+
+    # 右手系
+    if np.dot(np.cross(u_x, u_y), u_z) < 0:
+        u_y = -u_y
+
+    return u_x, u_y
+
+
+# ------------------------------------------------------------------
+#  新增：基于网格几何的平面检测 + 侧壁 RANSAC 建立长方体坐标系
+# ------------------------------------------------------------------
+
+def build_box_aligned_frame_mesh(mesh, distance_thr_ratio=0.02,
+                                 normal_thr_deg=30.0, max_iter=5000,
+                                 shell_depths=None, rng=None):
+    """
+    基于网格几何的平面检测 + 侧壁带 RANSAC 建立长方体坐标系。
+
+    shell_depths: ((x_neg, x_pos), (y_neg, y_pos), (z_neg, z_pos))
+                  各轴向正负方向的壳厚度比率，用于排除表面特征区域。
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    if shell_depths is None:
+        shell_depths = ((0.1, 0.1), (0.1, 0.1), (0.2, 0.2))
+
+    # 1. 检测顶/底两个主导平面，确定 z 轴
+    planes = detect_dominant_planes(
+        mesh, n_planes=2, distance_thr_ratio=distance_thr_ratio,
+        normal_thr_deg=normal_thr_deg, max_iter=max_iter, rng=rng
+    )
+    if len(planes) < 2:
+        raise ValueError(f"Only {len(planes)} dominant plane found, need 2.")
+
+    n0, n1 = planes[0]['normal'], planes[1]['normal']
+    if np.dot(n0, n1) > 0:
+        n1 = -n1
+    u_z = average_antiparallel_directions(n0, n1)
+
+    # 2. 根据 z 方向壳厚度构造侧壁带
+    proj_z = mesh.vertices @ u_z
+    z_min, z_max = proj_z.min(), proj_z.max()
+    z_extent = z_max - z_min
+    z_neg, z_pos = shell_depths[2]
+    z_lo = z_min + z_neg * z_extent
+    z_hi = z_max - z_pos * z_extent
+
+    centers_z = mesh.triangles_center @ u_z
+    side_mask = (centers_z > z_lo) & (centers_z < z_hi)
+
+    print(f"  Side band: z in [{z_lo:.3f}, {z_hi:.3f}], "
+          f"faces={np.sum(side_mask)}")
+
+    if np.sum(side_mask) < 10:
+        raise ValueError("Too few faces in side band; check shell depths.")
+
+    # 3. 在侧壁带内 RANSAC 检测 4 个侧面
+    side_centers = mesh.triangles_center[side_mask]
+    side_normals = mesh.face_normals[side_mask]
+    side_areas = mesh.area_faces[side_mask]
+
+    side_planes = detect_side_planes(
+        side_centers, side_normals, side_areas, u_z,
+        n_side_planes=4, distance_thr_ratio=distance_thr_ratio,
+        normal_thr_deg=normal_thr_deg, max_iter=max_iter, rng=rng
+    )
+
+    if len(side_planes) < 2:
+        raise ValueError(f"Only {len(side_planes)} side plane found, need 2.")
+
+    # 4. 合并侧面为 x、y 轴
+    u_x, u_y = merge_side_planes_to_xy(side_planes, u_z)
+
+    # 5. 计算包围盒中心和尺寸
+    axes = np.vstack([u_x, u_y, u_z])
+    origin, extents = points_bounding_box(mesh.vertices, axes)
+
+    # 6. 变换矩阵
+    T_w2l = np.eye(4)
+    T_w2l[:3, :3] = axes
+    T_w2l[:3, 3] = -axes @ origin
+
+    T_l2w = np.eye(4)
+    T_l2w[:3, :3] = axes.T
+    T_l2w[:3, 3] = origin
+
+    fit_info = evaluate_obb_fit(mesh, origin, axes, extents)
+
+    return T_w2l, T_l2w, u_x, u_y, u_z, origin, extents, fit_info
+
+
+# ------------------------------------------------------------------
+#  新增：基于网格几何的平面检测 + 二维 OBB 建立长方体坐标系（原函数保留）
 # ------------------------------------------------------------------
 
 def detect_dominant_planes(mesh, n_planes=2, distance_thr_ratio=0.02,
@@ -1586,83 +1804,6 @@ def fit_obb_2d(points_2d):
             best_axes = np.array([[c, -s], [s, c]])
 
     return best_axes, best_area
-
-
-def build_box_aligned_frame_mesh(mesh, distance_thr_ratio=0.02,
-                                 normal_thr_deg=30.0, max_iter=5000,
-                                 rng=None):
-    """
-    基于网格几何的平面检测 + 二维 OBB 建立长方体坐标系。
-
-    流程：
-      1. RANSAC 检测两个面积最大的主导平面（顶/底面）
-      2. 它们的法向平均得到 z 轴
-      3. 把顶/底面内点投影到垂直于 z 的平面
-      4. 二维 OBB 找 x、y 轴
-      5. 计算包围盒中心和尺寸
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-
-    planes = detect_dominant_planes(
-        mesh, n_planes=2, distance_thr_ratio=distance_thr_ratio,
-        normal_thr_deg=normal_thr_deg, max_iter=max_iter, rng=rng
-    )
-
-    if len(planes) < 2:
-        raise ValueError(f"Only {len(planes)} dominant plane found, need 2.")
-
-    # z 轴：两个主导平面法向的平均
-    n0 = planes[0]['normal']
-    n1 = planes[1]['normal']
-    if np.dot(n0, n1) > 0:
-        n1 = -n1
-    u_z = average_antiparallel_directions(n0, n1)
-
-    # 构造 xy 平面的临时正交基
-    if abs(u_z[2]) < 0.9:
-        temp_x = np.cross(u_z, [0, 0, 1])
-    else:
-        temp_x = np.cross(u_z, [1, 0, 0])
-    temp_x = temp_x / np.linalg.norm(temp_x)
-    temp_y = np.cross(u_z, temp_x)
-
-    # 用所有网格顶点投影到 xy 平面，利用整体轮廓确定 x、y 轴
-    pts_3d = mesh.vertices
-
-    # 投影到 xy 平面
-    proj_x = pts_3d @ temp_x
-    proj_y = pts_3d @ temp_y
-    proj_2d = np.column_stack([proj_x, proj_y])
-
-    # 二维 OBB
-    axes_2d, area_2d = fit_obb_2d(proj_2d)
-    print(f"  2D OBB area: {area_2d:.3f}")
-
-    u_x = axes_2d[0, 0] * temp_x + axes_2d[0, 1] * temp_y
-    u_y = axes_2d[1, 0] * temp_x + axes_2d[1, 1] * temp_y
-
-    # 右手系
-    if np.dot(np.cross(u_x, u_y), u_z) < 0:
-        u_y = -u_y
-
-    # 计算包围盒中心和尺寸
-    axes = np.vstack([u_x, u_y, u_z])
-    origin, extents = points_bounding_box(mesh.vertices, axes)
-
-    # 变换矩阵
-    R = axes.T
-    T_w2l = np.eye(4)
-    T_w2l[:3, :3] = axes
-    T_w2l[:3, 3] = -axes @ origin
-
-    T_l2w = np.eye(4)
-    T_l2w[:3, :3] = R
-    T_l2w[:3, 3] = origin
-
-    fit_info = evaluate_obb_fit(mesh, origin, axes, extents)
-
-    return T_w2l, T_l2w, u_x, u_y, u_z, origin, extents, fit_info
 
 
 # ------------------------------------------------------------------

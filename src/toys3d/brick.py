@@ -184,7 +184,7 @@ def build_final_visualization(mesh, axes, origin, extents):
 # ------------------------------------------------------------------
 
 def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
-                  grid_size=128):
+                  grid_size=128, shell_depths=None):
     """
     处理长方体扫描网格，建立局部正交坐标系。
 
@@ -195,6 +195,8 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
     num_passes : 0 | 1 | 2
     repair_mode : bool
     grid_size : int
+    shell_depths : tuple of 3 tuples
+        ((x_neg, x_pos), (y_neg, y_pos), (z_neg, z_pos))
 
     Returns
     -------
@@ -252,7 +254,7 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
         else:
             print("\n[Pass 1] Initial frame estimation using mesh-based planar detection")
             T_w2l, T_l2w, ux, uy, uz, origin, extents, fit = build_box_aligned_frame_mesh(
-                mesh, distance_thr_ratio=0.02
+                mesh, distance_thr_ratio=0.02, shell_depths=shell_depths
             )
 
         axes = np.vstack([ux, uy, uz])
@@ -274,7 +276,7 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
         else:
             print("\n[Pass 2] Refined frame estimation using mesh-based planar detection + 2D OBB")
             T_w2l, T_l2w, ux, uy, uz, origin, extents, fit = build_box_aligned_frame_mesh(
-                mesh, distance_thr_ratio=0.02
+                mesh, distance_thr_ratio=0.02, shell_depths=shell_depths
             )
 
         axes = np.vstack([ux, uy, uz])
@@ -298,6 +300,10 @@ def main():
                         help="处理阶段：0=检测/修复，1=初步处理，2=精细处理（默认2）")
     parser.add_argument("--grid-size", type=int, default=128,
                         help="体素化分辨率（默认128）")
+    parser.add_argument("--shell", type=float, nargs='+', default=None,
+                        help="壳厚度比率，支持：1 个值 s（各方向统一）、"
+                             "3 个值 x y z（正负对称）、"
+                             "6 个值 xn xp yn yp zn zp（各方向独立）")
     parser.add_argument("--repair", action="store_true",
                         help="尝试自动修复网格")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
@@ -309,12 +315,27 @@ def main():
         print("Multiple meshes detected, merged.")
     print(f"Sup, loading model: {args.input_file}")
 
+    # 解析 --shell 参数
+    shell_depths = None
+    if args.shell is not None:
+        s = args.shell
+        if len(s) == 1:
+            v = s[0]
+            shell_depths = ((v, v), (v, v), (v, v))
+        elif len(s) == 3:
+            shell_depths = ((s[0], s[0]), (s[1], s[1]), (s[2], s[2]))
+        elif len(s) == 6:
+            shell_depths = ((s[0], s[1]), (s[2], s[3]), (s[4], s[5]))
+        else:
+            raise ValueError("--shell 需要 1、3 或 6 个数值")
+
     scene, world_scene, stats = process_brick(
         mesh,
         method=args.method,
         num_passes=args.num_passes,
         repair_mode=args.repair,
-        grid_size=args.grid_size
+        grid_size=args.grid_size,
+        shell_depths=shell_depths
     )
 
     if args.output:
