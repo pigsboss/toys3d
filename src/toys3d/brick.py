@@ -17,7 +17,7 @@ from toys3d.geometrics import (
     repair_nonmanifold_edges,
     fill_small_holes,
     build_box_aligned_frame_voxel,
-    build_box_aligned_frame_normal,
+    build_box_aligned_frame_mesh,
     normalize,
 )
 
@@ -191,7 +191,7 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
     Parameters
     ----------
     mesh : trimesh.Trimesh
-    method : 'voxel' | 'normal'
+    method : 'voxel' | 'mesh'
     num_passes : 0 | 1 | 2
     repair_mode : bool
     grid_size : int
@@ -250,9 +250,9 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
                 mesh, grid_size=grid_size, optimize=False
             )
         else:
-            print("\n[Pass 1] Initial direction estimation using face normal clustering")
-            T_w2l, T_l2w, ux, uy, uz, origin, extents, fit = build_box_aligned_frame_normal(
-                mesh, n_clusters=6
+            print("\n[Pass 1] Initial frame estimation using mesh-based planar detection")
+            T_w2l, T_l2w, ux, uy, uz, origin, extents, fit = build_box_aligned_frame_mesh(
+                mesh, distance_thr_ratio=0.02
             )
 
         axes = np.vstack([ux, uy, uz])
@@ -272,9 +272,9 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
                 mesh, grid_size=grid_size, optimize=True
             )
         else:
-            print("\n[Pass 2] Refined frame estimation using face normal clustering + orthogonalization")
-            T_w2l, T_l2w, ux, uy, uz, origin, extents, fit = build_box_aligned_frame_normal(
-                mesh, n_clusters=6
+            print("\n[Pass 2] Refined frame estimation using mesh-based planar detection + 2D OBB")
+            T_w2l, T_l2w, ux, uy, uz, origin, extents, fit = build_box_aligned_frame_mesh(
+                mesh, distance_thr_ratio=0.02
             )
 
         axes = np.vstack([ux, uy, uz])
@@ -292,8 +292,8 @@ def main():
     parser = argparse.ArgumentParser(description="处理长方体扫描网格（音箱/手机/砖块），建立正交坐标系。")
     parser.add_argument("input_file", help="输入网格文件路径 (stl/ply/obj)")
     parser.add_argument("--output", help="保存处理后的网格路径 (可选)")
-    parser.add_argument("--method", type=str, default='voxel', choices=['voxel', 'normal'],
-                        help="处理方法：voxel=体素化OBB，normal=三角面片法向聚类（默认voxel）")
+    parser.add_argument("--method", type=str, default='voxel', choices=['voxel', 'mesh'],
+                        help="处理方法：voxel=体素化OBB，mesh=基于网格几何的平面检测+二维OBB（默认voxel）")
     parser.add_argument("--num-passes", type=int, default=2, choices=[0, 1, 2],
                         help="处理阶段：0=检测/修复，1=初步处理，2=精细处理（默认2）")
     parser.add_argument("--grid-size", type=int, default=128,

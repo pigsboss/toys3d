@@ -1459,6 +1459,212 @@ def build_box_aligned_frame_normal(mesh, n_clusters=6, rng=None):
 
     return T_w2l, T_l2w, ux, uy, uz, origin, extents, fit_info
 
+
+# ------------------------------------------------------------------
+#  新增：基于网格几何的平面检测 + 二维 OBB 建立长方体坐标系
+# ------------------------------------------------------------------
+
+def detect_dominant_planes(mesh, n_planes=2, distance_thr_ratio=0.02,
+                           normal_thr_deg=30.0, max_iter=5000, rng=None):
+    """
+    用 RANSAC 检测网格中面积最大的 n_planes 个主导平面。
+
+    Returns
+    -------
+    planes : list of dict
+        每个元素包含：
+        - 'normal' : (3,) 平面单位法向
+        - 'origin' : (3,) 平面上一点
+        - 'mask'   : (N,) bool 内点面片掩码
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    centers = mesh.triangles_center
+    normals = mesh.face_normals
+    areas = mesh.area_faces
+    N = len(mesh.faces)
+
+    bbox_diag = np.linalg.norm(mesh.bounding_box.extents)
+    d_thr = distance_thr_ratio * bbox_diag
+    cos_thr = np.cos(np.deg2rad(normal_thr_deg))
+
+    remaining = np.ones(N, dtype=bool)
+    planes = []
+
+    for _ in range(n_planes):
+        idx_remaining = np.flatnonzero(remaining)
+        if len(idx_remaining) < 10:
+            break
+
+        c_rem = centers[idx_remaining]
+        n_rem = normals[idx_remaining]
+        a_rem = areas[idx_remaining]
+
+        best_score = 0.0
+        best_plane = None
+        best_inliers = None
+
+        for _ in range(max_iter):
+            sample = rng.choice(len(idx_remaining), size=3, replace=False)
+            p = c_rem[sample]
+            v1 = p[1] - p[0]
+            v2 = p[2] - p[0]
+            pn = np.cross(v1, v2)
+            pn_norm = np.linalg.norm(pn)
+            if pn_norm < 1e-12:
+                continue
+            pn = pn / pn_norm
+
+            dists = signed_distance_to_plane(c_rem, p.mean(axis=0), pn)
+            normal_dots = np.abs(n_rem @ pn)
+            inliers = (np.abs(dists) <= d_thr) & (normal_dots >= cos_thr)
+
+            score = float(np.sum(a_rem[inliers]))
+            if score > best_score:
+                best_score = score
+                best_plane = (pn, p.mean(axis=0))
+                best_inliers = inliers
+
+        if best_plane is None:
+            break
+
+        # 用所有内点精化平面
+        global_inliers = np.zeros(N, dtype=bool)
+        global_inliers[idx_remaining] = best_inliers
+
+        pts_in = centers[global_inliers]
+        weights = areas[global_inliers]
+        if np.sum(weights) < 1e-12:
+            break
+
+        # 加权最小二乘拟合平面
+        mean = np.sum(weights[:, None] * pts_in, axis=0) / np.sum(weights)
+        centered = pts_in - mean
+        cov = (weights[:, None] * centered).T @ centered
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        refined_normal = eigvecs[:, np.argmin(eigvals)]
+
+        # 确保法向与原始采样法向一致
+        if np.dot(refined_normal, best_plane[0]) < 0:
+            refined_normal = -refined_normal
+
+        dists = signed_distance_to_plane(centers, mean, refined_normal)
+        normal_dots = np.abs(normals @ refined_normal)
+        global_inliers = (np.abs(dists) <= d_thr) & (normal_dots >= cos_thr)
+
+        planes.append({
+            'normal': refined_normal,
+            'origin': mean,
+            'mask': global_inliers,
+        })
+        remaining &= ~global_inliers
+
+    return planes
+
+
+def fit_obb_2d(points_2d):
+    """
+    对二维点集拟合最小面积包围矩形，返回矩形两条边的单位方向。
+    """
+    if len(points_2d) < 3:
+        raise ValueError("Too few points for 2D OBB")
+
+    angles = np.linspace(0, np.pi / 2, 180, endpoint=False)
+    best_area = np.inf
+    best_axes = None
+
+    for theta in angles:
+        c, s = np.cos(theta), np.sin(theta)
+        R = np.array([[c, s], [-s, c]])
+        rot = points_2d @ R.T
+        w = rot[:, 0].max() - rot[:, 0].min()
+        h = rot[:, 1].max() - rot[:, 1].min()
+        area = w * h
+        if area < best_area:
+            best_area = area
+            best_axes = np.array([[c, -s], [s, c]])
+
+    return best_axes, best_area
+
+
+def build_box_aligned_frame_mesh(mesh, distance_thr_ratio=0.02,
+                                 normal_thr_deg=30.0, max_iter=5000,
+                                 rng=None):
+    """
+    基于网格几何的平面检测 + 二维 OBB 建立长方体坐标系。
+
+    流程：
+      1. RANSAC 检测两个面积最大的主导平面（顶/底面）
+      2. 它们的法向平均得到 z 轴
+      3. 把顶/底面内点投影到垂直于 z 的平面
+      4. 二维 OBB 找 x、y 轴
+      5. 计算包围盒中心和尺寸
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    planes = detect_dominant_planes(
+        mesh, n_planes=2, distance_thr_ratio=distance_thr_ratio,
+        normal_thr_deg=normal_thr_deg, max_iter=max_iter, rng=rng
+    )
+
+    if len(planes) < 2:
+        raise ValueError(f"Only {len(planes)} dominant plane found, need 2.")
+
+    # z 轴：两个主导平面法向的平均
+    n0 = planes[0]['normal']
+    n1 = planes[1]['normal']
+    if np.dot(n0, n1) > 0:
+        n1 = -n1
+    u_z = average_antiparallel_directions(n0, n1)
+
+    # 构造 xy 平面的临时正交基
+    if abs(u_z[2]) < 0.9:
+        temp_x = np.cross(u_z, [0, 0, 1])
+    else:
+        temp_x = np.cross(u_z, [1, 0, 0])
+    temp_x = temp_x / np.linalg.norm(temp_x)
+    temp_y = np.cross(u_z, temp_x)
+
+    # 收集顶/底面内点
+    inlier_mask = planes[0]['mask'] | planes[1]['mask']
+    pts_3d = mesh.triangles_center[inlier_mask]
+    areas = mesh.area_faces[inlier_mask]
+
+    # 加权投影到 xy 平面
+    proj_x = pts_3d @ temp_x
+    proj_y = pts_3d @ temp_y
+    proj_2d = np.column_stack([proj_x, proj_y])
+
+    # 二维 OBB
+    axes_2d, _ = fit_obb_2d(proj_2d)
+    u_x = axes_2d[0, 0] * temp_x + axes_2d[0, 1] * temp_y
+    u_y = axes_2d[1, 0] * temp_x + axes_2d[1, 1] * temp_y
+
+    # 右手系
+    if np.dot(np.cross(u_x, u_y), u_z) < 0:
+        u_y = -u_y
+
+    # 计算包围盒中心和尺寸
+    axes = np.vstack([u_x, u_y, u_z])
+    origin, extents = points_bounding_box(mesh.vertices, axes)
+
+    # 变换矩阵
+    R = axes.T
+    T_w2l = np.eye(4)
+    T_w2l[:3, :3] = axes
+    T_w2l[:3, 3] = -axes @ origin
+
+    T_l2w = np.eye(4)
+    T_l2w[:3, :3] = R
+    T_l2w[:3, 3] = origin
+
+    fit_info = evaluate_obb_fit(mesh, origin, axes, extents)
+
+    return T_w2l, T_l2w, u_x, u_y, u_z, origin, extents, fit_info
+
+
 # ------------------------------------------------------------------
 #  新增：网格缺陷检测与修复工具
 # ------------------------------------------------------------------
