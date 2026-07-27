@@ -1627,18 +1627,18 @@ def build_box_aligned_frame_mesh(mesh, distance_thr_ratio=0.02,
     temp_x = temp_x / np.linalg.norm(temp_x)
     temp_y = np.cross(u_z, temp_x)
 
-    # 收集顶/底面内点
-    inlier_mask = planes[0]['mask'] | planes[1]['mask']
-    pts_3d = mesh.triangles_center[inlier_mask]
-    areas = mesh.area_faces[inlier_mask]
+    # 用所有网格顶点投影到 xy 平面，利用整体轮廓确定 x、y 轴
+    pts_3d = mesh.vertices
 
-    # 加权投影到 xy 平面
+    # 投影到 xy 平面
     proj_x = pts_3d @ temp_x
     proj_y = pts_3d @ temp_y
     proj_2d = np.column_stack([proj_x, proj_y])
 
     # 二维 OBB
-    axes_2d, _ = fit_obb_2d(proj_2d)
+    axes_2d, area_2d = fit_obb_2d(proj_2d)
+    print(f"  2D OBB area: {area_2d:.3f}")
+
     u_x = axes_2d[0, 0] * temp_x + axes_2d[0, 1] * temp_y
     u_y = axes_2d[1, 0] * temp_x + axes_2d[1, 1] * temp_y
 
