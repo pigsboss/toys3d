@@ -43,7 +43,10 @@ def closest_points_on_lines(dir1, pt1, dir2, pt2):
     denom = a * c - b * b
     if abs(denom) < 1e-9:          # parallel
         sc = 0.0
-        tc = (b > c and d / b) or (e / c)
+        if abs(b) < 1e-12:
+            tc = e / c if abs(c) > 1e-12 else 0.0
+        else:
+            tc = d / b
     else:
         sc = (b * e - c * d) / denom
         tc = (a * e - b * d) / denom
@@ -1022,7 +1025,9 @@ def process_handlebar(mesh,
     scene_transformed : trimesh.Scene
         变换后网格和坐标轴的可视化场景。
     world_scene : trimesh.Scene
-        原始世界坐标系下的可视化场景（含轴线、公垂线段、中点、坐标架）。
+        原始世界坐标系下的可视化场景。
+    transformed_mesh : trimesh.Trimesh
+        已变换到新坐标系的原始网格（不含坐标轴等可视化对象）。
     stats : dict
         统计信息。
     """
@@ -1048,19 +1053,34 @@ def process_handlebar(mesh,
     # 修复（如果需要）
     if repair_mode and (defect_stats['open_edges'] > 0 or defect_stats['nonmanifold_edges'] > 0):
         print("\n[Repair mode] Attempting to fix mesh...")
+        max_repair_iter = 5
 
-        # 策略1：去重复/退化面
-        mesh = repair_mesh_by_removing_duplicates(mesh)
+        for iter in range(max_repair_iter):
+            print(f"\n  [Repair iter {iter}]")
 
-        # 策略2：消除非流形边
-        mesh = repair_nonmanifold_edges(mesh)
+            # 策略1：去重复/退化面
+            mesh = repair_mesh_by_removing_duplicates(mesh)
 
-        # 补洞
-        mesh = fill_small_holes(mesh)
+            # 策略2：消除非流形边
+            mesh = repair_nonmanifold_edges(mesh)
 
-        # 修复后重新统计
+            # 补洞
+            mesh = fill_small_holes(mesh)
+
+            # 检查修复结果
+            defect_stats, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+            print(f"  After iter {iter}: open_edges={defect_stats['open_edges']}, "
+                  f"nonmanifold_edges={defect_stats['nonmanifold_edges']}")
+
+            if defect_stats['open_edges'] == 0 and defect_stats['nonmanifold_edges'] == 0:
+                print("  Mesh fully repaired.")
+                break
+
+            if iter == max_repair_iter - 1:
+                print("  Reached maximum repair iterations.")
+
         stats = compute_mesh_stats(mesh)
-        print("After repair:")
+        print("\nAfter repair:")
         for k, v in stats.items():
             print(f"  {k}: {v}")
 
@@ -1527,7 +1547,7 @@ def process_handlebar(mesh,
         count = np.sum(final_labels == i)
         print(f"  {name}: {count} triangles")
 
-    return scene, world_scene, stats
+    return scene, world_scene, mesh_transformed, stats
 
 
 def colorize_mesh(mesh, final_labels):
@@ -1596,7 +1616,7 @@ def main():
     print(f"Yo, loading model: {args.input_file}")
 
     # 处理
-    transformed_scene, world_scene, stats = process_handlebar(
+    transformed_scene, world_scene, transformed_mesh, stats = process_handlebar(
         mesh,
         ransac_threshold=args.ransac_thr,
         num_passes=args.num_passes,
@@ -1608,8 +1628,7 @@ def main():
 
     # 保存输出
     if args.output:
-        out_mesh = transformed_scene.dump(concatenate=True)
-        out_mesh.export(args.output)
+        transformed_mesh.export(args.output)
         print(f"Processed mesh saved to {args.output}")
 
     # 可视化
