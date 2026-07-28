@@ -294,6 +294,17 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
         print(f"  After repair defects: open_edges={defect_stats['open_edges']}, "
               f"nonmanifold_edges={defect_stats['nonmanifold_edges']}")
 
+        # 打印剩余开放边界环信息
+        if defect_stats['open_edges'] > 0:
+            loops = extract_boundary_loops(mesh)
+            print(f"\nRemaining boundary loops: {len(loops)}")
+            for i, loop in enumerate(loops):
+                pts = mesh.vertices[np.array(loop)]
+                centroid = pts.mean(axis=0)
+                print(f"  Loop {i}: {len(loop)} edges, "
+                      f"centroid=({centroid[0]:.3f}, {centroid[1]:.3f}, {centroid[2]:.3f}), "
+                      f"z_range=[{pts[:,2].min():.3f}, {pts[:,2].max():.3f}]")
+
     # num-passes 0: 仅检测/修复
     if num_passes == 0:
         if repair_mode and defect_stats['open_edges'] > 0:
