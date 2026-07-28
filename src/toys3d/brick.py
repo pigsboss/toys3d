@@ -18,7 +18,6 @@ from toys3d.geometrics import (
     fill_small_holes,
     build_box_aligned_frame_voxel,
     build_box_aligned_frame_mesh,
-    normalize,
 )
 
 
@@ -119,8 +118,8 @@ def build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask):
     return scene
 
 
-def build_initial_visualization(mesh, axes, origin, extents=None, method='voxel'):
-    """初步处理可视化：原始网格 + 候选轴 + OBB 盒子（体素法）或面片按方向着色（法向法）。"""
+def build_initial_visualization(mesh, axes, origin, extents=None):
+    """初步处理可视化：原始网格 + 候选轴 + OBB 盒子。"""
     scene = trimesh.Scene()
     vis_mesh = mesh.copy()
 
@@ -257,7 +256,7 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
         mesh_transformed = mesh.copy()
         mesh_transformed.apply_transform(T_w2l)
 
-        world_scene = build_initial_visualization(mesh, axes, origin, extents=extents, method=method)
+        world_scene = build_initial_visualization(mesh, axes, origin, extents=extents)
         scene = build_final_visualization(mesh_transformed, axes, origin, extents)
         return scene, world_scene, mesh_transformed, stats
 
@@ -282,7 +281,7 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
         mesh_transformed = mesh.copy()
         mesh_transformed.apply_transform(T_w2l)
 
-        world_scene = build_initial_visualization(mesh, axes, origin, extents=extents, method=method)
+        world_scene = build_initial_visualization(mesh, axes, origin, extents=extents)
         scene = build_final_visualization(mesh_transformed, axes, origin, extents)
         return scene, world_scene, mesh_transformed, stats
 
@@ -326,6 +325,14 @@ def main():
             shell_depths = ((s[0], s[1]), (s[2], s[3]), (s[4], s[5]))
         else:
             raise ValueError("--shell 需要 1、3 或 6 个数值")
+
+        # 校验：各方向正负壳厚度之和应小于 1.0，避免壳带重叠
+        for i, (neg, pos) in enumerate(shell_depths):
+            if neg < 0 or pos < 0:
+                raise ValueError(f"--shell 分量必须非负，axis={i}")
+            if neg + pos >= 1.0:
+                raise ValueError(
+                    f"--shell 轴 {i} 正负分量之和 {neg + pos} 必须小于 1.0")
 
     scene, world_scene, transformed_mesh, stats = process_brick(
         mesh,
