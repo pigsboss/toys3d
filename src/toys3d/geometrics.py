@@ -1601,12 +1601,12 @@ def merge_side_planes_to_xy(planes, u_z):
 
 def build_box_aligned_frame_mesh(mesh, distance_thr_ratio=0.02,
                                  normal_thr_deg=30.0, max_iter=5000,
-                                 shell_depths=None, rng=None):
+                                 shell_depths=None, refine=True, rng=None):
     """
-    基于网格几何的平面检测 + 侧壁带 RANSAC 建立长方体坐标系。
+    基于网格几何的平面检测建立长方体坐标系。
 
-    shell_depths: ((x_neg, x_pos), (y_neg, y_pos), (z_neg, z_pos))
-                  各轴向正负方向的壳厚度比率，用于排除表面特征区域。
+    refine=True  (Pass 2): 检测顶/底面后，用侧壁带 RANSAC 精化侧面方向。
+    refine=False (Pass 1): 检测顶/底面后，用整体顶点投影的 2D OBB 快速估计侧面方向。
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -1626,45 +1626,65 @@ def build_box_aligned_frame_mesh(mesh, distance_thr_ratio=0.02,
         n1 = -n1
     u_z = average_antiparallel_directions(n0, n1)
 
-    # 2. 根据 z 方向壳厚度构造侧壁带
-    proj_z = mesh.vertices @ u_z
-    z_min, z_max = proj_z.min(), proj_z.max()
-    z_extent = z_max - z_min
-    z_neg, z_pos = shell_depths[2]
-    z_lo = z_min + z_neg * z_extent
-    z_hi = z_max - z_pos * z_extent
+    # 构造 xy 平面临时正交基
+    if abs(u_z[2]) < 0.9:
+        temp_x = np.cross(u_z, [0, 0, 1])
+    else:
+        temp_x = np.cross(u_z, [1, 0, 0])
+    temp_x = temp_x / np.linalg.norm(temp_x)
+    temp_y = np.cross(u_z, temp_x)
 
-    centers_z = mesh.triangles_center @ u_z
-    side_mask = (centers_z > z_lo) & (centers_z < z_hi)
+    if refine:
+        # Pass 2: 在侧壁带内精化侧面方向
+        proj_z = mesh.vertices @ u_z
+        z_min, z_max = proj_z.min(), proj_z.max()
+        z_extent = z_max - z_min
+        z_neg, z_pos = shell_depths[2]
+        z_lo = z_min + z_neg * z_extent
+        z_hi = z_max - z_pos * z_extent
 
-    print(f"  Side band: z in [{z_lo:.3f}, {z_hi:.3f}], "
-          f"faces={np.sum(side_mask)}")
+        centers_z = mesh.triangles_center @ u_z
+        side_mask = (centers_z > z_lo) & (centers_z < z_hi)
 
-    if np.sum(side_mask) < 10:
-        raise ValueError("Too few faces in side band; check shell depths.")
+        print(f"  Side band: z in [{z_lo:.3f}, {z_hi:.3f}], "
+              f"faces={np.sum(side_mask)}")
 
-    # 3. 在侧壁带内 RANSAC 检测 4 个侧面
-    side_centers = mesh.triangles_center[side_mask]
-    side_normals = mesh.face_normals[side_mask]
-    side_areas = mesh.area_faces[side_mask]
+        if np.sum(side_mask) < 10:
+            raise ValueError("Too few faces in side band; check shell depths.")
 
-    side_planes = detect_side_planes(
-        side_centers, side_normals, side_areas, u_z,
-        n_side_planes=4, distance_thr_ratio=distance_thr_ratio,
-        normal_thr_deg=normal_thr_deg, max_iter=max_iter, rng=rng
-    )
+        side_centers = mesh.triangles_center[side_mask]
+        side_normals = mesh.face_normals[side_mask]
+        side_areas = mesh.area_faces[side_mask]
 
-    if len(side_planes) < 2:
-        raise ValueError(f"Only {len(side_planes)} side plane found, need 2.")
+        side_planes = detect_side_planes(
+            side_centers, side_normals, side_areas, u_z,
+            n_side_planes=4, distance_thr_ratio=distance_thr_ratio,
+            normal_thr_deg=normal_thr_deg, max_iter=max_iter, rng=rng
+        )
 
-    # 4. 合并侧面为 x、y 轴
-    u_x, u_y = merge_side_planes_to_xy(side_planes, u_z)
+        if len(side_planes) < 2:
+            raise ValueError(f"Only {len(side_planes)} side plane found, need 2.")
 
-    # 5. 计算包围盒中心和尺寸
+        u_x, u_y = merge_side_planes_to_xy(side_planes, u_z)
+    else:
+        # Pass 1: 用所有顶点投影的 2D OBB 快速估计 x, y
+        pts_3d = mesh.vertices
+        proj_x = pts_3d @ temp_x
+        proj_y = pts_3d @ temp_y
+        proj_2d = np.column_stack([proj_x, proj_y])
+
+        axes_2d, _ = fit_obb_2d(proj_2d)
+        u_x = axes_2d[0, 0] * temp_x + axes_2d[0, 1] * temp_y
+        u_y = axes_2d[1, 0] * temp_x + axes_2d[1, 1] * temp_y
+
+        if np.dot(np.cross(u_x, u_y), u_z) < 0:
+            u_y = -u_y
+
+    # 计算包围盒中心和尺寸
     axes = np.vstack([u_x, u_y, u_z])
     origin, extents = points_bounding_box(mesh.vertices, axes)
 
-    # 6. 变换矩阵
+    # 变换矩阵
     T_w2l = np.eye(4)
     T_w2l[:3, :3] = axes
     T_w2l[:3, 3] = -axes @ origin

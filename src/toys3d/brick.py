@@ -124,10 +124,7 @@ def build_initial_visualization(mesh, axes, origin, extents=None, method='voxel'
     scene = trimesh.Scene()
     vis_mesh = mesh.copy()
 
-    if method == 'normal':
-        colorize_by_box_faces(vis_mesh, axes, origin)
-    else:
-        vis_mesh.visual.face_colors = [200, 200, 200, 255]
+    vis_mesh.visual.face_colors = [200, 200, 200, 255]
 
     scene.add_geometry(vis_mesh)
 
@@ -247,9 +244,9 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
                 mesh, grid_size=grid_size, optimize=False
             )
         else:
-            print("\n[Pass 1] Initial frame estimation using mesh-based planar detection")
+            print("\n[Pass 1] Initial frame estimation using mesh-based planar detection + 2D OBB")
             T_w2l, T_l2w, ux, uy, uz, origin, extents, fit = build_box_aligned_frame_mesh(
-                mesh, distance_thr_ratio=0.02, shell_depths=shell_depths
+                mesh, distance_thr_ratio=0.02, shell_depths=shell_depths, refine=False
             )
 
         axes = np.vstack([ux, uy, uz])
@@ -272,9 +269,9 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
                 mesh, grid_size=grid_size, optimize=True
             )
         else:
-            print("\n[Pass 2] Refined frame estimation using mesh-based planar detection + 2D OBB")
+            print("\n[Pass 2] Refined frame estimation using mesh-based planar detection + side-band RANSAC")
             T_w2l, T_l2w, ux, uy, uz, origin, extents, fit = build_box_aligned_frame_mesh(
-                mesh, distance_thr_ratio=0.02, shell_depths=shell_depths
+                mesh, distance_thr_ratio=0.02, shell_depths=shell_depths, refine=True
             )
 
         axes = np.vstack([ux, uy, uz])
