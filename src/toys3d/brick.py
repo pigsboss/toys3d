@@ -18,6 +18,7 @@ from toys3d.geometrics import (
     fill_small_holes,
     build_box_aligned_frame_voxel,
     build_box_aligned_frame_mesh,
+    extract_boundary_loops,
 )
 
 
@@ -116,6 +117,72 @@ def build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask):
                       u_z=np.array([0, 0, 1]),
                       length=max_ext * 0.5)
     return scene
+
+
+def build_remaining_boundary_visualization(mesh):
+    """
+    可视化修复后仍剩余的开放边界环。
+    每个边界环用不同颜色显示其相邻面片。
+    """
+    loops = extract_boundary_loops(mesh)
+    print(f"\nRemaining boundary loops: {len(loops)}")
+    for i, loop in enumerate(loops):
+        pts = mesh.vertices[np.array(loop)]
+        centroid = pts.mean(axis=0)
+        print(f"  Loop {i}: {len(loop)} edges, "
+              f"centroid=({centroid[0]:.3f}, {centroid[1]:.3f}, {centroid[2]:.3f}), "
+              f"z_range=[{pts[:,2].min():.3f}, {pts[:,2].max():.3f}]")
+
+    # 标记涉及边界边的面片
+    edge_face_map = {}
+    for fi, face in enumerate(mesh.faces):
+        v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
+            edge_face_map.setdefault(key, []).append(fi)
+
+    boundary_edges = [e for e, fl in edge_face_map.items() if len(fl) == 1]
+    boundary_face_indices = set()
+    for e in boundary_edges:
+        for fi in edge_face_map[e]:
+            boundary_face_indices.add(fi)
+
+    N = len(mesh.faces)
+    face_colors = np.full((N, 4), 200, dtype=np.uint8)
+    face_colors[:, 3] = 255
+
+    # 用不同颜色标记每个边界环附近的面片
+    colors = [
+        [255, 0, 0, 255],     # 红
+        [0, 255, 0, 255],     # 绿
+        [0, 0, 255, 255],     # 蓝
+        [255, 255, 0, 255],   # 黄
+        [255, 0, 255, 255],   # 紫
+        [0, 255, 255, 255],   # 青
+        [255, 128, 0, 255],   # 橙
+        [128, 0, 255, 255],   # 粉
+    ]
+
+    for i, loop in enumerate(loops):
+        color = colors[i % len(colors)]
+        for j in range(len(loop)):
+            v1, v2 = loop[j], loop[(j + 1) % len(loop)]
+            key = (v1, v2) if v1 < v2 else (v2, v1)
+            for fi in edge_face_map.get(key, []):
+                face_colors[fi] = color
+
+    vis_mesh = mesh.copy()
+    vis_mesh.visual.face_colors = face_colors
+
+    scene = trimesh.Scene(vis_mesh)
+    origin = mesh.bounding_box.centroid
+    max_ext = mesh.bounding_box.extents.max()
+    add_axes_to_scene(scene, origin=origin,
+                      u_x=np.array([1, 0, 0]),
+                      u_y=np.array([0, 1, 0]),
+                      u_z=np.array([0, 0, 1]),
+                      length=max_ext * 0.5)
+    return scene, loops
 
 
 def build_initial_visualization(mesh, axes, origin, extents=None):
@@ -229,11 +296,20 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
 
     # num-passes 0: 仅检测/修复
     if num_passes == 0:
-        world_scene = build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask)
-        scene = trimesh.Scene(mesh.copy())
-        colorize_defects(scene.geometry[list(scene.geometry.keys())[0]],
-                         open_face_mask, nonmanifold_face_mask)
-        return scene, world_scene, mesh.copy(), stats
+        if repair_mode and defect_stats['open_edges'] > 0:
+            print("\n[Repair] Showing remaining boundary loops after repair.")
+            world_scene, loops = build_remaining_boundary_visualization(mesh)
+            scene = trimesh.Scene(mesh.copy())
+            # 把世界场景的着色直接复制给简单场景
+            scene.geometry[list(scene.geometry.keys())[0]].visual.face_colors = \
+                world_scene.geometry[list(world_scene.geometry.keys())[0]].visual.face_colors
+            return scene, world_scene, mesh.copy(), stats
+        else:
+            world_scene = build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask)
+            scene = trimesh.Scene(mesh.copy())
+            colorize_defects(scene.geometry[list(scene.geometry.keys())[0]],
+                             open_face_mask, nonmanifold_face_mask)
+            return scene, world_scene, mesh.copy(), stats
 
     # num-passes 1: 初步处理
     if num_passes == 1:

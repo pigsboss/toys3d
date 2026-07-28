@@ -1781,3 +1781,61 @@ def fill_small_holes(mesh, max_loop_edges=50, verbose=True):
     out = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     out.fix_normals()
     return out
+
+
+# ------------------------------------------------------------------
+#  新增：提取开放边界环
+# ------------------------------------------------------------------
+
+def extract_boundary_loops(mesh):
+    """
+    提取网格的所有开放边界环。
+
+    Returns
+    -------
+    loops : list of list of int
+        每个元素是一个边界环的顶点索引列表。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+
+    edge_face_map = {}
+    for fi, face in enumerate(faces):
+        v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
+            edge_face_map.setdefault(key, []).append(fi)
+
+    boundary_edges = [e for e, fl in edge_face_map.items() if len(fl) == 1]
+
+    if not boundary_edges:
+        return []
+
+    adjacency = {}
+    for a, b in boundary_edges:
+        adjacency.setdefault(a, []).append(b)
+        adjacency.setdefault(b, []).append(a)
+
+    visited = set()
+    loops = []
+    for start in adjacency:
+        if start in visited:
+            continue
+        loop = [start]
+        visited.add(start)
+        prev, curr = None, start
+        while True:
+            neighbors = [v for v in adjacency[curr] if v != prev]
+            if not neighbors:
+                break
+            nxt = neighbors[0]
+            if nxt == start and len(loop) > 2:
+                break
+            if nxt in visited:
+                break
+            loop.append(nxt)
+            visited.add(nxt)
+            prev, curr = curr, nxt
+        if len(loop) >= 3:
+            loops.append(loop)
+
+    return loops
