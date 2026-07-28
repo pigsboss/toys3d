@@ -1713,51 +1713,89 @@ def repair_nonmanifold_edges(mesh, max_iterations=10, verbose=True):
 def fill_small_holes(mesh, max_loop_edges=50, verbose=True):
     """
     用质心扇形三角化封闭小边界环。
+    使用基于边界边集合的 DFS，按方向连续性在分叉处选择下一条边。
     """
     faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
 
+    # 构建 edge -> faces 映射，识别边界边
     edge_face_map = {}
     for fi, face in enumerate(faces):
         v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
         for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
             key = (a, b) if a < b else (b, a)
             edge_face_map.setdefault(key, []).append(fi)
-    boundary_edges = [e for e, fl in edge_face_map.items()
-                      if len(fl) == 1]
+
+    boundary_edges = set(e for e, fl in edge_face_map.items() if len(fl) == 1)
 
     if not boundary_edges:
         if verbose:
             print("  No boundary edges, nothing to fill.")
         return mesh
 
-    adjacency = {}
-    for a, b in boundary_edges:
-        adjacency.setdefault(a, []).append(b)
-        adjacency.setdefault(b, []).append(a)
-
-    visited = set()
+    # 稳健地提取所有边界环
     loops = []
-    for start in adjacency:
-        if start in visited:
-            continue
-        loop = [start]
-        visited.add(start)
-        prev, curr = None, start
-        while True:
-            neighbors = [v for v in adjacency[curr] if v != prev]
-            if not neighbors:
-                break
-            nxt = neighbors[0]
-            if nxt == start and len(loop) > 2:
-                break
-            if nxt in visited:
-                break
-            loop.append(nxt)
-            visited.add(nxt)
-            prev, curr = curr, nxt
-        if len(loop) >= 3:
-            loops.append(loop)
+    edge_set = set(boundary_edges)
 
+    while edge_set:
+        e0 = edge_set.pop()
+        v_start, v_curr = e0
+        loop = [v_start, v_curr]
+        v_prev = v_start
+
+        while True:
+            # 找与 v_curr 相连且未访问的边界边
+            candidates = [e for e in edge_set if v_curr in e]
+
+            if not candidates:
+                # 无法闭合，放弃这条路径
+                if verbose and len(loop) > 2:
+                    print(f"  Dropped unclosed boundary path ({len(loop)} edges)")
+                break
+
+            # 如果有多个候选，按方向连续性选择最自然的延续
+            if len(candidates) > 1:
+                dir_curr = mesh.vertices[v_curr] - mesh.vertices[v_prev]
+                dir_curr = dir_curr / (np.linalg.norm(dir_curr) + 1e-12)
+
+                best_edge = None
+                best_score = -np.inf
+                for e in candidates:
+                    v_next = e[0] if e[1] == v_curr else e[1]
+                    dir_next = mesh.vertices[v_next] - mesh.vertices[v_curr]
+                    dn = np.linalg.norm(dir_next)
+                    if dn < 1e-12:
+                        continue
+                    dir_next = dir_next / dn
+
+                    # 偏好与当前方向夹角最小的延续
+                    dot = np.dot(dir_curr, dir_next)
+                    # 惩罚反向转弯
+                    score = dot if dot >= 0 else -0.5 * dot
+                    if score > best_score:
+                        best_score = score
+                        best_edge = e
+                next_edge = best_edge
+            else:
+                next_edge = candidates[0]
+
+            edge_set.remove(next_edge)
+            v_next = next_edge[0] if next_edge[1] == v_curr else next_edge[1]
+            loop.append(v_next)
+
+            if v_next == v_start:
+                # 成功闭合
+                loops.append(loop[:-1])  # 去掉重复的起点
+                break
+
+            v_prev, v_curr = v_curr, v_next
+
+            # 安全上限，防止异常拓扑导致无限循环
+            if len(loop) > max(max_loop_edges * 3, 500):
+                if verbose:
+                    print(f"  Dropped overly long boundary path ({len(loop)} edges)")
+                break
+
+    # 扇形封闭找到的边界环
     new_vertices = [mesh.vertices]
     new_faces = [faces]
     for loop in loops:
