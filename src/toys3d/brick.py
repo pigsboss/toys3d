@@ -281,11 +281,34 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
     # 修复
     if repair_mode and (defect_stats['open_edges'] > 0 or defect_stats['nonmanifold_edges'] > 0):
         print("\n[Repair mode] Attempting to fix mesh...")
-        mesh = repair_mesh_by_removing_duplicates(mesh)
-        mesh = repair_nonmanifold_edges(mesh)
-        mesh = fill_small_holes(mesh)
+        max_repair_iter = 5
+
+        for iter in range(max_repair_iter):
+            print(f"\n  [Repair iter {iter}]")
+
+            # 策略1：去重复/退化面
+            mesh = repair_mesh_by_removing_duplicates(mesh)
+
+            # 策略2：消除非流形边
+            mesh = repair_nonmanifold_edges(mesh)
+
+            # 策略3：补洞
+            mesh = fill_small_holes(mesh)
+
+            # 检查修复结果
+            defect_stats, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+            print(f"  After iter {iter}: open_edges={defect_stats['open_edges']}, "
+                  f"nonmanifold_edges={defect_stats['nonmanifold_edges']}")
+
+            if defect_stats['open_edges'] == 0 and defect_stats['nonmanifold_edges'] == 0:
+                print("  Mesh fully repaired.")
+                break
+
+            if iter == max_repair_iter - 1:
+                print("  Reached maximum repair iterations.")
+
         stats = compute_mesh_stats(mesh)
-        print("After repair:")
+        print("\nAfter repair:")
         for k, v in stats.items():
             print(f"  {k}: {v}")
 
