@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 
 # Ensure src directory is on the path so that 'toys3d' can be imported
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -23,6 +24,22 @@ from toys3d.geometrics import (
     extract_plate_boundary_loops,
     classify_edge_regularity,
 )
+
+
+# ------------------------------------------------------------------
+#  Timer 类用于记录耗时
+# ------------------------------------------------------------------
+class Timer:
+    """Simple timer context manager for logging elapsed time."""
+    def __init__(self, label=''):
+        self.label = label
+        self.start = None
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+    def __exit__(self, *args):
+        elapsed = time.perf_counter() - self.start
+        print(f"[Timer] {self.label} took {elapsed:.3f}s")
 
 
 # ------------------------------------------------------------------
@@ -132,6 +149,7 @@ def visualize_boundaries(mesh, labels, scale, line_tol, circle_tol, spline_tol):
     """
     按边界环规律性着色：直线=绿，圆弧=蓝，样条=黄，不规则=红。
     同时返回被判为不规则的边界环列表。
+    同时输出每个薄板的边界环数量。
     """
     scene = trimesh.Scene()
     vis = mesh.copy()
@@ -151,6 +169,8 @@ def visualize_boundaries(mesh, labels, scale, line_tol, circle_tol, spline_tol):
         if lbl < 0:
             continue
         loops = extract_plate_boundary_loops(mesh, labels == lbl)
+        # 输出每个薄板的边界环数量
+        print(f"  Plate {lbl}: {len(loops)} boundary loops")
         for loop in loops:
             pts = mesh.vertices[np.asarray(loop, dtype=int)]
             ctype, score = classify_edge_regularity(
@@ -260,7 +280,8 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
                   angle_threshold_deg=30.0, min_faces=30,
                   thin_mode='adaptive', thin_threshold=0.1,
                   line_tol=0.05, circle_tol=0.05, spline_tol=0.1,
-                  irregular_perimeter_ratio=0.05):
+                  irregular_perimeter_ratio=0.05,
+                  thickness_grid_size=128):
     """
     薄壳扫描网格处理主函数。
 
@@ -276,39 +297,45 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
         统计信息。
     """
     # 0. 基础统计
-    stats = compute_mesh_stats(mesh)
-    print("Yo, mesh stats:")
-    for k, v in stats.items():
-        print(f"  {k}: {v}")
+    with Timer("Initial stats/defect analysis"):
+        stats = compute_mesh_stats(mesh)
+        print("Yo, mesh stats:")
+        for k, v in stats.items():
+            print(f"  {k}: {v}")
 
-    defect_stats, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
-    print("\nMesh defect analysis:")
-    print(f"  open edges: {defect_stats['open_edges']}")
-    print(f"  nonmanifold edges: {defect_stats['nonmanifold_edges']}")
-    print(f"  watertight (no open edges): {defect_stats['watertight_by_count']}")
+        defect_stats, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+        print("\nMesh defect analysis:")
+        print(f"  open edges: {defect_stats['open_edges']}")
+        print(f"  nonmanifold edges: {defect_stats['nonmanifold_edges']}")
+        print(f"  watertight (no open edges): {defect_stats['watertight_by_count']}")
 
     # 可选修复
     if repair_mode and (defect_stats['open_edges'] > 0 or defect_stats['nonmanifold_edges'] > 0):
-        print("\n[Repair mode] Attempting to fix mesh...")
-        mesh = _repair_loop(mesh)
-        stats = compute_mesh_stats(mesh)
-        print("\nAfter repair:")
-        for k, v in stats.items():
-            print(f"  {k}: {v}")
-        defect_stats, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
-        print(f"  After repair defects: open_edges={defect_stats['open_edges']}, "
-              f"nonmanifold_edges={defect_stats['nonmanifold_edges']}")
+        with Timer("Mesh repair"):
+            print("\n[Repair mode] Attempting to fix mesh...")
+            mesh = _repair_loop(mesh)
+            stats = compute_mesh_stats(mesh)
+            print("\nAfter repair:")
+            for k, v in stats.items():
+                print(f"  {k}: {v}")
+            defect_stats, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+            print(f"  After repair defects: open_edges={defect_stats['open_edges']}, "
+                  f"nonmanifold_edges={defect_stats['nonmanifold_edges']}")
 
     # 首次厚度估计与薄板分割（后续各阶段都会复用）
     def analyze_current(m):
-        thickness, reliability = estimate_shell_thickness(m)
-        th_stats = compute_wall_thickness_statistics(thickness, reliability)
-        labels = segment_plates_by_smoothness(
-            m, angle_threshold_deg=angle_threshold_deg, min_faces=min_faces
-        )
+        with Timer("  thickness estimation"):
+            thickness, reliability = estimate_shell_thickness(m, grid_size=thickness_grid_size)
+        with Timer("  thickness statistics"):
+            th_stats = compute_wall_thickness_statistics(thickness, reliability)
+        with Timer("  plate segmentation"):
+            labels = segment_plates_by_smoothness(
+                m, angle_threshold_deg=angle_threshold_deg, min_faces=min_faces
+            )
         return thickness, reliability, th_stats, labels
 
-    thickness, reliability, th_stats, labels = analyze_current(mesh)
+    with Timer("First thickness/segmentation analysis"):
+        thickness, reliability, th_stats, labels = analyze_current(mesh)
 
     print("\n[Shell analysis]")
     print(f"  Median thickness: {th_stats['median']:.4f}")
@@ -346,7 +373,8 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
         mesh.remove_unreferenced_vertices()
         mesh = fill_small_holes(mesh, max_loop_edges=100, verbose=False)
 
-    thickness, reliability, th_stats, labels = analyze_current(mesh)
+    with Timer("Second thickness/segmentation analysis (after cleanup)"):
+        thickness, reliability, th_stats, labels = analyze_current(mesh)
     print(f"  After cleanup: {mesh.faces.shape[0]} faces, median thickness: {th_stats['median']:.4f}")
 
     if num_passes == 1:
@@ -361,10 +389,11 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
         scale = 1.0
 
     # 先可视化并收集不规则小边界环
-    scene, irregular_loops = visualize_boundaries(
-        mesh, labels, scale=scale,
-        line_tol=line_tol, circle_tol=circle_tol, spline_tol=spline_tol
-    )
+    with Timer("visualize_boundaries (pass 2)"):
+        scene, irregular_loops = visualize_boundaries(
+            mesh, labels, scale=scale,
+            line_tol=line_tol, circle_tol=circle_tol, spline_tol=spline_tol
+        )
 
     print(f"  Found {len(irregular_loops)} irregular small boundary loops")
 
@@ -381,7 +410,8 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
             mesh = fill_small_holes(mesh, max_loop_edges=100, verbose=False)
 
     # 重新分析用于最终可视化
-    thickness, reliability, th_stats, labels = analyze_current(mesh)
+    with Timer("Third thickness/segmentation analysis (after refinement)"):
+        thickness, reliability, th_stats, labels = analyze_current(mesh)
     print(f"  After refinement: {mesh.faces.shape[0]} faces, "
           f"median thickness: {th_stats['median']:.4f}")
 
@@ -422,6 +452,8 @@ def main():
                         help="边界环样条拟合归一化误差阈值")
     parser.add_argument("--irregular-perimeter-ratio", type=float, default=0.05,
                         help="不规则边界环周长小于该比例*包围盒对角线时会被删除")
+    parser.add_argument("--thickness-grid-size", type=int, default=128,
+                        help="体素分辨率用于厚度估计（默认128）")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
     args = parser.parse_args()
 
@@ -443,6 +475,7 @@ def main():
         circle_tol=args.circle_tol,
         spline_tol=args.spline_tol,
         irregular_perimeter_ratio=args.irregular_perimeter_ratio,
+        thickness_grid_size=args.thickness_grid_size,
     )
 
     if args.output:
