@@ -1878,9 +1878,10 @@ def extract_boundary_loops(mesh):
 
     return loops
 
-# ==================================================================
-#  新增：薄板分割核心函数
-# ==================================================================
+
+# ------------------------------------------------------------------
+#  新增：薄板分割核心函数（向量化实现）
+# ------------------------------------------------------------------
 
 def build_face_adjacency(mesh):
     """
@@ -1911,6 +1912,97 @@ def compute_g1_deviation(mesh, face_i, face_j):
     dot = np.clip(np.dot(n1, n2), -1.0, 1.0)
     return np.arccos(dot)
 
+
+def segment_plates_by_smoothness(mesh, angle_threshold_deg=30.0, min_faces=10):
+    """
+    基于相邻面片二面角进行区域增长，分割出光滑薄板区域。
+    使用向量化图连通分量算法，避免 Python DFS 开销。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    angle_threshold_deg : float   二面角阈值（度）
+    min_faces : int               最小面片数
+
+    Returns
+    -------
+    labels : (N,) ndarray, int   面片区域标签（-1 为被合并/舍弃）
+    """
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+    N = len(faces)
+    angle_thr = np.deg2rad(angle_threshold_deg)
+    cos_thr = np.cos(angle_thr)
+
+    # 构建相邻面片对（共享边）
+    edge_map = {}
+    pair_count = 0
+    for fi, (v1, v2, v3) in enumerate(faces):
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
+            if key in edge_map:
+                fj = edge_map[key]
+                edge_map[key] = (fj, fi)
+                pair_count += 1
+            else:
+                edge_map[key] = fi
+
+    if pair_count == 0:
+        labels = np.arange(N, dtype=int)
+    else:
+        pairs = np.empty((pair_count, 2), dtype=np.int64)
+        idx = 0
+        for val in edge_map.values():
+            if isinstance(val, tuple):
+                pairs[idx] = val
+                idx += 1
+
+        i = pairs[:, 0]
+        j = pairs[:, 1]
+        normals = mesh.face_normals
+        dots = normals[i, 0] * normals[j, 0] + \
+               normals[i, 1] * normals[j, 1] + \
+               normals[i, 2] * normals[j, 2]
+
+        # 保留二面角小于阈值的边（点积 > cos(theta)）
+        mask = dots >= cos_thr
+
+        n_keep = int(np.sum(mask))
+        if n_keep == 0:
+            labels = np.arange(N, dtype=int)
+        else:
+            rows = np.empty(2 * n_keep, dtype=np.int64)
+            cols = np.empty(2 * n_keep, dtype=np.int64)
+            rows[:n_keep] = i[mask]
+            cols[:n_keep] = j[mask]
+            rows[n_keep:] = j[mask]
+            cols[n_keep:] = i[mask]
+            data = np.ones(2 * n_keep, dtype=np.int8)
+            graph = csr_matrix((data, (rows, cols)), shape=(N, N))
+            _, labels = connected_components(graph, directed=False)
+
+    # 移除过小的区域
+    unique, counts = np.unique(labels, return_counts=True)
+    small_mask = counts < min_faces
+    if np.any(small_mask):
+        small_labels = unique[small_mask]
+        for lbl in small_labels:
+            labels[labels == lbl] = -1
+
+    # 重新编号（紧凑的从 0 开始）
+    valid = labels >= 0
+    if np.any(valid):
+        _, new_labels = np.unique(labels[valid], return_inverse=True)
+        labels[valid] = new_labels
+
+    return labels
+
+
+# ==================================================================
+#  新增：薄壳处理核心函数 (原 shell.py 中已用)
+# ==================================================================
 
 # ------------------------------------------------------------------
 #  基于体素距离场的厚度估计（替换原射线法）
@@ -1995,71 +2087,6 @@ def estimate_shell_thickness(mesh, grid_size=128, margin=1.05):
 
     return thickness, reliability
 
-
-def segment_plates_by_smoothness(mesh, angle_threshold_deg=30.0, min_faces=10):
-    """
-    基于相邻面片二面角进行区域增长，分割出光滑薄板区域。
-
-    参数
-    ----------
-    mesh : trimesh.Trimesh
-    angle_threshold_deg : float   二面角阈值（度），邻面夹角小于此值即合并
-    min_faces : int               最小面片数（低于此值的区域将被舍弃）
-
-    返回
-    -------
-    labels : (N,) ndarray, int   面片区域标签（-1 为未归类）
-    """
-    adj = build_face_adjacency(mesh)
-    N = len(mesh.faces)
-    labels = -np.ones(N, dtype=int)
-    current_label = 0
-    angle_thr = np.deg2rad(angle_threshold_deg)
-
-    # 预先计算所有邻面的 G1 偏差，避免重复计算
-    # 用 dict 缓存
-    g1_cache = {}
-
-    for start in range(N):
-        if labels[start] >= 0:
-            continue
-        stack = [start]
-        labels[start] = current_label
-        while stack:
-            fi = stack.pop()
-            for fj in adj[fi]:
-                if labels[fj] >= 0:
-                    continue
-                # 利用对称性缓存
-                key = (fi, fj) if fi < fj else (fj, fi)
-                if key not in g1_cache:
-                    g1_cache[key] = compute_g1_deviation(mesh, fi, fj)
-                angle = g1_cache[key]
-                if angle <= angle_thr:
-                    labels[fj] = current_label
-                    stack.append(fj)
-        current_label += 1
-
-    # 移除过小的区域
-    unique, counts = np.unique(labels, return_counts=True)
-    for lbl, cnt in zip(unique, counts):
-        if cnt < min_faces and lbl != -1:
-            labels[labels == lbl] = -1
-
-    # 重新编号（紧凑的从 0 开始）
-    new_label = 0
-    for lbl in sorted(unique[unique != -1]):
-        if counts[unique.tolist().index(lbl)] >= min_faces:
-            labels[labels == lbl] = new_label
-            new_label += 1
-        else:
-            labels[labels == lbl] = -1
-    return labels
-
-
-# ------------------------------------------------------------------
-#  薄壳处理：P0 厚度分析 / 板边界与折痕提取
-# ------------------------------------------------------------------
 
 def detect_thin_regions(thickness, mode='adaptive', threshold=0.1,
                         fallback_median=None):
