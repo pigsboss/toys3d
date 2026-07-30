@@ -1936,29 +1936,24 @@ def segment_plates_by_smoothness(mesh, angle_threshold_deg=30.0, min_faces=10):
     angle_thr = np.deg2rad(angle_threshold_deg)
     cos_thr = np.cos(angle_thr)
 
-    # 构建相邻面片对（共享边）
+    # 构建相邻面片对（仅保留恰好被 2 个面片共享的边）
     edge_map = {}
-    pair_count = 0
     for fi, (v1, v2, v3) in enumerate(faces):
         for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
             key = (a, b) if a < b else (b, a)
-            if key in edge_map:
-                fj = edge_map[key]
-                edge_map[key] = (fj, fi)
-                pair_count += 1
-            else:
-                edge_map[key] = fi
+            edge_map.setdefault(key, []).append(fi)
+
+    pairs = []
+    for fl in edge_map.values():
+        if len(fl) == 2:
+            pairs.append((fl[0], fl[1]))
+
+    pair_count = len(pairs)
 
     if pair_count == 0:
         labels = np.arange(N, dtype=int)
     else:
-        pairs = np.empty((pair_count, 2), dtype=np.int64)
-        idx = 0
-        for val in edge_map.values():
-            if isinstance(val, tuple):
-                pairs[idx] = val
-                idx += 1
-
+        pairs = np.array(pairs, dtype=np.int64)
         i = pairs[:, 0]
         j = pairs[:, 1]
         normals = mesh.face_normals
