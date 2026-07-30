@@ -2037,3 +2037,392 @@ def segment_plates_by_smoothness(mesh, angle_threshold_deg=30.0, min_faces=10):
         else:
             labels[labels == lbl] = -1
     return labels
+
+
+# ------------------------------------------------------------------
+#  薄壳处理：P0 厚度分析 / 板边界与折痕提取
+# ------------------------------------------------------------------
+
+def detect_thin_regions(thickness, mode='adaptive', threshold=0.1,
+                        fallback_median=None):
+    """
+    标记局部厚度过小的面片。
+
+    Parameters
+    ----------
+    thickness : (N,) ndarray
+        每个面片的厚度估计（可含 NaN）。
+    mode : 'adaptive' | 'absolute'
+        adaptive 时 threshold 为全局中位数的比例；
+        absolute 时 threshold 为绝对厚度值。
+    threshold : float
+        阈值（比例或绝对值）。
+    fallback_median : float or None
+        adaptive 模式下，若无法取到中位数时的回退值。
+
+    Returns
+    -------
+    mask : (N,) bool
+        厚度被认为过小的面片掩码。
+    """
+    thickness = np.asarray(thickness, dtype=np.float64)
+    valid = np.isfinite(thickness)
+    if not np.any(valid):
+        return np.zeros(len(thickness), dtype=bool)
+
+    if mode == 'adaptive':
+        med = fallback_median if fallback_median is not None else np.median(thickness[valid])
+        abs_thr = threshold * med
+    elif mode == 'absolute':
+        abs_thr = threshold
+    else:
+        raise ValueError("mode must be 'adaptive' or 'absolute'")
+
+    return valid & (thickness < abs_thr)
+
+
+def compute_wall_thickness_statistics(thickness, reliability=None):
+    """
+    计算厚度场的统计信息，用于自适应阈值与诊断输出。
+
+    Returns
+    -------
+    stats : dict
+    """
+    thickness = np.asarray(thickness, dtype=np.float64)
+    if reliability is None:
+        reliability = np.isfinite(thickness)
+
+    stats = {
+        'reliable_count': int(np.sum(reliability)),
+        'reliable_ratio': float(np.sum(reliability) / max(len(thickness), 1)),
+    }
+
+    if not np.any(reliability):
+        for key in ['median', 'mean', 'std', 'min', 'max',
+                    'p25', 'p75', 'iqr']:
+            stats[key] = np.nan
+        return stats
+
+    vals = thickness[reliability]
+    p25, p75 = np.percentile(vals, [25, 75])
+
+    stats['median'] = float(np.median(vals))
+    stats['mean'] = float(np.mean(vals))
+    stats['std'] = float(np.std(vals))
+    stats['min'] = float(np.min(vals))
+    stats['max'] = float(np.max(vals))
+    stats['p25'] = float(p25)
+    stats['p75'] = float(p75)
+    stats['iqr'] = float(p75 - p25)
+    return stats
+
+
+def extract_plate_boundary_loops(mesh, plate_mask):
+    """
+    提取指定薄板面片集合的所有边界环。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    plate_mask : (N,) bool
+        属于某一块板（或合并后的板）的面片掩码。
+
+    Returns
+    -------
+    loops : list of list of int
+        每个边界环的顶点索引列表。
+    """
+    faces = np.asarray(mesh.faces).reshape(-1, 3)
+    mask = np.asarray(plate_mask, dtype=bool)
+    plate_indices = np.flatnonzero(mask)
+
+    if len(plate_indices) == 0:
+        return []
+
+    # 统计子网格内部每条边的出现次数
+    edge_count = {}
+    for fi in plate_indices:
+        v = faces[fi]
+        for j in range(3):
+            a, b = int(v[j]), int(v[(j + 1) % 3])
+            key = (a, b) if a < b else (b, a)
+            edge_count[key] = edge_count.get(key, 0) + 1
+
+    boundary_edges = [e for e, c in edge_count.items() if c == 1]
+    if not boundary_edges:
+        return []
+
+    adjacency = {}
+    for a, b in boundary_edges:
+        adjacency.setdefault(a, []).append(b)
+        adjacency.setdefault(b, []).append(a)
+
+    visited = set()
+    loops = []
+    for start in adjacency:
+        if start in visited:
+            continue
+
+        loop = [start]
+        visited.add(start)
+        prev, curr = None, start
+
+        while True:
+            neighbors = [v for v in adjacency.get(curr, []) if v != prev]
+            if not neighbors:
+                break
+            nxt = neighbors[0]
+            if nxt == start and len(loop) > 2:
+                break
+            if nxt in visited:
+                break
+            loop.append(nxt)
+            visited.add(nxt)
+            prev, curr = curr, nxt
+
+        if len(loop) >= 3:
+            loops.append(loop)
+
+    return loops
+
+
+def extract_crease_lines(mesh, plate_labels, dihedral_thr_deg=30.0):
+    """
+    提取相邻薄板之间的折痕线（二面角较大的内部边链）。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    plate_labels : (N,) ndarray
+        面片的薄板标签。
+    dihedral_thr_deg : float
+        折痕判定二面角阈值（度）。
+
+    Returns
+    -------
+    chains : list of list of int
+        每条折痕链的顶点索引序列。
+    """
+    faces = np.asarray(mesh.faces).reshape(-1, 3)
+    edge_face_map = {}
+    for fi, face in enumerate(faces):
+        for j in range(3):
+            a, b = int(face[j]), int(face[(j + 1) % 3])
+            key = (a, b) if a < b else (b, a)
+            edge_face_map.setdefault(key, []).append(fi)
+
+    angle_thr = np.deg2rad(dihedral_thr_deg)
+    crease_edges = []
+
+    for edge, fl in edge_face_map.items():
+        if len(fl) != 2:
+            continue
+        fi, fj = fl
+        if plate_labels[fi] == plate_labels[fj]:
+            continue
+        angle = compute_g1_deviation(mesh, fi, fj)
+        if angle > angle_thr:
+            crease_edges.append(edge)
+
+    if not crease_edges:
+        return []
+
+    adjacency = {}
+    for a, b in crease_edges:
+        adjacency.setdefault(a, []).append(b)
+        adjacency.setdefault(b, []).append(a)
+
+    visited = set(crease_edges)
+    chains = []
+
+    for edge in crease_edges:
+        if edge not in visited:
+            continue
+        visited.remove(edge)
+
+        chain = [edge[0], edge[1]]
+
+        # 向前延伸
+        end = edge[1]
+        while True:
+            nxt_list = [v for v in adjacency.get(end, []) if v != chain[-2]]
+            if len(nxt_list) != 1:
+                break
+            nxt = nxt_list[0]
+            e2 = tuple(sorted((end, nxt)))
+            if e2 not in visited:
+                break
+            visited.remove(e2)
+            chain.append(nxt)
+            end = nxt
+
+        # 向后延伸
+        begin = chain[0]
+        while True:
+            nxt_list = [v for v in adjacency.get(begin, []) if v != chain[1]]
+            if len(nxt_list) != 1:
+                break
+            nxt = nxt_list[0]
+            e2 = tuple(sorted((begin, nxt)))
+            if e2 not in visited:
+                break
+            visited.remove(e2)
+            chain.insert(0, nxt)
+            begin = nxt
+
+        # 闭合环去重
+        if len(chain) > 1 and chain[0] == chain[-1]:
+            chain = chain[:-1]
+
+        chains.append(chain)
+
+    return chains
+
+
+# ------------------------------------------------------------------
+#  薄壳处理：P1 边缘规律性分类
+# ------------------------------------------------------------------
+
+def fit_line_3d(points):
+    """
+    三维点最小二乘直线拟合。
+
+    Returns
+    -------
+    rmse : float
+    direction : (3,) ndarray or None
+    center : (3,) ndarray
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    n = len(pts)
+    if n < 2:
+        return np.inf, None, pts.mean(axis=0) if n > 0 else None
+
+    center = pts.mean(axis=0)
+    centered = pts - center
+    if n == 2:
+        direction = centered[1] - centered[0]
+        norm = np.linalg.norm(direction)
+        if norm < 1e-12:
+            return np.inf, None, center
+        direction = direction / norm
+        return 0.0, direction, center
+
+    _, s, vh = np.linalg.svd(centered, full_matrices=False)
+    if s[0] < 1e-12:
+        return np.inf, None, center
+
+    direction = vh[0]
+    projections = centered @ direction
+    residuals = centered - projections[:, None] * direction
+    rmse = np.sqrt(np.mean(np.sum(residuals ** 2, axis=1)))
+    return rmse, direction, center
+
+
+def fit_circle_3d(points):
+    """
+    三维点最小二乘圆拟合。先投影到最佳拟合平面，再在平面内做圆拟合。
+
+    Returns
+    -------
+    rmse : float
+    center : (3,) ndarray or None
+    normal : (3,) ndarray or None
+    radius : float
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    n = len(pts)
+    if n < 4:
+        return np.inf, None, None, 0.0
+
+    center = pts.mean(axis=0)
+    centered = pts - center
+    _, s, vh = np.linalg.svd(centered, full_matrices=False)
+    if s[1] < 1e-12:
+        return np.inf, None, None, 0.0
+
+    normal = vh[2]
+    basis_u = vh[0]
+    basis_v = vh[1]
+
+    coords = np.column_stack([centered @ basis_u, centered @ basis_v])
+
+    A = np.column_stack([coords[:, 0], coords[:, 1], np.ones(n)])
+    b = coords[:, 0] ** 2 + coords[:, 1] ** 2
+    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+
+    cx, cy = sol[0] / 2.0, sol[1] / 2.0
+    radius = np.sqrt(cx * cx + cy * cy + sol[2])
+    center3d = center + cx * basis_u + cy * basis_v
+
+    radii = np.linalg.norm(coords - np.array([cx, cy]), axis=1)
+    rmse = np.sqrt(np.mean((radii - radius) ** 2))
+    return rmse, center3d, normal, float(radius)
+
+
+def fit_spline_3d(points, degree=3, num_samples=100):
+    """
+    三维 B 样条拟合。若 scipy 不可用或点数不足，返回 inf。
+
+    Returns
+    -------
+    rmse : float
+    fitted : (num_samples, 3) ndarray or None
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    n = len(pts)
+    if n < degree + 1:
+        return np.inf, None
+
+    try:
+        from scipy.interpolate import splprep, splev
+    except ImportError:
+        return np.inf, None
+
+    try:
+        tck, _ = splprep(pts.T, k=degree, s=n * 0.01)
+        u_fine = np.linspace(0, 1, num_samples)
+        fitted = np.array(splev(u_fine, tck)).T
+
+        # 用最近拟合点距离近似 RMSE
+        dists = np.sqrt(np.min(
+            np.sum((pts[:, None, :] - fitted[None, :, :]) ** 2, axis=2),
+            axis=1
+        ))
+        rmse = float(np.sqrt(np.mean(dists ** 2)))
+        return rmse, fitted
+    except Exception:
+        return np.inf, None
+
+
+def classify_edge_regularity(loop_pts, scale=1.0, line_tol=0.1,
+                             circle_tol=0.1, spline_tol=0.1):
+    """
+    判断三维边界环属于直线、圆弧、样条还是不规则。
+
+    Returns
+    -------
+    label : 'line' | 'circle' | 'spline' | 'irregular'
+    score : float
+        归一化拟合误差。
+    """
+    pts = np.asarray(loop_pts, dtype=np.float64)
+    if len(pts) < 3:
+        return 'irregular', np.inf
+
+    line_err, _, _ = fit_line_3d(pts)
+    circle_err, _, _, _ = fit_circle_3d(pts)
+    spline_err, _ = fit_spline_3d(pts)
+
+    line_score = line_err / scale
+    circle_score = circle_err / scale
+    spline_score = spline_err / scale
+
+    if line_score < line_tol:
+        return 'line', line_score
+    if circle_score < circle_tol:
+        return 'circle', circle_score
+    if spline_score < spline_tol and np.isfinite(spline_score):
+        return 'spline', spline_score
+    return 'irregular', min(line_score, circle_score, spline_score)
