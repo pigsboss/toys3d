@@ -1934,7 +1934,7 @@ def estimate_shell_thickness(mesh, eps=1e-6):
     N = len(centers)
 
     # 小偏移避免起点正好在面上
-    diag = mesh.bounding_box.diagonal
+    diag = float(np.linalg.norm(mesh.bounding_box.extents))
     offset = eps * diag
 
     # 正向射线（沿法线）

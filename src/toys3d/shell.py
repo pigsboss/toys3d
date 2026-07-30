@@ -356,7 +356,7 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
 
     # Pass 2: 基于边界环规律性精化
     print("\n[Pass 2] Refining by boundary regularity...")
-    scale = mesh.bounding_box.diagonal
+    scale = float(np.linalg.norm(mesh.bounding_box.extents))
     if scale < 1e-12:
         scale = 1.0
 
