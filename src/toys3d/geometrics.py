@@ -1912,70 +1912,88 @@ def compute_g1_deviation(mesh, face_i, face_j):
     return np.arccos(dot)
 
 
-def estimate_shell_thickness(mesh, eps=1e-6):
+# ------------------------------------------------------------------
+#  基于体素距离场的厚度估计（替换原射线法）
+# ------------------------------------------------------------------
+
+def estimate_shell_thickness(mesh, grid_size=128, margin=1.05):
     """
-    基于射线相交(cross‑section厚度)估计每个面片的局部厚度。
+    基于体素距离场估计每个面片的局部厚度。
 
-    对每一面片，沿法线方向（向外）发射一轮射线，取首个相交距离作为厚度。
-    同时发射反向射线，选择两个方向中较小的距离（保证覆盖薄壁两侧）。
+    将薄壳网格体素化，计算占用网格的距离变换。
+    对每个面片中心，取映射体素处的距离值，近似为半厚度，乘以 2 得到厚度。
 
-    参数
+    Parameters
     ----------
-    mesh : trimesh.Trimesh   (假设法线一致朝外)
-    eps   : float             偏移量，避免自相交
+    mesh : trimesh.Trimesh
+    grid_size : int
+        体素网格分辨率（沿最长轴）
+    margin : float
+        包围盒外边距比例
 
-    返回
+    Returns
     -------
-    thickness : (N,) ndarray   局部厚度估计值（NaN 表示无法估计）
-    reliability : (N,) bool     厚度是否可靠（有合法的两面交点）
+    thickness : (N,) ndarray
+        每个面片的厚度估计值（NaN 表示无法估计）
+    reliability : (N,) bool
+        是否成功映射到有效体素
     """
+    from scipy import ndimage
+
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+
+    # 计算带边距的包围盒
+    v_min = vertices.min(axis=0)
+    v_max = vertices.max(axis=0)
+    center = (v_min + v_max) / 2.0
+    extents = v_max - v_min
+    max_extent = extents.max()
+    if max_extent < 1e-12:
+        return np.full(len(faces), np.nan), np.zeros(len(faces), dtype=bool)
+
+    box_size = max_extent * margin
+    origin = center - box_size / 2.0
+    pitch = box_size / grid_size
+
+    if pitch <= 0:
+        return np.full(len(faces), np.nan), np.zeros(len(faces), dtype=bool)
+
+    # 面片中心体素化
     centers = mesh.triangles_center
-    normals = mesh.face_normals
-    N = len(centers)
+    voxel_coords = np.floor((centers - origin) / pitch).astype(int)
+    voxel_coords = np.clip(voxel_coords, 0, grid_size - 1)
 
-    # 小偏移避免起点正好在面上
-    diag = float(np.linalg.norm(mesh.bounding_box.extents))
-    offset = eps * diag
+    # 构建占用网格：标记任何包含三角面片的体素
+    occupied = np.zeros((grid_size, grid_size, grid_size), dtype=bool)
 
-    # 正向射线（沿法线）
-    ray_origins_fwd = centers + offset * normals
-    ray_directions_fwd = normals
+    # 采样每条边来光栅化三角面片
+    N = len(faces)
+    for fi in range(N):
+        v = faces[fi]
+        pts = vertices[v]
+        # 简单采样：面片中心 + 三条边中点
+        samples = np.vstack([
+            pts.mean(axis=0)[None, :],
+            (pts + np.roll(pts, -1, axis=0)) / 2.0
+        ])
+        coords = np.floor((samples - origin) / pitch).astype(int)
+        coords = np.clip(coords, 0, grid_size - 1)
+        occupied[coords[:, 0], coords[:, 1], coords[:, 2]] = True
 
-    # 反向射线
-    ray_origins_bwd = centers - offset * normals
-    ray_directions_bwd = -normals
+    # 距离变换：占用体素距离为 0，内部空腔距离表示到表面的距离
+    distance = ndimage.distance_transform_edt(~occupied)
 
-    # 使用 trimesh.ray.ray_mesh_intersect (返回第一个命中的交点、射线索引、三角索引)
-    loc_fwd, idx_ray_fwd, _ = mesh.ray.intersects_location(
-        ray_origins=ray_origins_fwd,
-        ray_directions=ray_directions_fwd,
-        multiple_hits=False
-    )
-    loc_bwd, idx_ray_bwd, _ = mesh.ray.intersects_location(
-        ray_origins=ray_origins_bwd,
-        ray_directions=ray_directions_bwd,
-        multiple_hits=False
-    )
+    # 每个面片中心的半厚度 * 2
+    ix, iy, iz = voxel_coords[:, 0], voxel_coords[:, 1], voxel_coords[:, 2]
+    half_thickness = distance[ix, iy, iz] * pitch
 
-    dist_fwd = np.full(N, np.inf)
-    dist_bwd = np.full(N, np.inf)
+    thickness = half_thickness * 2.0
 
-    # 填充正向距离
-    if len(idx_ray_fwd) > 0:
-        dist_fwd[idx_ray_fwd] = np.linalg.norm(
-            loc_fwd - ray_origins_fwd[idx_ray_fwd], axis=1
-        )
-    # 填充反向距离
-    if len(idx_ray_bwd) > 0:
-        dist_bwd[idx_ray_bwd] = np.linalg.norm(
-            loc_bwd - ray_origins_bwd[idx_ray_bwd], axis=1
-        )
+    # 可靠性：非零厚度且不是背景
+    reliability = (half_thickness > 0) & np.isfinite(thickness)
 
-    # 取两个方向中最小的距离（厚壁 = min(正向,反向)）
-    dist = np.minimum(dist_fwd, dist_bwd)
-    reliability = np.isfinite(dist) & (dist < diag * 0.5)  # 不能超过物体尺寸一半才合理
-
-    return dist, reliability
+    return thickness, reliability
 
 
 def segment_plates_by_smoothness(mesh, angle_threshold_deg=30.0, min_faces=10):
