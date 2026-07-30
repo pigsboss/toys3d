@@ -1877,3 +1877,163 @@ def extract_boundary_loops(mesh):
             loops.append(loop)
 
     return loops
+
+# ==================================================================
+#  新增：薄板分割核心函数
+# ==================================================================
+
+def build_face_adjacency(mesh):
+    """
+    返回面片邻接表，adj[fi] 为与 fi 共享一条边的面片索引列表。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+    N = len(faces)
+    adjacency = [[] for _ in range(N)]
+    edge_map = {}
+    for fi, (v1, v2, v3) in enumerate(faces):
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
+            if key in edge_map:
+                fj = edge_map[key]
+                adjacency[fi].append(fj)
+                adjacency[fj].append(fi)
+            else:
+                edge_map[key] = fi
+    return adjacency
+
+
+def compute_g1_deviation(mesh, face_i, face_j):
+    """
+    计算两个相邻面片间的 G1 光滑偏差（二面角，弧度）。
+    """
+    n1 = mesh.face_normals[face_i]
+    n2 = mesh.face_normals[face_j]
+    dot = np.clip(np.dot(n1, n2), -1.0, 1.0)
+    return np.arccos(dot)
+
+
+def estimate_shell_thickness(mesh, eps=1e-6):
+    """
+    基于射线相交(cross‑section厚度)估计每个面片的局部厚度。
+
+    对每一面片，沿法线方向（向外）发射一轮射线，取首个相交距离作为厚度。
+    同时发射反向射线，选择两个方向中较小的距离（保证覆盖薄壁两侧）。
+
+    参数
+    ----------
+    mesh : trimesh.Trimesh   (假设法线一致朝外)
+    eps   : float             偏移量，避免自相交
+
+    返回
+    -------
+    thickness : (N,) ndarray   局部厚度估计值（NaN 表示无法估计）
+    reliability : (N,) bool     厚度是否可靠（有合法的两面交点）
+    """
+    centers = mesh.triangles_center
+    normals = mesh.face_normals
+    N = len(centers)
+
+    # 小偏移避免起点正好在面上
+    diag = mesh.bounding_box.diagonal
+    offset = eps * diag
+
+    # 正向射线（沿法线）
+    ray_origins_fwd = centers + offset * normals
+    ray_directions_fwd = normals
+
+    # 反向射线
+    ray_origins_bwd = centers - offset * normals
+    ray_directions_bwd = -normals
+
+    # 使用 trimesh.ray.ray_mesh_intersect (返回第一个命中的交点、射线索引、三角索引)
+    loc_fwd, idx_ray_fwd, _ = mesh.ray.intersects_location(
+        ray_origins=ray_origins_fwd,
+        ray_directions=ray_directions_fwd,
+        multiple_hits=False
+    )
+    loc_bwd, idx_ray_bwd, _ = mesh.ray.intersects_location(
+        ray_origins=ray_origins_bwd,
+        ray_directions=ray_directions_bwd,
+        multiple_hits=False
+    )
+
+    dist_fwd = np.full(N, np.inf)
+    dist_bwd = np.full(N, np.inf)
+
+    # 填充正向距离
+    if len(idx_ray_fwd) > 0:
+        dist_fwd[idx_ray_fwd] = np.linalg.norm(
+            loc_fwd - ray_origins_fwd[idx_ray_fwd], axis=1
+        )
+    # 填充反向距离
+    if len(idx_ray_bwd) > 0:
+        dist_bwd[idx_ray_bwd] = np.linalg.norm(
+            loc_bwd - ray_origins_bwd[idx_ray_bwd], axis=1
+        )
+
+    # 取两个方向中最小的距离（厚壁 = min(正向,反向)）
+    dist = np.minimum(dist_fwd, dist_bwd)
+    reliability = np.isfinite(dist) & (dist < diag * 0.5)  # 不能超过物体尺寸一半才合理
+
+    return dist, reliability
+
+
+def segment_plates_by_smoothness(mesh, angle_threshold_deg=30.0, min_faces=10):
+    """
+    基于相邻面片二面角进行区域增长，分割出光滑薄板区域。
+
+    参数
+    ----------
+    mesh : trimesh.Trimesh
+    angle_threshold_deg : float   二面角阈值（度），邻面夹角小于此值即合并
+    min_faces : int               最小面片数（低于此值的区域将被舍弃）
+
+    返回
+    -------
+    labels : (N,) ndarray, int   面片区域标签（-1 为未归类）
+    """
+    adj = build_face_adjacency(mesh)
+    N = len(mesh.faces)
+    labels = -np.ones(N, dtype=int)
+    current_label = 0
+    angle_thr = np.deg2rad(angle_threshold_deg)
+
+    # 预先计算所有邻面的 G1 偏差，避免重复计算
+    # 用 dict 缓存
+    g1_cache = {}
+
+    for start in range(N):
+        if labels[start] >= 0:
+            continue
+        stack = [start]
+        labels[start] = current_label
+        while stack:
+            fi = stack.pop()
+            for fj in adj[fi]:
+                if labels[fj] >= 0:
+                    continue
+                # 利用对称性缓存
+                key = (fi, fj) if fi < fj else (fj, fi)
+                if key not in g1_cache:
+                    g1_cache[key] = compute_g1_deviation(mesh, fi, fj)
+                angle = g1_cache[key]
+                if angle <= angle_thr:
+                    labels[fj] = current_label
+                    stack.append(fj)
+        current_label += 1
+
+    # 移除过小的区域
+    unique, counts = np.unique(labels, return_counts=True)
+    for lbl, cnt in zip(unique, counts):
+        if cnt < min_faces and lbl != -1:
+            labels[labels == lbl] = -1
+
+    # 重新编号（紧凑的从 0 开始）
+    new_label = 0
+    for lbl in sorted(unique[unique != -1]):
+        if counts[unique.tolist().index(lbl)] >= min_faces:
+            labels[labels == lbl] = new_label
+            new_label += 1
+        else:
+            labels[labels == lbl] = -1
+    return labels
