@@ -145,6 +145,108 @@ def visualize_plates(mesh, labels):
     return scene
 
 
+def visualize_plate_centers(mesh, labels, alpha=80):
+    """
+    高亮显示每个薄板的中心面（局部拟合平面上的圆盘），
+    并以半透明方式显示原始网格。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    labels : (N,) ndarray
+        薄板标签。
+    alpha : int
+        原始网格透明度（0-255）。
+
+    Returns
+    -------
+    scene : trimesh.Scene
+    """
+    scene = trimesh.Scene()
+
+    # 原始网格半透明
+    base = mesh.copy()
+    N = len(base.faces)
+    colors = np.full((N, 4), 200, dtype=np.uint8)
+    colors[:, 3] = alpha
+    base.visual.face_colors = colors
+    scene.add_geometry(base)
+
+    # 随机调色板
+    rng = np.random.default_rng(42)
+    n_plates = int(max(0, labels.max()) + 1)
+    palette = np.column_stack([
+        rng.integers(80, 255, size=n_plates),
+        rng.integers(80, 255, size=n_plates),
+        rng.integers(80, 255, size=n_plates),
+        np.full(n_plates, 255, dtype=np.uint8),
+    ])
+
+    # 为每个薄板生成中心面圆盘
+    for lbl in range(n_plates):
+        mask = labels == lbl
+        n_faces = int(np.sum(mask))
+        if n_faces < 3:
+            continue
+
+        centers = mesh.triangles_center[mask]
+        mean_pt = centers.mean(axis=0)
+
+        # 用 PCA 拟合局部平面
+        centered = centers - mean_pt
+        cov = centered.T @ centered
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        normal = eigvecs[:, np.argmin(eigvals)]
+
+        # 确保法向与薄板平均法向一致
+        face_normals = mesh.face_normals[mask]
+        avg_normal = face_normals.mean(axis=0)
+        avg_normal = avg_normal / (np.linalg.norm(avg_normal) + 1e-12)
+        if np.dot(normal, avg_normal) < 0:
+            normal = -normal
+
+        # 在平面内构造两个正交基
+        if abs(normal[2]) < 0.9:
+            u = np.cross([0.0, 0.0, 1.0], normal)
+        else:
+            u = np.cross([1.0, 0.0, 0.0], normal)
+        un = np.linalg.norm(u)
+        if un < 1e-12:
+            continue
+        u = u / un
+        v = np.cross(normal, u)
+
+        # 圆盘半径：薄板投影到平面的包围半径
+        proj_u = centered @ u
+        proj_v = centered @ v
+        sq = proj_u * proj_u + proj_v * proj_v
+        radius = float(np.sqrt(np.maximum(sq, 0).max()))
+
+        if radius < 1e-6:
+            continue
+
+        # 创建圆盘并变换到平面位置
+        disk = trimesh.creation.disk(radius=radius, sections=32)
+        R = np.column_stack([u, v, normal])
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = mean_pt
+        disk.apply_transform(T)
+        disk.visual.face_colors = palette[lbl % len(palette)]
+
+        scene.add_geometry(disk)
+
+    # 添加坐标轴
+    origin = mesh.bounding_box.centroid
+    max_ext = mesh.bounding_box.extents.max()
+    add_axes_to_scene(scene, origin,
+                      u_x=np.array([1, 0, 0]),
+                      u_y=np.array([0, 1, 0]),
+                      u_z=np.array([0, 0, 1]),
+                      length=max_ext * 0.5)
+    return scene
+
+
 def visualize_boundaries(mesh, labels, scale, line_tol, circle_tol, spline_tol):
     """
     按边界环规律性着色：直线=绿，圆弧=蓝，样条=黄，不规则=红。
@@ -281,7 +383,8 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
                   thin_mode='adaptive', thin_threshold=0.1,
                   line_tol=0.05, circle_tol=0.05, spline_tol=0.1,
                   irregular_perimeter_ratio=0.05,
-                  thickness_grid_size=128):
+                  thickness_grid_size=128,
+                  vis_mode='plates', vis_alpha=80):
     """
     薄壳扫描网格处理主函数。
 
@@ -345,8 +448,16 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
 
     # Pass 0: 检测可视化
     if num_passes == 0:
-        world_scene = visualize_thickness(mesh, thickness, reliability)
-        scene = visualize_plates(mesh, labels)
+        with Timer("pass 0 visualization"):
+            if vis_mode == 'thickness':
+                world_scene = visualize_thickness(mesh, thickness, reliability)
+                scene = visualize_plates(mesh, labels)
+            elif vis_mode == 'centers':
+                world_scene = visualize_plate_centers(mesh, labels, alpha=vis_alpha)
+                scene = world_scene
+            else:  # 'plates'
+                world_scene = visualize_thickness(mesh, thickness, reliability)
+                scene = visualize_plates(mesh, labels)
         return scene, world_scene, mesh.copy(), {**stats, **th_stats}
 
     # Pass 1: 删除过薄 / 不可靠区域
@@ -454,6 +565,11 @@ def main():
                         help="不规则边界环周长小于该比例*包围盒对角线时会被删除")
     parser.add_argument("--thickness-grid-size", type=int, default=128,
                         help="体素分辨率用于厚度估计（默认128）")
+    parser.add_argument("--vis-mode", type=str, default='plates',
+                        choices=['plates', 'centers', 'thickness'],
+                        help="Pass 0 可视化模式：plates=薄板着色, centers=中心面高亮, thickness=厚度场")
+    parser.add_argument("--vis-alpha", type=int, default=80,
+                        help="原始网格透明度（仅 centers 模式，0-255，默认80）")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
     args = parser.parse_args()
 
@@ -476,6 +592,8 @@ def main():
         spline_tol=args.spline_tol,
         irregular_perimeter_ratio=args.irregular_perimeter_ratio,
         thickness_grid_size=args.thickness_grid_size,
+        vis_mode=args.vis_mode,
+        vis_alpha=args.vis_alpha,
     )
 
     if args.output:
