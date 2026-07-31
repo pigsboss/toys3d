@@ -2466,3 +2466,171 @@ def classify_edge_regularity(loop_pts, scale=1.0, line_tol=0.1,
     if spline_score < spline_tol and np.isfinite(spline_score):
         return 'spline', spline_score
     return 'irregular', min(line_score, circle_score, spline_score)
+
+# ------------------------------------------------------------------
+#  多尺度法向、边缘检测与基于边缘的区域分割
+# ------------------------------------------------------------------
+
+def get_k_ring_neighbors(adjacency, seed, k=1):
+    """
+    获取面片的 k-ring 邻域（包括 seed 自身）。
+    """
+    visited = {seed}
+    frontier = {seed}
+    for _ in range(k):
+        new_frontier = set()
+        for f in frontier:
+            new_frontier.update(adjacency[f])
+        frontier = new_frontier - visited
+        visited.update(frontier)
+        if not frontier:
+            break
+    return np.array(list(visited), dtype=int)
+
+
+def compute_multiscale_face_normals(mesh, scales=(1, 2, 4, 8)):
+    """
+    在不同邻域尺度下计算面片法向（面积加权平均）。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    scales : tuple of int
+        邻域 ring 数
+
+    Returns
+    -------
+    scale_normals : list of (N, 3) ndarray
+    """
+    adjacency = build_face_adjacency(mesh)
+    N = len(mesh.faces)
+    base_normals = mesh.face_normals.copy()
+    areas = mesh.area_faces
+
+    scale_normals = []
+    for k in scales:
+        smoothed = np.zeros_like(base_normals)
+        for i in range(N):
+            neighbors = get_k_ring_neighbors(adjacency, i, k=k)
+            w = areas[neighbors]
+            avg = np.average(base_normals[neighbors], axis=0, weights=w)
+            norm = np.linalg.norm(avg)
+            smoothed[i] = avg / norm if norm > 1e-12 else base_normals[i]
+        scale_normals.append(smoothed)
+
+    return scale_normals
+
+
+def compute_edge_strength_multiscale(mesh, scale_normals):
+    """
+    对每个尺度，计算每个面片与其 1-ring 邻域的法向平均差异（弧度）。
+
+    Returns
+    -------
+    strengths : (n_scales, N) ndarray
+    """
+    adjacency = build_face_adjacency(mesh)
+    N = len(mesh.faces)
+    n_scales = len(scale_normals)
+
+    strengths = np.zeros((n_scales, N), dtype=np.float64)
+    for s, normals in enumerate(scale_normals):
+        for i in range(N):
+            neighbors = adjacency[i]
+            if len(neighbors) == 0:
+                continue
+            dots = np.clip(np.dot(normals[neighbors], normals[i]), -1.0, 1.0)
+            angles = np.arccos(dots)
+            strengths[s, i] = float(np.mean(angles))
+
+    return strengths
+
+
+def detect_multiscale_edges(mesh, scales=(1, 2, 4, 8),
+                            threshold_ratio=0.3,
+                            min_consistent_scales=None):
+    """
+    多尺度边缘检测。
+
+    只有在多个尺度上都表现出强边缘响应的位置，才被认为是真实边缘。
+    同时要求小尺度响应不低于大尺度响应（避免纯噪声）。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    scales : tuple of int
+    threshold_ratio : float
+        相对阈值，边缘强度超过该比例的最大值才被考虑
+    min_consistent_scales : int or None
+        要求一致超过阈值的尺度数，默认 ceil(n_scales / 2)
+
+    Returns
+    -------
+    edge_face_mask : (N,) bool
+        位于边缘上的面片掩码
+    edge_strengths : (n_scales, N) ndarray
+        各尺度边缘强度
+    """
+    scale_normals = compute_multiscale_face_normals(mesh, scales=scales)
+    strengths = compute_edge_strength_multiscale(mesh, scale_normals)
+
+    n_scales, N = strengths.shape
+    if min_consistent_scales is None:
+        min_consistent_scales = max(2, (n_scales + 1) // 2)
+
+    # 相对阈值：超过最大值的 threshold_ratio
+    max_val = np.max(strengths, axis=1, keepdims=True) + 1e-12
+    normalized = strengths / max_val
+
+    # 一致性：多个尺度超过阈值
+    consistent = np.sum(normalized > threshold_ratio, axis=0) >= min_consistent_scales
+
+    # 单调性：随着尺度增大，边缘响应不增强（真实边缘在所有尺度都明显）
+    if n_scales >= 2:
+        monotonic = np.all(np.diff(strengths, axis=0) <= 0, axis=0)
+    else:
+        monotonic = np.ones(N, dtype=bool)
+
+    edge_face_mask = consistent & monotonic
+
+    return edge_face_mask, strengths
+
+
+def segment_regions_by_edges(mesh, edge_face_mask):
+    """
+    移除边缘面片后，对剩余面片做连通分量分割。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    edge_face_mask : (N,) bool
+        边缘面片掩码
+
+    Returns
+    -------
+    labels : (N,) ndarray
+        区域标签。边缘面片标记为 -1。
+    """
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    N = len(mesh.faces)
+    adjacency = build_face_adjacency(mesh)
+
+    rows, cols = [], []
+    for i in range(N):
+        if edge_face_mask[i]:
+            continue
+        for j in adjacency[i]:
+            if j > i and not edge_face_mask[j]:
+                rows.extend([i, j])
+                cols.extend([j, i])
+
+    labels = np.full(N, -1, dtype=int)
+    if len(rows) > 0:
+        data = np.ones(len(rows), dtype=np.int8)
+        graph = csr_matrix((data, (rows, cols)), shape=(N, N))
+        _, comps = connected_components(graph, directed=False)
+        labels[~edge_face_mask] = comps
+
+    return labels

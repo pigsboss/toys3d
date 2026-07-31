@@ -17,6 +17,9 @@ from toys3d.geometrics import (
     repair_mesh_by_removing_duplicates,
     repair_nonmanifold_edges,
     fill_small_holes,
+    build_face_adjacency,
+    detect_multiscale_edges,
+    segment_regions_by_edges,
     estimate_shell_thickness,
     segment_plates_by_smoothness,
     detect_thin_regions,
@@ -335,6 +338,40 @@ def _repair_loop(mesh, max_iter=5):
     return mesh
 
 
+def segment_by_multiscale_edges(mesh, scales=(1, 2, 4, 8),
+                                threshold_ratio=0.3, min_faces=30):
+    """
+    多尺度边缘检测 + 连通分量分割 + 小区域合并。
+    """
+    edge_mask, strengths = detect_multiscale_edges(
+        mesh, scales=scales, threshold_ratio=threshold_ratio
+    )
+    labels = segment_regions_by_edges(mesh, edge_mask)
+
+    # 合并小区域到相邻的最大区域
+    adjacency = build_face_adjacency(mesh)
+    unique, counts = np.unique(labels[labels >= 0], return_counts=True)
+    for lbl in unique[counts < min_faces]:
+        mask = labels == lbl
+        neighbor_labels = []
+        for fi in np.flatnonzero(mask):
+            for fj in adjacency[fi]:
+                nl = labels[fj]
+                if nl >= 0 and nl != lbl:
+                    neighbor_labels.append(nl)
+        if neighbor_labels:
+            new_lbl = max(set(neighbor_labels), key=neighbor_labels.count)
+            labels[mask] = new_lbl
+
+    # 压缩标签
+    valid = labels >= 0
+    if np.any(valid):
+        _, new_labels = np.unique(labels[valid], return_inverse=True)
+        labels[valid] = new_labels
+
+    return labels
+
+
 # ------------------------------------------------------------------
 #  主处理流程
 # ------------------------------------------------------------------
@@ -345,6 +382,8 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
                   line_tol=0.05, circle_tol=0.05, spline_tol=0.1,
                   irregular_perimeter_ratio=0.05,
                   thickness_grid_size=128,
+                  seg_mode='smoothness', edge_scales=(1, 2, 4, 8),
+                  edge_threshold_ratio=0.3,
                   vis_mode='plates', vis_alpha=80):
     """
     薄壳扫描网格处理主函数。
@@ -392,10 +431,19 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
             thickness, reliability = estimate_shell_thickness(m, grid_size=thickness_grid_size)
         with Timer("  thickness statistics"):
             th_stats = compute_wall_thickness_statistics(thickness, reliability)
+
         with Timer("  plate segmentation"):
-            labels = segment_plates_by_smoothness(
-                m, angle_threshold_deg=angle_threshold_deg, min_faces=min_faces
-            )
+            if seg_mode == 'multiscale':
+                labels = segment_by_multiscale_edges(
+                    m,
+                    scales=edge_scales,
+                    threshold_ratio=edge_threshold_ratio,
+                    min_faces=min_faces
+                )
+            else:
+                labels = segment_plates_by_smoothness(
+                    m, angle_threshold_deg=angle_threshold_deg, min_faces=min_faces
+                )
         return thickness, reliability, th_stats, labels
 
     with Timer("First thickness/segmentation analysis"):
@@ -526,6 +574,13 @@ def main():
                         help="不规则边界环周长小于该比例*包围盒对角线时会被删除")
     parser.add_argument("--thickness-grid-size", type=int, default=128,
                         help="体素分辨率用于厚度估计（默认128）")
+    parser.add_argument("--seg-mode", type=str, default='smoothness',
+                        choices=['smoothness', 'multiscale'],
+                        help="薄板分割模式：smoothness=法向连通性，multiscale=多尺度边缘检测")
+    parser.add_argument("--edge-scales", type=int, nargs='+', default=(1, 2, 4, 8),
+                        help="多尺度边缘检测的邻域尺度，默认 1 2 4 8")
+    parser.add_argument("--edge-threshold", type=float, default=0.3,
+                        help="多尺度边缘检测相对阈值（默认0.3）")
     parser.add_argument("--vis-mode", type=str, default='plates',
                         choices=['plates', 'centers', 'thickness'],
                         help="Pass 0 可视化模式：plates=薄板着色, centers=中心面高亮, thickness=厚度场")
@@ -553,6 +608,9 @@ def main():
         spline_tol=args.spline_tol,
         irregular_perimeter_ratio=args.irregular_perimeter_ratio,
         thickness_grid_size=args.thickness_grid_size,
+        seg_mode=args.seg_mode,
+        edge_scales=tuple(args.edge_scales),
+        edge_threshold_ratio=args.edge_threshold,
         vis_mode=args.vis_mode,
         vis_alpha=args.vis_alpha,
     )
