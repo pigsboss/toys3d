@@ -147,8 +147,8 @@ def visualize_plates(mesh, labels):
 
 def visualize_plate_centers(mesh, labels, alpha=80):
     """
-    高亮显示每个薄板的中心面（局部拟合平面上的圆盘），
-    并以半透明方式显示原始网格。
+    以薄板自身面片作为中心面代理进行可视化。
+    原始模型网格半透明显示，薄板面片用不透明彩色高亮显示。
 
     Parameters
     ----------
@@ -156,7 +156,7 @@ def visualize_plate_centers(mesh, labels, alpha=80):
     labels : (N,) ndarray
         薄板标签。
     alpha : int
-        原始网格透明度（0-255）。
+        非薄板/背景面片的透明度（0-255）。
 
     Returns
     -------
@@ -164,17 +164,19 @@ def visualize_plate_centers(mesh, labels, alpha=80):
     """
     scene = trimesh.Scene()
 
-    # 原始网格半透明
+    # 底层：半透明原始网格
     base = mesh.copy()
     N = len(base.faces)
-    colors = np.full((N, 4), 200, dtype=np.uint8)
-    colors[:, 3] = alpha
-    base.visual.face_colors = colors
-    scene.add_geometry(base)
+    base_colors = np.full((N, 4), 180, dtype=np.uint8)
+    base_colors[:, 3] = alpha
+    base.visual.face_colors = base_colors
+    scene.add_geometry(base, node_name='base_mesh')
 
-    # 随机调色板
-    rng = np.random.default_rng(42)
+    # 顶层：薄板面片不透明彩色
+    plates = mesh.copy()
     n_plates = int(max(0, labels.max()) + 1)
+
+    rng = np.random.default_rng(42)
     palette = np.column_stack([
         rng.integers(80, 255, size=n_plates),
         rng.integers(80, 255, size=n_plates),
@@ -182,59 +184,18 @@ def visualize_plate_centers(mesh, labels, alpha=80):
         np.full(n_plates, 255, dtype=np.uint8),
     ])
 
-    # 为每个薄板生成中心面圆盘
+    plate_colors = np.full((N, 4), 0, dtype=np.uint8)  # 默认透明
     for lbl in range(n_plates):
         mask = labels == lbl
-        n_faces = int(np.sum(mask))
-        if n_faces < 3:
+        if np.sum(mask) == 0:
             continue
+        plate_colors[mask] = palette[lbl % len(palette)]
 
-        centers = mesh.triangles_center[mask]
-        mean_pt = centers.mean(axis=0)
+    # 未归类面片完全透明
+    plate_colors[labels < 0] = [0, 0, 0, 0]
 
-        # 用 PCA 拟合局部平面
-        centered = centers - mean_pt
-        cov = centered.T @ centered
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        normal = eigvecs[:, np.argmin(eigvals)]
-
-        # 确保法向与薄板平均法向一致
-        face_normals = mesh.face_normals[mask]
-        avg_normal = face_normals.mean(axis=0)
-        avg_normal = avg_normal / (np.linalg.norm(avg_normal) + 1e-12)
-        if np.dot(normal, avg_normal) < 0:
-            normal = -normal
-
-        # 在平面内构造两个正交基
-        if abs(normal[2]) < 0.9:
-            u = np.cross([0.0, 0.0, 1.0], normal)
-        else:
-            u = np.cross([1.0, 0.0, 0.0], normal)
-        un = np.linalg.norm(u)
-        if un < 1e-12:
-            continue
-        u = u / un
-        v = np.cross(normal, u)
-
-        # 圆盘半径：薄板投影到平面的包围半径
-        proj_u = centered @ u
-        proj_v = centered @ v
-        sq = proj_u * proj_u + proj_v * proj_v
-        radius = float(np.sqrt(np.maximum(sq, 0).max()))
-
-        if radius < 1e-6:
-            continue
-
-        # 创建圆盘并变换到平面位置
-        disk = trimesh.creation.cylinder(radius=radius, height=0.01 * radius, sections=32)
-        R = np.column_stack([u, v, normal])
-        T = np.eye(4)
-        T[:3, :3] = R
-        T[:3, 3] = mean_pt
-        disk.apply_transform(T)
-        disk.visual.face_colors = palette[lbl % len(palette)]
-
-        scene.add_geometry(disk)
+    plates.visual.face_colors = plate_colors
+    scene.add_geometry(plates, node_name='plate_faces')
 
     # 添加坐标轴
     origin = mesh.bounding_box.centroid
