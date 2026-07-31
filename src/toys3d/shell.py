@@ -226,7 +226,7 @@ def visualize_plate_centers(mesh, labels, alpha=80):
             continue
 
         # 创建圆盘并变换到平面位置
-        disk = trimesh.creation.disk(radius=radius, sections=32)
+        disk = trimesh.creation.cylinder(radius=radius, height=0.01 * radius, sections=32)
         R = np.column_stack([u, v, normal])
         T = np.eye(4)
         T[:3, :3] = R
