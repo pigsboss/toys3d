@@ -2513,7 +2513,12 @@ def compute_multiscale_face_normals(mesh, scales=(1, 2, 4, 8)):
         for i in range(N):
             neighbors = get_k_ring_neighbors(adjacency, i, k=k)
             w = areas[neighbors]
-            avg = np.average(base_normals[neighbors], axis=0, weights=w)
+            w_sum = np.sum(w)
+            if w_sum < 1e-12:
+                # 退化情况：等权平均
+                avg = np.mean(base_normals[neighbors], axis=0)
+            else:
+                avg = np.average(base_normals[neighbors], axis=0, weights=w)
             norm = np.linalg.norm(avg)
             smoothed[i] = avg / norm if norm > 1e-12 else base_normals[i]
         scale_normals.append(smoothed)
