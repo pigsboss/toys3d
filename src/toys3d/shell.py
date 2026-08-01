@@ -148,10 +148,10 @@ def visualize_plates(mesh, labels):
     return scene
 
 
-def visualize_plate_centers(mesh, labels, alpha=80):
+def visualize_plate_centers(mesh, labels, alpha=80, plate_alpha=180):
     """
     以薄板自身面片作为中心面代理进行可视化。
-    原始模型网格半透明显示，薄板面片用不透明彩色高亮显示。
+    单网格混合着色：背景面片半透明灰色，薄板面片半透明彩色。
 
     Parameters
     ----------
@@ -159,48 +159,42 @@ def visualize_plate_centers(mesh, labels, alpha=80):
     labels : (N,) ndarray
         薄板标签。
     alpha : int
-        非薄板/背景面片的透明度（0-255）。
-
-    Returns
-    -------
-    scene : trimesh.Scene
+        未归类/背景面片的透明度（0-255，默认80）。
+    plate_alpha : int
+        薄板面片的透明度（0-255，默认180）。
     """
     scene = trimesh.Scene()
+    vis = mesh.copy()
+    N = len(vis.faces)
 
-    # 底层：半透明原始网格
-    base = mesh.copy()
-    N = len(base.faces)
-    base_colors = np.full((N, 4), 180, dtype=np.uint8)
-    base_colors[:, 3] = alpha
-    base.visual.face_colors = base_colors
-    scene.add_geometry(base, node_name='base_mesh')
-
-    # 顶层：薄板面片不透明彩色
-    plates = mesh.copy()
-    n_plates = int(max(0, labels.max()) + 1)
-
+    # 调色板
     rng = np.random.default_rng(42)
+    n_plates = int(max(0, labels.max()) + 1)
     palette = np.column_stack([
         rng.integers(80, 255, size=n_plates),
         rng.integers(80, 255, size=n_plates),
         rng.integers(80, 255, size=n_plates),
-        np.full(n_plates, 255, dtype=np.uint8),
+        np.full(n_plates, plate_alpha, dtype=np.uint8),
     ])
 
-    plate_colors = np.full((N, 4), 0, dtype=np.uint8)  # 默认透明
+    # 初始化：背景为半透明灰色
+    colors = np.full((N, 4), 180, dtype=np.uint8)
+    colors[:, 3] = alpha
+
+    # 薄板面片覆盖为彩色
     for lbl in range(n_plates):
         mask = labels == lbl
         if np.sum(mask) == 0:
             continue
-        plate_colors[mask] = palette[lbl % len(palette)]
+        colors[mask] = palette[lbl % len(palette)]
 
-    # 未归类面片完全透明
-    plate_colors[labels < 0] = [0, 0, 0, 0]
+    # 未归类面片（labels < 0）保持半透明灰色
+    colors[labels < 0] = [180, 180, 180, alpha]
 
-    plates.visual.face_colors = plate_colors
-    scene.add_geometry(plates, node_name='plate_faces')
+    vis.visual.face_colors = colors
+    scene.add_geometry(vis)
 
-    # 添加坐标轴
+    # 坐标轴
     origin = mesh.bounding_box.centroid
     max_ext = mesh.bounding_box.extents.max()
     add_axes_to_scene(scene, origin,
@@ -384,7 +378,7 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
                   thickness_grid_size=128,
                   seg_mode='smoothness', edge_scales=(1, 2, 4, 8),
                   edge_threshold_ratio=0.3,
-                  vis_mode='plates', vis_alpha=80):
+                  vis_mode='plates', vis_alpha=80, plate_alpha=180):
     """
     薄壳扫描网格处理主函数。
 
@@ -462,7 +456,7 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
                 world_scene = visualize_thickness(mesh, thickness, reliability)
                 scene = visualize_plates(mesh, labels)
             elif vis_mode == 'centers':
-                world_scene = visualize_plate_centers(mesh, labels, alpha=vis_alpha)
+                world_scene = visualize_plate_centers(mesh, labels, alpha=vis_alpha, plate_alpha=plate_alpha)
                 scene = world_scene
             else:  # 'plates'
                 world_scene = visualize_thickness(mesh, thickness, reliability)
@@ -586,6 +580,8 @@ def main():
                         help="Pass 0 可视化模式：plates=薄板着色, centers=中心面高亮, thickness=厚度场")
     parser.add_argument("--vis-alpha", type=int, default=80,
                         help="原始网格透明度（仅 centers 模式，0-255，默认80）")
+    parser.add_argument("--plate-alpha", type=int, default=180,
+                        help="薄板面片透明度（仅 centers 模式，0-255，默认180）")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
     args = parser.parse_args()
 
@@ -613,6 +609,7 @@ def main():
         edge_threshold_ratio=args.edge_threshold,
         vis_mode=args.vis_mode,
         vis_alpha=args.vis_alpha,
+        plate_alpha=args.plate_alpha,
     )
 
     if args.output:
