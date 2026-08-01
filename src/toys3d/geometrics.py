@@ -2677,7 +2677,9 @@ def build_proxy_mesh(mesh, target_faces=50000, max_edge_length=None,
     for it in range(iterations):
         # 1. 二次误差简化
         if len(proxy.faces) > target_faces:
-            proxy = proxy.simplify_quadric_decimation(target_faces)
+            target_reduction = 1.0 - target_faces / len(proxy.faces)
+            target_reduction = max(0.0, min(0.99, target_reduction))
+            proxy = proxy.simplify_quadric_decimation(target_reduction=target_reduction)
 
         # 2. 限制最大边长
         if max_edge_length is None:
