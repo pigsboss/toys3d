@@ -26,6 +26,10 @@ from toys3d.geometrics import (
     compute_wall_thickness_statistics,
     extract_plate_boundary_loops,
     classify_edge_regularity,
+    # 新增代理网格与局部聚类分割
+    build_proxy_mesh,
+    map_labels_from_proxy,
+    segment_plates_by_local_clustering,
 )
 
 
@@ -484,9 +488,11 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
                   line_tol=0.05, circle_tol=0.05, spline_tol=0.1,
                   irregular_perimeter_ratio=0.05,
                   thickness_grid_size=128,
-                  seg_mode='smoothness', edge_scales=(1, 2, 4, 8),
+                  seg_mode='cluster', edge_scales=(1, 2, 4, 8),
                   edge_threshold_ratio=0.3,
-                  vis_mode='plates', vis_alpha=40, plate_alpha=200):
+                  vis_mode='plates', vis_alpha=40, plate_alpha=200,
+                  proxy_faces=50000, proxy_max_edge=None,
+                  cluster_depth=2, cluster_angle_deg=30.0):
     """
     薄壳扫描网格处理主函数。
 
@@ -528,14 +534,23 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
                   f"nonmanifold_edges={defect_stats['nonmanifold_edges']}")
 
     # 首次厚度估计与薄板分割（后续各阶段都会复用）
-    def analyze_current(m):
-        with Timer("  thickness estimation"):
+    def analyze_current(m, proxy_m=None, step_label=""):
+        with Timer(f"{step_label} thickness estimation"):
             thickness, reliability = estimate_shell_thickness(m, grid_size=thickness_grid_size)
-        with Timer("  thickness statistics"):
+        with Timer(f"{step_label} thickness statistics"):
             th_stats = compute_wall_thickness_statistics(thickness, reliability)
 
-        with Timer("  plate segmentation"):
-            if seg_mode == 'multiscale':
+        with Timer(f"{step_label} plate segmentation"):
+            if seg_mode == 'cluster':
+                # 在代理网格上分割
+                p = proxy_m if proxy_m is not None else m
+                proxy_labels = segment_plates_by_local_clustering(
+                    p, depth=cluster_depth,
+                    cluster_angle_deg=cluster_angle_deg,
+                    min_faces=min_faces
+                )
+                labels = map_labels_from_proxy(m, p, proxy_labels)
+            elif seg_mode == 'multiscale':
                 labels = segment_by_multiscale_edges(
                     m,
                     scales=edge_scales,
@@ -548,8 +563,34 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
                 )
         return thickness, reliability, th_stats, labels
 
+    # 先估计初始厚度，用于自适应代理网格参数
+    with Timer("Initial thickness estimation"):
+        thickness, reliability = estimate_shell_thickness(mesh, grid_size=thickness_grid_size)
+        th_stats = compute_wall_thickness_statistics(thickness, reliability)
+
+    print(f"\n[Thickness] median={th_stats['median']:.4f}, "
+          f"reliable={th_stats['reliable_ratio']:.2%}")
+
+    # 构建代理网格（用于 cluster 模式）
+    proxy_mesh = None
+    if seg_mode == 'cluster':
+        with Timer("Build proxy mesh"):
+            auto_max_edge = proxy_max_edge
+            if auto_max_edge is None and np.isfinite(th_stats.get('median', np.nan)):
+                auto_max_edge = th_stats['median'] * 0.5
+            proxy_mesh = build_proxy_mesh(
+                mesh,
+                target_faces=proxy_faces,
+                max_edge_length=auto_max_edge,
+                iterations=2,
+                smooth=False
+            )
+            print(f"  Proxy mesh: {proxy_mesh.faces.shape[0]} faces, "
+                  f"mean_edge={proxy_mesh.edges_unique_length.mean():.4f}")
+
+    # 第一次完整分析（包含分割）
     with Timer("First thickness/segmentation analysis"):
-        thickness, reliability, th_stats, labels = analyze_current(mesh)
+        thickness, reliability, th_stats, labels = analyze_current(mesh, proxy_mesh, step_label="First")
 
     print("\n[Shell analysis]")
     print(f"  Median thickness: {th_stats['median']:.4f}")
@@ -596,7 +637,7 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
         mesh = fill_small_holes(mesh, max_loop_edges=100, verbose=False)
 
     with Timer("Second thickness/segmentation analysis (after cleanup)"):
-        thickness, reliability, th_stats, labels = analyze_current(mesh)
+        thickness, reliability, th_stats, labels = analyze_current(mesh, proxy_mesh, step_label="Second")
     print(f"  After cleanup: {mesh.faces.shape[0]} faces, median thickness: {th_stats['median']:.4f}")
 
     if num_passes == 1:
@@ -633,7 +674,7 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
 
     # 重新分析用于最终可视化
     with Timer("Third thickness/segmentation analysis (after refinement)"):
-        thickness, reliability, th_stats, labels = analyze_current(mesh)
+        thickness, reliability, th_stats, labels = analyze_current(mesh, proxy_mesh, step_label="Third")
     print(f"  After refinement: {mesh.faces.shape[0]} faces, "
           f"median thickness: {th_stats['median']:.4f}")
 
@@ -676,9 +717,9 @@ def main():
                         help="不规则边界环周长小于该比例*包围盒对角线时会被删除")
     parser.add_argument("--thickness-grid-size", type=int, default=128,
                         help="体素分辨率用于厚度估计（默认128）")
-    parser.add_argument("--seg-mode", type=str, default='smoothness',
-                        choices=['smoothness', 'multiscale'],
-                        help="薄板分割模式：smoothness=法向连通性，multiscale=多尺度边缘检测")
+    parser.add_argument("--seg-mode", type=str, default='cluster',
+                        choices=['smoothness', 'multiscale', 'cluster'],
+                        help="薄板分割模式：smoothness=法向连通性，multiscale=多尺度边缘，cluster=局部法向聚类")
     parser.add_argument("--edge-scales", type=int, nargs='+', default=(1, 2, 4, 8),
                         help="多尺度边缘检测的邻域尺度，默认 1 2 4 8")
     parser.add_argument("--edge-threshold", type=float, default=0.3,
@@ -690,6 +731,14 @@ def main():
                         help="原始网格透明度（仅 centers 模式，0-255，默认40）")
     parser.add_argument("--plate-alpha", type=int, default=200,
                         help="薄板面片透明度（仅 centers 模式，0-255，默认200）")
+    parser.add_argument("--proxy-faces", type=int, default=50000,
+                        help="代理网格目标面片数（仅 cluster 模式，默认50000）")
+    parser.add_argument("--proxy-max-edge", type=float, default=None,
+                        help="代理网格最大边长（默认自动=0.5*厚度中位数）")
+    parser.add_argument("--cluster-depth", type=int, default=2,
+                        help="局部法向聚类邻域树深度（默认2）")
+    parser.add_argument("--cluster-angle", type=float, default=30.0,
+                        help="同一法向簇最大夹角（度，默认30）")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
     args = parser.parse_args()
 
@@ -718,6 +767,10 @@ def main():
         vis_mode=args.vis_mode,
         vis_alpha=args.vis_alpha,
         plate_alpha=args.plate_alpha,
+        proxy_faces=args.proxy_faces,
+        proxy_max_edge=args.proxy_max_edge,
+        cluster_depth=args.cluster_depth,
+        cluster_angle_deg=args.cluster_angle,
     )
 
     if args.output:

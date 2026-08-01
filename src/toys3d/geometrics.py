@@ -1549,12 +1549,31 @@ def fit_obb_2d(points_2d):
 # ------------------------------------------------------------------
 
 def compute_mesh_stats(mesh):
-    """返回网格基本统计信息字典。"""
+    """返回网格基本统计信息字典，包含顶点、面片、边、边界边及边长分布。"""
     faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
     stats = {}
     stats['vertices'] = mesh.vertices.shape[0]
     stats['faces'] = faces.shape[0]
     stats['edges'] = mesh.edges_unique.shape[0]
+
+    # 边长统计
+    if mesh.edges_unique.shape[0] > 0:
+        edge_lengths = mesh.edges_unique_length
+        stats['mean_edge_length'] = float(np.mean(edge_lengths))
+        stats['edge_length_p1'] = float(np.percentile(edge_lengths, 1))
+        stats['edge_length_p5'] = float(np.percentile(edge_lengths, 5))
+        stats['edge_length_p50'] = float(np.percentile(edge_lengths, 50))
+        stats['edge_length_p95'] = float(np.percentile(edge_lengths, 95))
+        stats['edge_length_p99'] = float(np.percentile(edge_lengths, 99))
+    else:
+        stats['mean_edge_length'] = 0.0
+        stats['edge_length_p1'] = 0.0
+        stats['edge_length_p5'] = 0.0
+        stats['edge_length_p50'] = 0.0
+        stats['edge_length_p95'] = 0.0
+        stats['edge_length_p99'] = 0.0
+
+    # 边界边统计
     edge_face_map = {}
     for face_idx, face in enumerate(faces):
         v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
@@ -2625,5 +2644,215 @@ def segment_regions_by_edges(mesh, edge_face_mask):
         labels[valid_indices] = comps
     else:
         labels[valid_indices] = np.arange(n_valid)
+
+    return labels
+
+# ------------------------------------------------------------------
+#  代理网格与局部法向聚类薄板分割
+# ------------------------------------------------------------------
+
+def build_proxy_mesh(mesh, target_faces=50000, max_edge_length=None,
+                     iterations=2, smooth=False):
+    """
+    从原始扫描网格构建均匀、低分辨率、近似水密的代理网格。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    target_faces : int
+        目标面片数
+    max_edge_length : float or None
+        最大允许边长，超过则细分。默认取包围盒对角线的 2%。
+    iterations : int
+        简化-细分-清理的迭代次数
+    smooth : bool
+        是否做轻微 Laplacian 平滑
+
+    Returns
+    -------
+    proxy : trimesh.Trimesh
+    """
+    proxy = mesh.copy()
+
+    for it in range(iterations):
+        # 1. 二次误差简化
+        if len(proxy.faces) > target_faces:
+            proxy = proxy.simplify_quadratic_decimation(target_faces)
+
+        # 2. 限制最大边长
+        if max_edge_length is None:
+            diag = float(np.linalg.norm(proxy.bounding_box.extents))
+            max_edge_length = diag * 0.02
+        if max_edge_length > 0:
+            proxy = proxy.subdivide_to_size(max_edge_length)
+
+        # 3. 清理
+        proxy.merge_vertices()
+        proxy.remove_duplicate_faces()
+        proxy.remove_degenerate_faces()
+        proxy.remove_unreferenced_vertices()
+
+    if smooth and hasattr(proxy, 'smoothed'):
+        proxy = proxy.smoothed(iterations=1)
+
+    proxy.fix_normals()
+    return proxy
+
+
+def map_labels_from_proxy(original_mesh, proxy_mesh, proxy_labels):
+    """
+    将代理网格上的薄板标签映射回原始网格。
+
+    Returns
+    -------
+    labels : (N,) ndarray
+    """
+    from scipy.spatial import cKDTree
+
+    proxy_centers = np.asarray(proxy_mesh.triangles_center, dtype=np.float64)
+    original_centers = np.asarray(original_mesh.triangles_center, dtype=np.float64)
+
+    if len(proxy_centers) == 0 or len(original_centers) == 0:
+        return np.zeros(len(original_centers), dtype=int)
+
+    tree = cKDTree(proxy_centers)
+    _, indices = tree.query(original_centers, k=1)
+    return np.asarray(proxy_labels, dtype=int)[indices]
+
+
+class _NormalCluster:
+    """用于无符号法向聚类的简单辅助类。"""
+    def __init__(self, normal):
+        self.normals = [normal]
+        self.mean_axis = normal.copy()
+
+    def add(self, normal):
+        self.normals.append(normal)
+        # 增量更新平均方向
+        avg = np.mean(self.normals, axis=0)
+        n = np.linalg.norm(avg)
+        self.mean_axis = avg / n if n > 1e-12 else self.mean_axis
+
+
+def segment_plates_by_local_clustering(mesh, depth=2,
+                                       cluster_angle_deg=30.0,
+                                       min_faces=30):
+    """
+    基于局部邻域法向聚类的水密薄板分割。
+
+    对每个面片，取其 k-ring 邻域内的法向，用无符号点积做贪心聚类。
+    若邻域中法向呈现 2 个或以上聚类，则该面片位于薄板交界。
+    移除交界后做连通分量，再将交界重分配，合并小区域。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    depth : int
+        邻域树深度（默认 2）
+    cluster_angle_deg : float
+        同一簇内法向最大夹角（度）
+    min_faces : int
+        薄板最小面片数
+
+    Returns
+    -------
+    labels : (N,) ndarray
+    """
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    adjacency = build_face_adjacency(mesh)
+    N = len(mesh.faces)
+    normals = np.asarray(mesh.face_normals, dtype=np.float64)
+    cos_thr = np.cos(np.deg2rad(cluster_angle_deg))
+
+    boundary_mask = np.zeros(N, dtype=bool)
+
+    for fi in range(N):
+        neighbors = get_k_ring_neighbors(adjacency, fi, k=depth)
+        if len(neighbors) < 3:
+            continue
+
+        n_list = normals[neighbors]
+        clusters = []
+
+        for n in n_list:
+            n_unit = n / (np.linalg.norm(n) + 1e-12)
+            added = False
+            for cl in clusters:
+                if abs(np.dot(n_unit, cl.mean_axis)) >= cos_thr:
+                    cl.add(n_unit)
+                    added = True
+                    break
+            if not added:
+                clusters.append(_NormalCluster(n_unit))
+
+        if len(clusters) >= 2:
+            boundary_mask[fi] = True
+
+    # 移除边界后面片做连通分量
+    valid_mask = ~boundary_mask
+    valid_indices = np.flatnonzero(valid_mask)
+    n_valid = len(valid_indices)
+
+    labels = np.full(N, -1, dtype=int)
+    if n_valid > 0:
+        remap = np.full(N, -1, dtype=np.int64)
+        remap[valid_indices] = np.arange(n_valid)
+
+        rows, cols = [], []
+        for i in valid_indices:
+            for j in adjacency[i]:
+                if j > i and valid_mask[j]:
+                    ii, jj = remap[i], remap[j]
+                    rows.extend([ii, jj])
+                    cols.extend([jj, ii])
+
+        if len(rows) > 0:
+            data = np.ones(len(rows), dtype=np.int8)
+            graph = csr_matrix((data, (rows, cols)), shape=(n_valid, n_valid))
+            _, comps = connected_components(graph, directed=False)
+            labels[valid_indices] = comps
+        else:
+            labels[valid_indices] = np.arange(n_valid)
+
+    # 将边界面片重新分配到相邻薄板
+    for fi in range(N):
+        if labels[fi] != -1:
+            continue
+
+        best_label = -1
+        best_sim = -np.inf
+        for fj in adjacency[fi]:
+            lbl = labels[fj]
+            if lbl < 0:
+                continue
+            sim = abs(np.dot(normals[fi], normals[fj]))
+            if sim > best_sim:
+                best_sim = sim
+                best_label = lbl
+
+        if best_label != -1:
+            labels[fi] = best_label
+
+    # 合并小区域
+    unique, counts = np.unique(labels[labels >= 0], return_counts=True)
+    for lbl in unique[counts < min_faces]:
+        mask = labels == lbl
+        neighbor_labels = []
+        for fi in np.flatnonzero(mask):
+            for fj in adjacency[fi]:
+                nl = labels[fj]
+                if nl >= 0 and nl != lbl:
+                    neighbor_labels.append(nl)
+        if neighbor_labels:
+            new_lbl = max(set(neighbor_labels), key=neighbor_labels.count)
+            labels[mask] = new_lbl
+
+    # 压缩标签
+    valid = labels >= 0
+    if np.any(valid):
+        _, new_labels = np.unique(labels[valid], return_inverse=True)
+        labels[valid] = new_labels
 
     return labels
