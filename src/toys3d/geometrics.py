@@ -2688,7 +2688,13 @@ def build_proxy_mesh(mesh, target_faces=50000, max_edge_length=None,
 
         # 3. 清理
         proxy.merge_vertices()
-        proxy.remove_duplicate_faces()
+        # Remove duplicate faces (trimesh may not have this method, use NumPy)
+        faces = np.asarray(proxy.faces, dtype=np.int64)
+        unique_faces, idx = np.unique(faces, axis=0, return_index=True)
+        if unique_faces.shape[0] < faces.shape[0]:
+            proxy = trimesh.Trimesh(vertices=proxy.vertices,
+                                    faces=unique_faces,
+                                    process=False)
         proxy.remove_degenerate_faces()
         proxy.remove_unreferenced_vertices()
 
