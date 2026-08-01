@@ -151,23 +151,18 @@ def visualize_plates(mesh, labels):
 def _assign_plate_colors(labels, adjacency):
     """
     为每个薄板分配调色板颜色索引，保证相邻薄板颜色不同（贪心四色）。
-
-    Parameters
-    ----------
-    labels : (N,) int
-        面片标签，-1 为无效。
-    adjacency : list of list
-        面片邻接表。
-
-    Returns
-    -------
-    color_map : dict {label: color_index}
-    palette : list of [r,g,b] 颜色列表
+    所有有效标签（>=0）都会获得颜色。
     """
     from collections import defaultdict
 
-    # 构建标签邻接关系
+    # 初始化所有有效标签，确保孤立薄板也有颜色
+    unique_labels = np.unique(labels)
+    valid_labels = [l for l in unique_labels if l >= 0]
     label_neighbors = defaultdict(set)
+    for lbl in valid_labels:
+        label_neighbors[lbl]  # 创建空集
+
+    # 构建标签邻接关系
     for fi, neighbors in enumerate(adjacency):
         lbl = labels[fi]
         if lbl < 0:
@@ -179,7 +174,7 @@ def _assign_plate_colors(labels, adjacency):
             label_neighbors[lbl].add(lbl2)
             label_neighbors[lbl2].add(lbl)
 
-    # 基础高对比度调色板（四色）
+    # 基础高对比度调色板
     palette = [
         [230, 60, 60],    # 红
         [60, 120, 230],   # 蓝
@@ -196,7 +191,6 @@ def _assign_plate_colors(labels, adjacency):
                 chosen = i
                 break
         if chosen is None:
-            # 四色不足则动态扩展（通常不会发生）
             extras = [
                 [180, 40, 180],   # 紫
                 [0, 200, 200],    # 青
@@ -427,15 +421,37 @@ def _repair_loop(mesh, max_iter=5):
 def segment_by_multiscale_edges(mesh, scales=(1, 2, 4, 8),
                                 threshold_ratio=0.3, min_faces=30):
     """
-    多尺度边缘检测 + 连通分量分割 + 小区域合并。
+    多尺度边缘检测 + 连通分量分割 + 边缘面片重新分配 + 小区域合并。
     """
     edge_mask, strengths = detect_multiscale_edges(
         mesh, scales=scales, threshold_ratio=threshold_ratio
     )
     labels = segment_regions_by_edges(mesh, edge_mask)
 
-    # 合并小区域到相邻的最大区域
+    # 将边缘面片（-1）重新分配给相邻薄板
     adjacency = build_face_adjacency(mesh)
+    normals = mesh.face_normals
+
+    for fi in range(len(labels)):
+        if labels[fi] != -1:
+            continue
+
+        best_label = -1
+        best_angle = np.inf
+        for fj in adjacency[fi]:
+            lbl = labels[fj]
+            if lbl <= 0:
+                continue
+            dot = np.clip(np.dot(normals[fi], normals[fj]), -1.0, 1.0)
+            angle = float(np.arccos(dot))
+            if angle < best_angle:
+                best_angle = angle
+                best_label = lbl
+
+        if best_label != -1:
+            labels[fi] = best_label
+
+    # 合并小区域
     unique, counts = np.unique(labels[labels >= 0], return_counts=True)
     for lbl in unique[counts < min_faces]:
         mask = labels == lbl

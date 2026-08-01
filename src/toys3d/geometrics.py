@@ -2000,85 +2000,61 @@ def segment_plates_by_smoothness(mesh, angle_threshold_deg=30.0, min_faces=10):
 # ==================================================================
 
 # ------------------------------------------------------------------
-#  基于体素距离场的厚度估计（替换原射线法）
+#  基于 k-d 树的厚度估计
 # ------------------------------------------------------------------
 
-def estimate_shell_thickness(mesh, grid_size=128, margin=1.05):
+def estimate_shell_thickness(mesh, grid_size=128, margin=1.05, k_neighbors=20):
     """
-    基于体素距离场估计每个面片的局部厚度。
+    基于 k-d 树最近邻搜索估计每个面片的局部厚度。
 
-    将薄壳网格体素化，计算占用网格的距离变换。
-    对每个面片中心，取映射体素处的距离值，近似为半厚度，乘以 2 得到厚度。
+    对每个面片，查找其最近邻中法向反平行的面片，
+    以两中心距离近似壁厚。无法找到时厚度为 NaN。
 
     Parameters
     ----------
     mesh : trimesh.Trimesh
     grid_size : int
-        体素网格分辨率（沿最长轴）
+        保留参数（兼容旧接口）。
     margin : float
-        包围盒外边距比例
+        保留参数（兼容旧接口）。
+    k_neighbors : int
+        每个面片检查的最近邻数量（默认20）。
 
     Returns
     -------
     thickness : (N,) ndarray
-        每个面片的厚度估计值（NaN 表示无法估计）
     reliability : (N,) bool
-        是否成功映射到有效体素
     """
-    from scipy import ndimage
+    from scipy.spatial import cKDTree
 
-    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
-    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    centers = np.asarray(mesh.triangles_center, dtype=np.float64)
+    normals = np.asarray(mesh.face_normals, dtype=np.float64)
+    N = len(centers)
 
-    # 计算带边距的包围盒
-    v_min = vertices.min(axis=0)
-    v_max = vertices.max(axis=0)
-    center = (v_min + v_max) / 2.0
-    extents = v_max - v_min
-    max_extent = extents.max()
-    if max_extent < 1e-12:
-        return np.full(len(faces), np.nan), np.zeros(len(faces), dtype=bool)
+    thickness = np.full(N, np.nan, dtype=np.float64)
+    reliability = np.zeros(N, dtype=bool)
 
-    box_size = max_extent * margin
-    origin = center - box_size / 2.0
-    pitch = box_size / grid_size
+    if N == 0:
+        return thickness, reliability
 
-    if pitch <= 0:
-        return np.full(len(faces), np.nan), np.zeros(len(faces), dtype=bool)
+    k = min(k_neighbors, N - 1) if N > 1 else 1
 
-    # 面片中心体素化
-    centers = mesh.triangles_center
-    voxel_coords = np.floor((centers - origin) / pitch).astype(int)
-    voxel_coords = np.clip(voxel_coords, 0, grid_size - 1)
+    tree = cKDTree(centers)
+    dists, inds = tree.query(centers, k=k)
 
-    # 构建占用网格：标记任何包含三角面片的体素
-    occupied = np.zeros((grid_size, grid_size, grid_size), dtype=bool)
-
-    # 采样每条边来光栅化三角面片
-    N = len(faces)
-    for fi in range(N):
-        v = faces[fi]
-        pts = vertices[v]
-        # 简单采样：面片中心 + 三条边中点
-        samples = np.vstack([
-            pts.mean(axis=0)[None, :],
-            (pts + np.roll(pts, -1, axis=0)) / 2.0
-        ])
-        coords = np.floor((samples - origin) / pitch).astype(int)
-        coords = np.clip(coords, 0, grid_size - 1)
-        occupied[coords[:, 0], coords[:, 1], coords[:, 2]] = True
-
-    # 距离变换：占用体素距离为 0，内部空腔距离表示到表面的距离
-    distance = ndimage.distance_transform_edt(~occupied)
-
-    # 每个面片中心的半厚度 * 2
-    ix, iy, iz = voxel_coords[:, 0], voxel_coords[:, 1], voxel_coords[:, 2]
-    half_thickness = distance[ix, iy, iz] * pitch
-
-    thickness = half_thickness * 2.0
-
-    # 可靠性：非零厚度且不是背景
-    reliability = (half_thickness > 0) & np.isfinite(thickness)
+    for i in range(N):
+        for j in range(k):
+            idx = inds[i, j]
+            if idx == i:
+                continue
+            d = float(dists[i, j])
+            if d < 1e-12:
+                continue
+            dot = float(np.dot(normals[i], normals[idx]))
+            if dot < -0.3:  # 法向反平行
+                thickness[i] = d
+                reliability[i] = True
+                break
 
     return thickness, reliability
 
