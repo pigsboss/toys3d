@@ -2708,7 +2708,7 @@ def build_proxy_mesh(mesh, target_faces=50000, max_edge_length=None,
     proxy.merge_vertices()
     # 去除重复面片
     faces = np.asarray(proxy.faces, dtype=np.int64)
-    unique_faces, _ = np.unique(faces, axis=0, return_counts=False)
+    unique_faces = np.unique(faces, axis=0)
     if unique_faces.shape[0] < faces.shape[0]:
         proxy = trimesh.Trimesh(vertices=proxy.vertices,
                                 faces=unique_faces,
