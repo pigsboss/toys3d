@@ -2695,7 +2695,12 @@ def build_proxy_mesh(mesh, target_faces=50000, max_edge_length=None,
             proxy = trimesh.Trimesh(vertices=proxy.vertices,
                                     faces=unique_faces,
                                     process=False)
-        proxy.remove_degenerate_faces()
+        # Remove degenerate faces (zero area)
+        nd_mask = proxy.nondegenerate_faces
+        if not np.all(nd_mask):
+            proxy = trimesh.Trimesh(vertices=proxy.vertices,
+                                    faces=proxy.faces[nd_mask],
+                                    process=False)
         proxy.remove_unreferenced_vertices()
 
     if smooth and hasattr(proxy, 'smoothed'):
