@@ -148,10 +148,78 @@ def visualize_plates(mesh, labels):
     return scene
 
 
-def visualize_plate_centers(mesh, labels, alpha=80, plate_alpha=180):
+def _assign_plate_colors(labels, adjacency):
+    """
+    为每个薄板分配调色板颜色索引，保证相邻薄板颜色不同（贪心四色）。
+
+    Parameters
+    ----------
+    labels : (N,) int
+        面片标签，-1 为无效。
+    adjacency : list of list
+        面片邻接表。
+
+    Returns
+    -------
+    color_map : dict {label: color_index}
+    palette : list of [r,g,b] 颜色列表
+    """
+    from collections import defaultdict
+
+    # 构建标签邻接关系
+    label_neighbors = defaultdict(set)
+    for fi, neighbors in enumerate(adjacency):
+        lbl = labels[fi]
+        if lbl < 0:
+            continue
+        for fj in neighbors:
+            lbl2 = labels[fj]
+            if lbl2 < 0 or lbl2 == lbl:
+                continue
+            label_neighbors[lbl].add(lbl2)
+            label_neighbors[lbl2].add(lbl)
+
+    # 基础高对比度调色板（四色）
+    palette = [
+        [230, 60, 60],    # 红
+        [60, 120, 230],   # 蓝
+        [60, 200, 80],    # 绿
+        [255, 200, 40],   # 黄
+    ]
+
+    color_map = {}
+    for lbl in sorted(label_neighbors.keys()):
+        used = {color_map[n] for n in label_neighbors[lbl] if n in color_map}
+        chosen = None
+        for i in range(len(palette)):
+            if i not in used:
+                chosen = i
+                break
+        if chosen is None:
+            # 四色不足则动态扩展（通常不会发生）
+            extras = [
+                [180, 40, 180],   # 紫
+                [0, 200, 200],    # 青
+                [255, 120, 0],    # 橙
+                [120, 80, 60],    # 棕
+            ]
+            palette.extend(extras)
+            for i in range(len(palette)):
+                if i not in used:
+                    chosen = i
+                    break
+        color_map[lbl] = chosen
+
+    return color_map, palette
+
+
+def visualize_plate_centers(mesh, labels, alpha=40, plate_alpha=200):
     """
     以薄板自身面片作为中心面代理进行可视化。
-    单网格混合着色：背景面片半透明灰色，薄板面片半透明彩色。
+    单网格混合着色：
+    - 背景面片半透明灰色（alpha）
+    - 薄板面片按四色贪心分配，保证相邻板颜色不同
+    - 用不透明黑色勾勒每个薄板的边界环
 
     Parameters
     ----------
@@ -159,37 +227,61 @@ def visualize_plate_centers(mesh, labels, alpha=80, plate_alpha=180):
     labels : (N,) ndarray
         薄板标签。
     alpha : int
-        未归类/背景面片的透明度（0-255，默认80）。
+        未归类/背景面片的透明度（0-255，默认40）。
     plate_alpha : int
-        薄板面片的透明度（0-255，默认180）。
+        薄板面片的透明度（0-255，默认200）。
     """
     scene = trimesh.Scene()
     vis = mesh.copy()
     N = len(vis.faces)
 
-    # 调色板
-    rng = np.random.default_rng(42)
-    n_plates = int(max(0, labels.max()) + 1)
-    palette = np.column_stack([
-        rng.integers(80, 255, size=n_plates),
-        rng.integers(80, 255, size=n_plates),
-        rng.integers(80, 255, size=n_plates),
-        np.full(n_plates, plate_alpha, dtype=np.uint8),
-    ])
+    # 构建面片邻接（用于四色分配）
+    adjacency = build_face_adjacency(mesh)
 
-    # 初始化：背景为半透明灰色
+    # 分配颜色
+    color_map, palette = _assign_plate_colors(labels, adjacency)
+
+    # 初始化颜色：背景半透明灰色 alpha
     colors = np.full((N, 4), 180, dtype=np.uint8)
     colors[:, 3] = alpha
 
-    # 薄板面片覆盖为彩色
+    # 填充薄板颜色
+    n_plates = int(labels.max()) + 1
     for lbl in range(n_plates):
         mask = labels == lbl
         if np.sum(mask) == 0:
             continue
-        colors[mask] = palette[lbl % len(palette)]
+        if lbl in color_map:
+            ci = color_map[lbl]
+            if ci < len(palette):
+                colors[mask, :3] = palette[ci]
+                colors[mask, 3] = plate_alpha
 
-    # 未归类面片（labels < 0）保持半透明灰色
+    # 未归类面片保持半透明灰色
     colors[labels < 0] = [180, 180, 180, alpha]
+
+    # 构建 edge -> faces 映射，用于勾勒边界
+    edge_face_map = {}
+    for fi, (v1, v2, v3) in enumerate(mesh.faces):
+        for a, b in [(int(v1), int(v2)), (int(v2), int(v3)), (int(v3), int(v1))]:
+            key = (a, b) if a < b else (b, a)
+            edge_face_map.setdefault(key, []).append(fi)
+
+    # 对每个薄板提取边界环，并将边界邻接面片标记为不透明黑色
+    for lbl in range(n_plates):
+        mask = labels == lbl
+        if np.sum(mask) == 0:
+            continue
+        loops = extract_plate_boundary_loops(mesh, mask)
+        for loop in loops:
+            loop_arr = np.asarray(loop, dtype=int)
+            if len(loop_arr) < 3:
+                continue
+            for i in range(len(loop_arr)):
+                a, b = int(loop_arr[i]), int(loop_arr[(i + 1) % len(loop_arr)])
+                key = (a, b) if a < b else (b, a)
+                for fi in edge_face_map.get(key, []):
+                    colors[fi] = [10, 10, 10, 255]  # 近黑色，不透明
 
     vis.visual.face_colors = colors
     scene.add_geometry(vis)
@@ -378,7 +470,7 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
                   thickness_grid_size=128,
                   seg_mode='smoothness', edge_scales=(1, 2, 4, 8),
                   edge_threshold_ratio=0.3,
-                  vis_mode='plates', vis_alpha=80, plate_alpha=180):
+                  vis_mode='plates', vis_alpha=40, plate_alpha=200):
     """
     薄壳扫描网格处理主函数。
 
@@ -578,10 +670,10 @@ def main():
     parser.add_argument("--vis-mode", type=str, default='plates',
                         choices=['plates', 'centers', 'thickness'],
                         help="Pass 0 可视化模式：plates=薄板着色, centers=中心面高亮, thickness=厚度场")
-    parser.add_argument("--vis-alpha", type=int, default=80,
-                        help="原始网格透明度（仅 centers 模式，0-255，默认80）")
-    parser.add_argument("--plate-alpha", type=int, default=180,
-                        help="薄板面片透明度（仅 centers 模式，0-255，默认180）")
+    parser.add_argument("--vis-alpha", type=int, default=40,
+                        help="原始网格透明度（仅 centers 模式，0-255，默认40）")
+    parser.add_argument("--plate-alpha", type=int, default=200,
+                        help="薄板面片透明度（仅 centers 模式，0-255，默认200）")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
     args = parser.parse_args()
 
