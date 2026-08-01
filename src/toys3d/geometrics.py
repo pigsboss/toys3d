@@ -2655,6 +2655,7 @@ def build_proxy_mesh(mesh, target_faces=50000, max_edge_length=None,
                      iterations=2, smooth=False):
     """
     从原始扫描网格构建均匀、低分辨率、近似水密的代理网格。
+    采用「修复 → 简化 → 可选细分」的单次流程，避免面数爆炸。
 
     Parameters
     ----------
@@ -2662,46 +2663,63 @@ def build_proxy_mesh(mesh, target_faces=50000, max_edge_length=None,
     target_faces : int
         目标面片数
     max_edge_length : float or None
-        最大允许边长，超过则细分。默认取包围盒对角线的 2%。
-    iterations : int
-        简化-细分-清理的迭代次数
+        最大允许边长，默认取包围盒对角线的 2%。
+    iterations : int   (当前未使用，保留兼容)
     smooth : bool
         是否做轻微 Laplacian 平滑
-
-    Returns
-    -------
-    proxy : trimesh.Trimesh
     """
+    from toys3d.geometrics import (
+        repair_mesh_by_removing_duplicates,
+        repair_nonmanifold_edges,
+        fill_small_holes,
+        analyze_mesh_defects,
+    )
+
     proxy = mesh.copy()
 
-    for it in range(iterations):
-        # 1. 二次误差简化
-        if len(proxy.faces) > target_faces:
-            proxy = proxy.simplify_quadric_decimation(face_count=target_faces)
+    # 步骤 0：修复网格（最多 3 次迭代），消除开放边和大部分非流形边
+    defect_stats, _, _ = analyze_mesh_defects(proxy)
+    if defect_stats['open_edges'] > 0 or defect_stats['nonmanifold_edges'] > 0:
+        for _ in range(3):
+            proxy = repair_mesh_by_removing_duplicates(proxy)
+            proxy = repair_nonmanifold_edges(proxy, verbose=False)
+            proxy = fill_small_holes(proxy, max_loop_edges=50, verbose=False)
+            defect_stats, _, _ = analyze_mesh_defects(proxy)
+            if defect_stats['open_edges'] == 0 and defect_stats['nonmanifold_edges'] == 0:
+                break
 
-        # 2. 限制最大边长
-        if max_edge_length is None:
-            diag = float(np.linalg.norm(proxy.bounding_box.extents))
-            max_edge_length = diag * 0.02
-        if max_edge_length > 0:
-            proxy = proxy.subdivide_to_size(max_edge_length)
+    # 步骤 1：简化到目标面数
+    if len(proxy.faces) > target_faces:
+        proxy = proxy.simplify_quadric_decimation(face_count=target_faces)
 
-        # 3. 清理
-        proxy.merge_vertices()
-        # Remove duplicate faces (trimesh may not have this method, use NumPy)
-        faces = np.asarray(proxy.faces, dtype=np.int64)
-        unique_faces, idx = np.unique(faces, axis=0, return_index=True)
-        if unique_faces.shape[0] < faces.shape[0]:
-            proxy = trimesh.Trimesh(vertices=proxy.vertices,
-                                    faces=unique_faces,
-                                    process=False)
-        # Remove degenerate faces (zero area)
-        nd_mask = proxy.nondegenerate_faces
-        if not np.all(nd_mask):
-            proxy = trimesh.Trimesh(vertices=proxy.vertices,
-                                    faces=proxy.faces[nd_mask],
-                                    process=False)
-        proxy.remove_unreferenced_vertices()
+    # 步骤 2：如果需要且合理，细分一次（避免面数爆炸）
+    if max_edge_length is None:
+        diag = float(np.linalg.norm(proxy.bounding_box.extents))
+        max_edge_length = diag * 0.02
+    if max_edge_length > 0 and len(proxy.edges_unique) > 0:
+        mean_edge = float(np.mean(proxy.edges_unique_length))
+        if mean_edge > max_edge_length * 1.5:
+            # 预估细分后面数，防止爆炸
+            est_factor = (mean_edge / max_edge_length) ** 2
+            if len(proxy.faces) * est_factor < max(target_faces * 4, 200000):
+                proxy = proxy.subdivide_to_size(max_edge_length)
+
+    # 步骤 3：清理
+    proxy.merge_vertices()
+    # 去除重复面片
+    faces = np.asarray(proxy.faces, dtype=np.int64)
+    unique_faces, _ = np.unique(faces, axis=0, return_counts=False)
+    if unique_faces.shape[0] < faces.shape[0]:
+        proxy = trimesh.Trimesh(vertices=proxy.vertices,
+                                faces=unique_faces,
+                                process=False)
+    # 去除退化面片
+    nd_mask = proxy.nondegenerate_faces
+    if not np.all(nd_mask):
+        proxy = trimesh.Trimesh(vertices=proxy.vertices,
+                                faces=proxy.faces[nd_mask],
+                                process=False)
+    proxy.remove_unreferenced_vertices()
 
     if smooth and hasattr(proxy, 'smoothed'):
         proxy = proxy.smoothed(iterations=1)
@@ -2732,17 +2750,24 @@ def map_labels_from_proxy(original_mesh, proxy_mesh, proxy_labels):
 
 
 class _NormalCluster:
-    """用于无符号法向聚类的简单辅助类。"""
+    """用于无符号法向聚类的简单辅助类，缓存平均方向。"""
     def __init__(self, normal):
         self.normals = [normal]
-        self.mean_axis = normal.copy()
+        self._mean_dirty = True
+        self._mean_cache = normal.copy()
 
     def add(self, normal):
         self.normals.append(normal)
-        # 增量更新平均方向
-        avg = np.mean(self.normals, axis=0)
-        n = np.linalg.norm(avg)
-        self.mean_axis = avg / n if n > 1e-12 else self.mean_axis
+        self._mean_dirty = True
+
+    @property
+    def mean_axis(self):
+        if self._mean_dirty:
+            avg = np.mean(self.normals, axis=0)
+            n = np.linalg.norm(avg)
+            self._mean_cache = avg / n if n > 1e-12 else self.normals[0]
+            self._mean_dirty = False
+        return self._mean_cache
 
 
 def segment_plates_by_local_clustering(mesh, depth=2,
