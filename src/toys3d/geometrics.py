@@ -2622,20 +2622,32 @@ def segment_regions_by_edges(mesh, edge_face_mask):
     N = len(mesh.faces)
     adjacency = build_face_adjacency(mesh)
 
+    valid_mask = ~np.asarray(edge_face_mask, dtype=bool)
+    valid_indices = np.flatnonzero(valid_mask)
+    n_valid = len(valid_indices)
+
+    # 旧索引 -> 新索引映射
+    remap = np.full(N, -1, dtype=np.int64)
+    remap[valid_indices] = np.arange(n_valid)
+
     rows, cols = [], []
-    for i in range(N):
-        if edge_face_mask[i]:
-            continue
+    for i in valid_indices:
         for j in adjacency[i]:
-            if j > i and not edge_face_mask[j]:
-                rows.extend([i, j])
-                cols.extend([j, i])
+            if j > i and valid_mask[j]:
+                ii, jj = remap[i], remap[j]
+                rows.extend([ii, jj])
+                cols.extend([jj, ii])
 
     labels = np.full(N, -1, dtype=int)
+    if n_valid == 0:
+        return labels
+
     if len(rows) > 0:
         data = np.ones(len(rows), dtype=np.int8)
-        graph = csr_matrix((data, (rows, cols)), shape=(N, N))
+        graph = csr_matrix((data, (rows, cols)), shape=(n_valid, n_valid))
         _, comps = connected_components(graph, directed=False)
-        labels[~edge_face_mask] = comps
+        labels[valid_indices] = comps
+    else:
+        labels[valid_indices] = np.arange(n_valid)
 
     return labels
