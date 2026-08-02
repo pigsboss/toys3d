@@ -2814,9 +2814,10 @@ def segment_plates_by_local_clustering(mesh, radius=None,
         med = float(np.nanmedian(thickness))
         if not np.isfinite(med) or med < 1e-6:
             med = float(np.mean(mesh.edges_unique_length))
-        radius = max(4.0 * med, 1e-3)
+        radius = max(1.5 * med, 1e-3)
         print(f"    thickness median={med:.4f}, radius={radius:.4f} "
               f"({time.time() - t0:.2f}s)")
+        print(f"    thickness median={med:.4f}, radius={radius:.4f} (1.5x thickness)")
 
     # 球状邻域查询
     print("  Building k-d tree for face centers...")
