@@ -483,7 +483,7 @@ def segment_by_multiscale_edges(mesh, scales=(1, 2, 4, 8),
 # ------------------------------------------------------------------
 
 def process_shell(mesh, num_passes=0, repair_mode=False,
-                  angle_threshold_deg=30.0, min_faces=30,
+                  angle_threshold_deg=30.0, min_faces=500,
                   thin_mode='adaptive', thin_threshold=0.1,
                   line_tol=0.05, circle_tol=0.05, spline_tol=0.1,
                   irregular_perimeter_ratio=0.05,
@@ -492,7 +492,7 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
                   edge_threshold_ratio=0.3,
                   vis_mode='plates', vis_alpha=40, plate_alpha=200,
                   proxy_faces=50000, proxy_max_edge=None,
-                  cluster_depth=2, cluster_angle_deg=30.0,
+                  cluster_depth=2, cluster_angle_deg=45.0,
                   cluster_radius=None):
     """
     薄壳扫描网格处理主函数。
@@ -701,8 +701,8 @@ def main():
                         help="尝试自动修复网格拓扑缺陷")
     parser.add_argument("--angle-threshold", type=float, default=30.0,
                         help="薄板分割二面角阈值（度，默认30）")
-    parser.add_argument("--min-faces", type=int, default=30,
-                        help="薄板最小面片数（默认30）")
+    parser.add_argument("--min-faces", type=int, default=500,
+                        help="薄板最小面片数（默认500）")
     parser.add_argument("--thin-mode", type=str, default='adaptive',
                         choices=['adaptive', 'absolute'],
                         help="薄区阈值模式：adaptive=厚度中位数比例，absolute=绝对值")
@@ -738,8 +738,8 @@ def main():
                         help="代理网格最大边长（默认自动=0.5*厚度中位数）")
     parser.add_argument("--cluster-depth", type=int, default=2,
                         help="局部法向聚类邻域树深度（默认2）")
-    parser.add_argument("--cluster-angle", type=float, default=30.0,
-                        help="同一法向簇最大夹角（度，默认30）")
+    parser.add_argument("--cluster-angle", type=float, default=45.0,
+                        help="同一法向簇最大夹角（度，默认45）")
     parser.add_argument("--cluster-radius", type=float, default=None,
                         help="球状邻域半径（默认自动=4*厚度中位数）")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
@@ -785,6 +785,9 @@ def main():
         try:
             os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
             world_scene.show()
+        except IndexError as e:
+            print(f"\n[ERROR] macOS/pygllet display error: {e}")
+            print("This is a display backend issue, not a mesh processing error.")
         except Exception as e:
             print(f"\n[ERROR] Visualization failed: {e}")
             import traceback
