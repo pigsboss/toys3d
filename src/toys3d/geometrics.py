@@ -2770,23 +2770,23 @@ class _NormalCluster:
         return self._mean_cache
 
 
-def segment_plates_by_local_clustering(mesh, depth=2,
+def segment_plates_by_local_clustering(mesh, radius=None,
                                        cluster_angle_deg=30.0,
                                        min_faces=30):
     """
-    基于局部邻域法向聚类的水密薄板分割。
+    基于球状欧氏邻域的局部法向聚类薄板分割。
 
-    对每个面片，取其 k-ring 邻域内的法向，用无符号点积做贪心聚类。
-    若邻域中法向呈现 2 个或以上聚类，则该面片位于薄板交界。
-    移除交界后做连通分量，再将交界重分配，合并小区域。
+    对每个面片，以其中心为球心、radius 为半径搜索邻域面片。
+    这些面片可能来自薄板中心面的两侧（内/外表面），
+    也可能来自相邻薄板。通过无符号法向聚类识别薄板交界。
 
     Parameters
     ----------
     mesh : trimesh.Trimesh
-    depth : int
-        邻域树深度（默认 2）
+    radius : float or None
+        球邻域半径。默认 = 4 * 厚度中位数。
     cluster_angle_deg : float
-        同一簇内法向最大夹角（度）
+        同一法向簇最大夹角（度）
     min_faces : int
         薄板最小面片数
 
@@ -2796,16 +2796,55 @@ def segment_plates_by_local_clustering(mesh, depth=2,
     """
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
+    import time
 
-    adjacency = build_face_adjacency(mesh)
-    N = len(mesh.faces)
+    centers = np.asarray(mesh.triangles_center, dtype=np.float64)
     normals = np.asarray(mesh.face_normals, dtype=np.float64)
-    cos_thr = np.cos(np.deg2rad(cluster_angle_deg))
+    N = len(centers)
 
+    if N == 0:
+        return np.zeros(0, dtype=int)
+
+    # 自动估计半径
+    if radius is None:
+        print("  Estimating thickness for default cluster radius...")
+        t0 = time.time()
+        thickness, _ = estimate_shell_thickness(mesh, k_neighbors=10)
+        med = float(np.nanmedian(thickness))
+        if not np.isfinite(med) or med < 1e-6:
+            med = float(np.mean(mesh.edges_unique_length))
+        radius = max(4.0 * med, 1e-3)
+        print(f"    thickness median={med:.4f}, radius={radius:.4f} "
+              f"({time.time() - t0:.2f}s)")
+
+    # 球状邻域查询
+    print("  Building k-d tree for face centers...")
+    t0 = time.time()
+    tree = cKDTree(centers)
+    print(f"    k-d tree built in {time.time() - t0:.2f}s")
+
+    print(f"  Querying ball neighbors (radius={radius:.4f})...")
+    t0 = time.time()
+    neighbors_list = tree.query_ball_point(centers, radius)
+    elapsed = time.time() - t0
+    avg_neighbors = np.mean([len(n) for n in neighbors_list])
+    max_neighbors = max(len(n) for n in neighbors_list)
+    print(f"    ball query done in {elapsed:.2f}s, "
+          f"avg_neighbors={avg_neighbors:.1f}, max_neighbors={max_neighbors}")
+
+    cos_thr = np.cos(np.deg2rad(cluster_angle_deg))
     boundary_mask = np.zeros(N, dtype=bool)
 
+    print("  Clustering normals per face...")
+    t0 = time.time()
+    report_interval = max(1, N // 10)
     for fi in range(N):
-        neighbors = get_k_ring_neighbors(adjacency, fi, k=depth)
+        if fi % report_interval == 0:
+            print(f"    clustering {fi}/{N} ({100 * fi / N:.0f}%) "
+                  f"+{time.time() - t0:.2f}s")
+
+        neighbors = neighbors_list[fi]
         if len(neighbors) < 3:
             continue
 
@@ -2823,16 +2862,25 @@ def segment_plates_by_local_clustering(mesh, depth=2,
             if not added:
                 clusters.append(_NormalCluster(n_unit))
 
+        # 两个及以上法向簇：位于薄板交界
         if len(clusters) >= 2:
             boundary_mask[fi] = True
 
+    print(f"    clustering done in {time.time() - t0:.2f}s, "
+          f"boundary faces={np.sum(boundary_mask)}")
+
     # 移除边界后面片做连通分量
+    print("  Segmenting connected components...")
+    t0 = time.time()
     valid_mask = ~boundary_mask
     valid_indices = np.flatnonzero(valid_mask)
     n_valid = len(valid_indices)
 
     labels = np.full(N, -1, dtype=int)
     if n_valid > 0:
+        # 构建面片邻接图（拓扑邻接，用于连通分量）
+        adjacency = build_face_adjacency(mesh)
+
         remap = np.full(N, -1, dtype=np.int64)
         remap[valid_indices] = np.arange(n_valid)
 
@@ -2852,7 +2900,12 @@ def segment_plates_by_local_clustering(mesh, depth=2,
         else:
             labels[valid_indices] = np.arange(n_valid)
 
+    print(f"    components done in {time.time() - t0:.2f}s")
+
     # 将边界面片重新分配到相邻薄板
+    print("  Reassigning boundary faces...")
+    t0 = time.time()
+    adjacency = build_face_adjacency(mesh)
     for fi in range(N):
         if labels[fi] != -1:
             continue
@@ -2871,7 +2924,11 @@ def segment_plates_by_local_clustering(mesh, depth=2,
         if best_label != -1:
             labels[fi] = best_label
 
+    print(f"    reassignment done in {time.time() - t0:.2f}s")
+
     # 合并小区域
+    print("  Merging small regions...")
+    t0 = time.time()
     unique, counts = np.unique(labels[labels >= 0], return_counts=True)
     for lbl in unique[counts < min_faces]:
         mask = labels == lbl
@@ -2890,5 +2947,8 @@ def segment_plates_by_local_clustering(mesh, depth=2,
     if np.any(valid):
         _, new_labels = np.unique(labels[valid], return_inverse=True)
         labels[valid] = new_labels
+
+    print(f"    merge done in {time.time() - t0:.2f}s, "
+          f"n_plates={labels.max() + 1}")
 
     return labels

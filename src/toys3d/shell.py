@@ -492,7 +492,8 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
                   edge_threshold_ratio=0.3,
                   vis_mode='plates', vis_alpha=40, plate_alpha=200,
                   proxy_faces=50000, proxy_max_edge=None,
-                  cluster_depth=2, cluster_angle_deg=30.0):
+                  cluster_depth=2, cluster_angle_deg=30.0,
+                  cluster_radius=None):
     """
     薄壳扫描网格处理主函数。
 
@@ -545,7 +546,7 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
                 # 在代理网格上分割
                 p = proxy_m if proxy_m is not None else m
                 proxy_labels = segment_plates_by_local_clustering(
-                    p, depth=cluster_depth,
+                    p, radius=cluster_radius,
                     cluster_angle_deg=cluster_angle_deg,
                     min_faces=min_faces
                 )
@@ -739,6 +740,8 @@ def main():
                         help="局部法向聚类邻域树深度（默认2）")
     parser.add_argument("--cluster-angle", type=float, default=30.0,
                         help="同一法向簇最大夹角（度，默认30）")
+    parser.add_argument("--cluster-radius", type=float, default=None,
+                        help="球状邻域半径（默认自动=4*厚度中位数）")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
     args = parser.parse_args()
 
@@ -771,6 +774,7 @@ def main():
         proxy_max_edge=args.proxy_max_edge,
         cluster_depth=args.cluster_depth,
         cluster_angle_deg=args.cluster_angle,
+        cluster_radius=args.cluster_radius,
     )
 
     if args.output:
