@@ -30,6 +30,7 @@ from toys3d.geometrics import (
     build_proxy_mesh,
     map_labels_from_proxy,
     segment_plates_by_local_clustering,
+    segment_plates_by_plane_fitting,
 )
 
 
@@ -493,7 +494,8 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
                   vis_mode='plates', vis_alpha=40, plate_alpha=200,
                   proxy_faces=50000, proxy_max_edge=None,
                   cluster_depth=2, cluster_angle_deg=45.0,
-                  cluster_radius=None):
+                  cluster_radius=None,
+                  ransac_inlier_thr=0.1, max_planes=3):
     """
     薄壳扫描网格处理主函数。
 
@@ -542,11 +544,25 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
             th_stats = compute_wall_thickness_statistics(thickness, reliability)
 
         with Timer(f"{step_label} plate segmentation"):
+            # 自动估计半径（cluster 和 planar 模式共用）
+            if cluster_radius is None:
+                print("  Estimating thickness for default ball radius...")
+                t0 = time.time()
+                temp_thickness, _ = estimate_shell_thickness(m, k_neighbors=10)
+                med = float(np.nanmedian(temp_thickness))
+                if not np.isfinite(med) or med < 1e-6:
+                    med = float(np.mean(m.edges_unique_length))
+                radius = max(1.5 * med, 1e-3)
+                print(f"    median={med:.4f}, radius={radius:.4f} "
+                      f"({time.time() - t0:.2f}s)")
+            else:
+                radius = cluster_radius
+
             if seg_mode == 'cluster':
                 # 在代理网格上分割
                 p = proxy_m if proxy_m is not None else m
                 proxy_labels = segment_plates_by_local_clustering(
-                    p, radius=cluster_radius,
+                    p, radius=radius,
                     cluster_angle_deg=cluster_angle_deg,
                     min_faces=min_faces
                 )
@@ -558,6 +574,20 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
                     threshold_ratio=edge_threshold_ratio,
                     min_faces=min_faces
                 )
+            elif seg_mode == 'planar':
+                p = proxy_m if proxy_m is not None else m
+                labels_proxy = segment_plates_by_plane_fitting(
+                    p,
+                    radius=radius,
+                    inlier_threshold=ransac_inlier_thr,
+                    max_planes=max_planes,
+                    min_faces=min_faces,
+                    rng=None
+                )
+                if proxy_m is not None:
+                    labels = map_labels_from_proxy(m, p, labels_proxy)
+                else:
+                    labels = labels_proxy
             else:
                 labels = segment_plates_by_smoothness(
                     m, angle_threshold_deg=angle_threshold_deg, min_faces=min_faces
@@ -572,9 +602,9 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
     print(f"\n[Thickness] median={th_stats['median']:.4f}, "
           f"reliable={th_stats['reliable_ratio']:.2%}")
 
-    # 构建代理网格（用于 cluster 模式）
+    # 构建代理网格（用于 cluster 和 planar 模式）
     proxy_mesh = None
-    if seg_mode == 'cluster':
+    if seg_mode in ('cluster', 'planar'):
         with Timer("Build proxy mesh"):
             auto_max_edge = proxy_max_edge
             if auto_max_edge is None and np.isfinite(th_stats.get('median', np.nan)):
@@ -719,8 +749,8 @@ def main():
     parser.add_argument("--thickness-grid-size", type=int, default=128,
                         help="体素分辨率用于厚度估计（默认128）")
     parser.add_argument("--seg-mode", type=str, default='cluster',
-                        choices=['smoothness', 'multiscale', 'cluster'],
-                        help="薄板分割模式：smoothness=法向连通性，multiscale=多尺度边缘，cluster=局部法向聚类")
+                        choices=['smoothness', 'multiscale', 'cluster', 'planar'],
+                        help="薄板分割模式：smoothness=法向连通性，multiscale=多尺度边缘，cluster=局部法向聚类，planar=局部平面拟合")
     parser.add_argument("--edge-scales", type=int, nargs='+', default=(1, 2, 4, 8),
                         help="多尺度边缘检测的邻域尺度，默认 1 2 4 8")
     parser.add_argument("--edge-threshold", type=float, default=0.3,
@@ -741,7 +771,11 @@ def main():
     parser.add_argument("--cluster-angle", type=float, default=45.0,
                         help="同一法向簇最大夹角（度，默认45）")
     parser.add_argument("--cluster-radius", type=float, default=None,
-                        help="球状邻域半径（默认自动=4*厚度中位数）")
+                        help="球状邻域半径（默认自动=1.5*厚度中位数）")
+    parser.add_argument("--ransac-threshold", type=float, default=0.1,
+                        help="RANSAC inlier distance threshold for planar mode")
+    parser.add_argument("--max-planes", type=int, default=3,
+                        help="Max planes to fit per local ball (default 3)")
     parser.add_argument("--show", action="store_true", help="显示可视化窗口")
     args = parser.parse_args()
 
@@ -775,6 +809,8 @@ def main():
         cluster_depth=args.cluster_depth,
         cluster_angle_deg=args.cluster_angle,
         cluster_radius=args.cluster_radius,
+        ransac_inlier_thr=args.ransac_threshold,
+        max_planes=args.max_planes,
     )
 
     if args.output:

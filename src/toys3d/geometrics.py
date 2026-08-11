@@ -2953,3 +2953,295 @@ def segment_plates_by_local_clustering(mesh, radius=None,
           f"n_plates={labels.max() + 1}")
 
     return labels
+
+
+# ==================================================================
+#  Plane fitting based segmentation (RANSAC in ball)
+# ==================================================================
+
+def ransac_plane_fitting(points, max_iter=500, inlier_threshold=0.1,
+                         rng=None):
+    """
+    Fit a single plane to 3D points using RANSAC.
+    Returns (normal, point_on_plane), inlier_mask.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.shape[0] < 3:
+        return None, np.zeros(pts.shape[0], dtype=bool)
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    best_inliers = None
+    best_n = None
+    best_p = None
+    best_score = -1
+
+    n = pts.shape[0]
+    for _ in range(max_iter):
+        idxs = rng.choice(n, 3, replace=False)
+        p0, p1, p2 = pts[idxs]
+        normal = np.cross(p1 - p0, p2 - p0)
+        norm_len = np.linalg.norm(normal)
+        if norm_len < 1e-12:
+            continue
+        normal = normal / norm_len
+        dists = np.abs(np.dot(pts - p0, normal))
+        inliers = dists <= inlier_threshold
+        score = int(np.sum(inliers))
+        if score > best_score:
+            best_score = score
+            best_inliers = inliers
+            best_n = normal
+            best_p = p0
+
+    if best_inliers is None:
+        return None, np.zeros(n, dtype=bool)
+
+    # refine plane using all inliers
+    inlier_pts = pts[best_inliers]
+    centroid = inlier_pts.mean(axis=0)
+    cov = (inlier_pts - centroid).T @ (inlier_pts - centroid)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    refined_normal = eigvecs[:, np.argmin(eigvals)]
+    if np.dot(refined_normal, best_n) < 0:
+        refined_normal = -refined_normal
+    return (refined_normal, centroid), best_inliers
+
+
+def multi_ransac_planes(points, max_planes=3, inlier_threshold=0.1,
+                        min_points_per_plane=5, max_iter=500, rng=None):
+    """
+    Sequentially extract up to max_planes dominant planes from points.
+    Returns list of (normal, point, inlier_mask).
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    remaining = np.ones(len(pts), dtype=bool)
+    planes = []
+
+    for _ in range(max_planes):
+        if np.sum(remaining) < min_points_per_plane:
+            break
+        sub_pts = pts[remaining]
+        plane_params, inliers_sub = ransac_plane_fitting(
+            sub_pts, max_iter=max_iter,
+            inlier_threshold=inlier_threshold, rng=rng
+        )
+        if plane_params is None:
+            break
+        global_inliers = np.zeros(len(pts), dtype=bool)
+        global_inliers[remaining] = inliers_sub
+        if np.sum(global_inliers) < min_points_per_plane:
+            break
+        planes.append((plane_params[0], plane_params[1], global_inliers))
+        remaining &= ~global_inliers
+
+    return planes
+
+
+def _spatial_split_inliers(centers, inlier_mask, face_indices,
+                           mesh_adjacency, ball_face_set,
+                           distance_threshold=None):
+    """
+    Split inlier faces into spatial connected components.
+    """
+    idx = np.where(inlier_mask)[0]
+    if len(idx) <= 1:
+        return [inlier_mask]
+
+    local_map = {global_id: i for i, global_id in enumerate(idx)}
+    n_in = len(idx)
+
+    rows, cols = [], []
+    for i, global_id in enumerate(idx):
+        for neighbor in mesh_adjacency.get(global_id, []):
+            if neighbor not in ball_face_set:
+                continue
+            if neighbor in local_map:
+                j = local_map[neighbor]
+                rows.append(i); cols.append(j)
+                rows.append(j); cols.append(i)
+
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    if len(rows) == 0:
+        comps = np.arange(n_in)
+    else:
+        graph = csr_matrix((np.ones(len(rows), dtype=np.int8),
+                            (rows, cols)), shape=(n_in, n_in))
+        _, comps = connected_components(graph, directed=False)
+
+    unique_comps = np.unique(comps)
+    components = []
+    for comp in unique_comps:
+        comp_mask = np.zeros(len(centers), dtype=bool)
+        comp_mask[idx[comps == comp]] = True
+        components.append(comp_mask)
+    return components
+
+
+def detect_boundary_ball(centers, ball_face_indices, mesh_adjacency,
+                         distance_threshold=None, max_planes=3,
+                         inlier_threshold=0.1, max_iter=300, rng=None):
+    """
+    Returns True if there are >=2 spatially separated plane patches.
+    """
+    if len(ball_face_indices) < 6:
+        return False
+
+    ball_pts = centers[ball_face_indices]
+    planes = multi_ransac_planes(
+        ball_pts, max_planes=max_planes,
+        inlier_threshold=inlier_threshold,
+        min_points_per_plane=3, max_iter=max_iter, rng=rng
+    )
+
+    total_components = 0
+    for plane_params in planes:
+        normal, point, inlier_mask = plane_params
+        sub_mask = np.zeros(len(centers), dtype=bool)
+        sub_mask[ball_face_indices] = inlier_mask
+        pieces = _spatial_split_inliers(
+            centers, sub_mask, ball_face_indices,
+            mesh_adjacency, set(ball_face_indices),
+            distance_threshold
+        )
+        total_components += len(pieces)
+        if total_components >= 2:
+            return True
+
+    return False
+
+
+def segment_plates_by_plane_fitting(mesh, radius=5.0,
+                                    inlier_threshold=0.1,
+                                    max_planes=3, min_faces=30,
+                                    rng=None):
+    """
+    Segment mesh into plates using plane fitting in local ball neighborhoods.
+
+    Returns labels (0..k-1), -1 for unassigned.
+    """
+    from scipy.spatial import cKDTree
+    import time
+
+    centers = mesh.triangles_center
+    N = len(centers)
+    if N == 0:
+        return np.zeros(0, dtype=int)
+
+    adjacency = build_face_adjacency(mesh)
+
+    print("  Building k-d tree for centers...")
+    t0 = time.time()
+    tree = cKDTree(centers)
+    print(f"    k-d tree built in {time.time() - t0:.2f}s")
+
+    print(f"  Querying ball neighbors (radius={radius:.4f})...")
+    t0 = time.time()
+    neighbors_list = tree.query_ball_point(centers, radius)
+    elapsed = time.time() - t0
+    avg_n = np.mean([len(n) for n in neighbors_list])
+    print(f"    ball query done in {elapsed:.2f}s, avg_neighbors={avg_n:.1f}")
+
+    boundary_mask = np.zeros(N, dtype=bool)
+    if rng is None:
+        rng = np.random.default_rng()
+
+    print("  Detecting boundaries by plane fitting...")
+    t0 = time.time()
+    report_interval = max(1, N // 10)
+    for fi in range(N):
+        if fi % report_interval == 0:
+            print(f"    processing {fi}/{N} ({100 * fi / N:.0f}%) "
+                  f"+{time.time() - t0:.2f}s")
+        ball_indices = neighbors_list[fi]
+        if len(ball_indices) < 6:
+            continue
+        boundary_mask[fi] = detect_boundary_ball(
+            centers, ball_indices, adjacency,
+            max_planes=max_planes,
+            inlier_threshold=inlier_threshold, max_iter=300, rng=rng
+        )
+    print(f"    boundary detection done in {time.time() - t0:.2f}s, "
+          f"boundary faces={np.sum(boundary_mask)}")
+
+    # segment connected components of non-boundary faces
+    print("  Segmenting non-boundary faces...")
+    t0 = time.time()
+    valid_mask = ~boundary_mask
+    valid_indices = np.flatnonzero(valid_mask)
+    n_valid = len(valid_indices)
+    labels = np.full(N, -1, dtype=int)
+
+    if n_valid > 0:
+        remap = np.full(N, -1, dtype=np.int64)
+        remap[valid_indices] = np.arange(n_valid)
+
+        rows, cols = [], []
+        for i in valid_indices:
+            for j in adjacency[i]:
+                if j > i and valid_mask[j]:
+                    ii, jj = remap[i], remap[j]
+                    rows.extend([ii, jj])
+                    cols.extend([jj, ii])
+
+        from scipy.sparse import csr_matrix
+        from scipy.sparse.csgraph import connected_components
+
+        if len(rows) > 0:
+            graph = csr_matrix((np.ones(len(rows), dtype=np.int8),
+                                (rows, cols)), shape=(n_valid, n_valid))
+            _, comps = connected_components(graph, directed=False)
+            labels[valid_indices] = comps
+        else:
+            labels[valid_indices] = np.arange(n_valid)
+    print(f"    components done in {time.time() - t0:.2f}s")
+
+    # reassign boundary faces to nearest plate
+    print("  Reassigning boundary faces...")
+    t0 = time.time()
+    normals = mesh.face_normals
+    for fi in range(N):
+        if labels[fi] != -1:
+            continue
+        best_label = -1
+        best_dot = -1.0
+        for nj in adjacency[fi]:
+            lbl = labels[nj]
+            if lbl < 0:
+                continue
+            dot = np.dot(normals[fi], normals[nj])
+            if dot > best_dot:
+                best_dot = dot
+                best_label = lbl
+        if best_label != -1:
+            labels[fi] = best_label
+    print(f"    reassignment done in {time.time() - t0:.2f}s")
+
+    # merge small components
+    print("  Merging small regions...")
+    t0 = time.time()
+    unique, counts = np.unique(labels[labels >= 0], return_counts=True)
+    for lbl in unique[counts < min_faces]:
+        mask = labels == lbl
+        neighbor_labels = []
+        for fi in np.flatnonzero(mask):
+            for nj in adjacency[fi]:
+                nl = labels[nj]
+                if nl >= 0 and nl != lbl:
+                    neighbor_labels.append(nl)
+        if neighbor_labels:
+            new_lbl = max(set(neighbor_labels), key=neighbor_labels.count)
+            labels[mask] = new_lbl
+
+    # compact labels
+    valid = labels >= 0
+    if np.any(valid):
+        _, new_labels = np.unique(labels[valid], return_inverse=True)
+        labels[valid] = new_labels
+
+    n_plates = labels.max() + 1 if np.any(labels >= 0) else 0
+    print(f"    merge done in {time.time() - t0:.2f}s, n_plates={n_plates}")
+    return labels
