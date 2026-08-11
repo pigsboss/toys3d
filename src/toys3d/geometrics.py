@@ -3039,12 +3039,8 @@ def multi_ransac_planes(points, max_planes=3, inlier_threshold=0.1,
     return planes
 
 
-def _spatial_split_inliers(centers, inlier_mask, face_indices,
-                           mesh_adjacency, ball_face_set,
-                           distance_threshold=None):
-    """
-    Split inlier faces into spatial connected components.
-    """
+def _spatial_split_inliers(centers, inlier_mask, adjacency, ball_face_set):
+    """Split inlier faces into spatial connected components using face adjacency list."""
     idx = np.where(inlier_mask)[0]
     if len(idx) <= 1:
         return [inlier_mask]
@@ -3054,7 +3050,9 @@ def _spatial_split_inliers(centers, inlier_mask, face_indices,
 
     rows, cols = [], []
     for i, global_id in enumerate(idx):
-        for neighbor in mesh_adjacency.get(global_id, []):
+        # adjacency is a list of lists
+        neighbors = adjacency[global_id] if global_id < len(adjacency) else []
+        for neighbor in neighbors:
             if neighbor not in ball_face_set:
                 continue
             if neighbor in local_map:
@@ -3082,7 +3080,7 @@ def _spatial_split_inliers(centers, inlier_mask, face_indices,
 
 
 def detect_boundary_ball(centers, ball_face_indices, mesh_adjacency,
-                         distance_threshold=None, max_planes=3,
+                         max_planes=3,
                          inlier_threshold=0.1, max_iter=300, rng=None):
     """
     Returns True if there are >=2 spatially separated plane patches.
@@ -3103,9 +3101,7 @@ def detect_boundary_ball(centers, ball_face_indices, mesh_adjacency,
         sub_mask = np.zeros(len(centers), dtype=bool)
         sub_mask[ball_face_indices] = inlier_mask
         pieces = _spatial_split_inliers(
-            centers, sub_mask, ball_face_indices,
-            mesh_adjacency, set(ball_face_indices),
-            distance_threshold
+            centers, sub_mask, mesh_adjacency, set(ball_face_indices)
         )
         total_components += len(pieces)
         if total_components >= 2:
