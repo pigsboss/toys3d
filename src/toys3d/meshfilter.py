@@ -36,9 +36,82 @@ def build_vertex_neighbors(faces, n_vertices):
     return neighbors
 
 
-def build_face_neighbor_lists(mesh, neighborhood='topology', k_neighbors=10):
+def build_k_ring_vertex_neighbors(faces, n_vertices, k=1):
+    """
+    构建每个顶点的 k-ring 拓扑邻域顶点集合（包含自身）。
+
+    Parameters
+    ----------
+    faces : (F, 3) ndarray
+    n_vertices : int
+    k : int
+        环数，k=1 即 1-ring
+
+    Returns
+    -------
+    neighbors : list of set
+    """
+    one_ring = build_vertex_neighbors(faces, n_vertices)
+    neighbors = [set(s) for s in one_ring]
+
+    current = [set(s) for s in one_ring]
+    for _ in range(1, k):
+        next_ring = [set() for _ in range(n_vertices)]
+        for i in range(n_vertices):
+            for nb in current[i]:
+                next_ring[i].update(one_ring[nb])
+            next_ring[i].discard(i)
+            next_ring[i] -= neighbors[i]
+            neighbors[i].update(next_ring[i])
+        current = next_ring
+
+    for i in range(n_vertices):
+        neighbors[i].add(i)
+
+    return neighbors
+
+
+def build_k_ring_face_neighbors(mesh, k=1):
+    """
+    构建每个面片的 k-ring 拓扑邻域面片集合（包含自身）。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    k : int
+
+    Returns
+    -------
+    neighbor_lists : list of ndarray
+    """
+    adjacency = build_face_adjacency(mesh)
+    N = len(mesh.faces)
+    neighbors = [set([i]) for i in range(N)]
+    current = [set([i]) for i in range(N)]
+
+    for _ in range(k):
+        next_ring = [set() for _ in range(N)]
+        for i in range(N):
+            for nb in current[i]:
+                next_ring[i].update(adjacency[nb])
+            next_ring[i] -= neighbors[i]
+            neighbors[i].update(next_ring[i])
+        current = next_ring
+
+    return [np.array(list(s), dtype=int) for s in neighbors]
+
+
+def build_face_neighbor_lists(mesh, neighborhood='topology',
+                              kernel_size=1):
     """
     构建每个面片的邻域面片索引列表（包含自身）。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    neighborhood : 'topology' | 'euclidean'
+    kernel_size : int
+        topology 模式下为 k-ring 环数，euclidean 模式下为 k 近邻数量
 
     Returns
     -------
@@ -49,20 +122,19 @@ def build_face_neighbor_lists(mesh, neighborhood='topology', k_neighbors=10):
         return []
 
     if neighborhood == 'topology':
-        adjacency = build_face_adjacency(mesh)
-        return [np.array(adjacency[i] + [i], dtype=int) for i in range(N)]
+        return build_k_ring_face_neighbors(mesh, k=kernel_size)
     else:
         centers = np.asarray(mesh.triangles_center, dtype=np.float64)
-        k = min(k_neighbors, N)
+        k = min(kernel_size, N)
         tree = cKDTree(centers)
         _, idxs = tree.query(centers, k=k)
         return [idxs[i] for i in range(N)]
 
 
 def vertex_median_filter_topology(vertices, faces, iterations=1,
-                                  strength=1.0, verbose=True):
+                                  strength=1.0, kernel_ring=1, verbose=True):
     """
-    基于拓扑 1-ring 邻域的顶点中值滤波。
+    基于拓扑 k-ring 邻域的顶点中值滤波。
 
     Parameters
     ----------
@@ -71,6 +143,8 @@ def vertex_median_filter_topology(vertices, faces, iterations=1,
     iterations : int
     strength : float
         新位置 = (1 - strength) * old + strength * median
+    kernel_ring : int
+        k-ring 环数，默认 1（即 1-ring）
     verbose : bool
         是否输出进度
 
@@ -82,8 +156,8 @@ def vertex_median_filter_topology(vertices, faces, iterations=1,
     n_vertices = len(vertices)
 
     if verbose:
-        print("  Building topology neighbor list...")
-    neighbors = build_vertex_neighbors(faces, n_vertices)
+        print(f"  Building topology {kernel_ring}-ring neighbor list...")
+    neighbors = build_k_ring_vertex_neighbors(faces, n_vertices, k=kernel_ring)
     if verbose:
         print(f"    done, n_vertices={n_vertices}")
 
@@ -281,7 +355,7 @@ def update_vertices_from_normals(mesh, target_normals, strength=1.0):
     return vertices + strength * avg_disp
 
 
-def normal_median_filter(mesh, neighborhood='topology', k_neighbors=10,
+def normal_median_filter(mesh, neighborhood='topology', kernel_size=1,
                          iterations=1, strength=1.0, verbose=True):
     """
     法向中值滤波：对面片法向做中值滤波，再反投影更新顶点。
@@ -307,7 +381,7 @@ def normal_median_filter(mesh, neighborhood='topology', k_neighbors=10,
             print("    Building neighbor lists...")
         t0 = time.time()
         neighbor_lists = build_face_neighbor_lists(
-            m, neighborhood=neighborhood, k_neighbors=k_neighbors
+            m, neighborhood=neighborhood, kernel_size=kernel_size
         )
         if verbose:
             print(f"    neighbor lists built in {time.time() - t0:.2f}s")
@@ -353,11 +427,12 @@ def main():
                         choices=["topology", "euclidean"],
                         help="median 模式下邻域类型（默认 topology）")
 
+    parser.add_argument("--kernel-size", type=int, default=1,
+                        help="邻域大小：topology 模式为 k-ring 环数，"
+                             "euclidean 模式为 k 近邻数量（默认 1）")
+
     parser.add_argument("--iterations", type=int, default=1,
                         help="迭代次数（默认 1）")
-
-    parser.add_argument("--k-neighbors", type=int, default=10,
-                        help="euclidean 模式下最近邻数量（默认 10）")
 
     parser.add_argument("--strength", type=float, default=1.0,
                         help="中值滤波强度，0~1（默认 1.0）")
@@ -390,12 +465,13 @@ def main():
                 mesh.vertices, mesh.faces,
                 iterations=args.iterations,
                 strength=args.strength,
+                kernel_ring=args.kernel_size,
                 verbose=args.verbose
             )
         else:  # euclidean
             new_vertices = vertex_median_filter_euclidean(
                 mesh.vertices, mesh.faces,
-                k_neighbors=args.k_neighbors,
+                k_neighbors=args.kernel_size,
                 iterations=args.iterations,
                 strength=args.strength,
                 verbose=args.verbose
@@ -411,7 +487,7 @@ def main():
         new_vertices = normal_median_filter(
             mesh,
             neighborhood=args.neighborhood,
-            k_neighbors=args.k_neighbors,
+            kernel_size=args.kernel_size,
             iterations=args.iterations,
             strength=args.strength,
             verbose=args.verbose
