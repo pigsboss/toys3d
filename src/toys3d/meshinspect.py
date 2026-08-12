@@ -26,10 +26,6 @@ from toys3d.geometrics import (
 def compute_face_area_stats(mesh):
     """
     计算三角面片面积的统计量。
-
-    Returns
-    -------
-    stats : dict
     """
     areas = mesh.area_faces
     stats = {}
@@ -97,6 +93,43 @@ def build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask):
 
     vis.visual.face_colors = colors
     return vis
+
+
+def add_wireframe_to_scene(scene, mesh, color=None, radius=None):
+    """
+    将网格的边以圆柱线段形式加入场景，用于观察三角剖分。
+
+    Parameters
+    ----------
+    scene : trimesh.Scene
+    mesh : trimesh.Trimesh
+    color : list or tuple or ndarray or None
+        RGBA 颜色，默认纯黑不透明 [0, 0, 0, 255]。
+    radius : float or None
+        圆柱半径，默认基于包围盒对角线的 0.05%。
+    """
+    if color is None:
+        color = np.array([0, 0, 0, 255], dtype=np.uint8)
+    else:
+        color = np.asarray(color, dtype=np.uint8)
+
+    edges_unique = mesh.edges_unique
+    if len(edges_unique) == 0:
+        return
+
+    if radius is None or radius <= 0:
+        diag = float(np.linalg.norm(mesh.bounding_box.extents))
+        radius = max(diag * 0.0005, 1e-6)
+
+    for e in edges_unique:
+        v0, v1 = mesh.vertices[e[0]], mesh.vertices[e[1]]
+        seg = trimesh.creation.cylinder(
+            radius=radius,
+            segment=[v0, v1],
+            sections=4,
+        )
+        seg.visual.face_colors = color
+        scene.add_geometry(seg)
 
 
 def print_separator(title=None):
@@ -181,11 +214,37 @@ def inspect_mesh(mesh, args):
         vis = build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask)
         scene = trimesh.Scene(vis)
 
+        # 先导出着色的缺陷网格（不含线框）
         if args.output:
             vis.export(args.output)
             print(f"\nColored defect mesh saved to: {args.output}")
 
+        # 再叠加线框到场景用于可视化
+        if args.wireframe:
+            add_wireframe_to_scene(
+                scene, vis,
+                color=args.wireframe_color,
+                radius=args.wireframe_radius
+            )
+
     return scene
+
+
+def _parse_color_string(s):
+    """
+    将 'R,G,B,A' 字符串解析为整数列表。
+    """
+    parts = s.split(',')
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError(
+            f"Color must be 'R,G,B,A', got '{s}'"
+        )
+    try:
+        return [int(p.strip()) for p in parts]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Color components must be integers, got '{s}'"
+        )
 
 
 def main():
@@ -197,7 +256,15 @@ def main():
                         help="输出带缺陷着色的网格文件路径 (可选)")
     parser.add_argument("--show", action="store_true",
                         help="显示可视化窗口")
+    parser.add_argument("--wireframe", action="store_true",
+                        help="在可视化中叠加黑色线框，观察三角剖分")
+    parser.add_argument("--wireframe-radius", type=float, default=None,
+                        help="线框圆柱半径（默认按包围盒自动计算）")
+    parser.add_argument("--wireframe-color", type=str, default="0,0,0,255",
+                        help="线框 RGBA 颜色，默认 '0,0,0,255'")
     args = parser.parse_args()
+
+    args.wireframe_color = _parse_color_string(args.wireframe_color)
 
     print(f"Loading: {args.input_file}")
     mesh = trimesh.load(args.input_file, force="mesh")
