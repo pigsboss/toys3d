@@ -8,6 +8,12 @@ _src_parent = os.path.dirname(_project_root)
 if _src_parent not in sys.path:
     sys.path.insert(0, _src_parent)
 
+# If the current working directory contains an `inspect.py`, it would shadow
+# the standard library module and cause circular imports (e.g., in NumPy).
+if os.path.exists(os.path.join(os.getcwd(), 'inspect.py')):
+    if '' in sys.path:
+        sys.path.remove('')
+
 import numpy as np
 import trimesh
 
