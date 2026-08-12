@@ -13,7 +13,10 @@ import numpy as np
 import trimesh
 
 from scipy.spatial import cKDTree
-from toys3d.geometrics import compute_mesh_stats
+from toys3d.geometrics import (
+    compute_mesh_stats,
+    build_face_adjacency,   # 新增
+)
 
 
 # ------------------------------------------------------------------
@@ -31,6 +34,29 @@ def build_vertex_neighbors(faces, n_vertices):
         neighbors[b].update([a, c])
         neighbors[c].update([a, b])
     return neighbors
+
+
+def build_face_neighbor_lists(mesh, neighborhood='topology', k_neighbors=10):
+    """
+    构建每个面片的邻域面片索引列表（包含自身）。
+
+    Returns
+    -------
+    neighbor_lists : list of ndarray
+    """
+    N = len(mesh.faces)
+    if N == 0:
+        return []
+
+    if neighborhood == 'topology':
+        adjacency = build_face_adjacency(mesh)
+        return [np.array(adjacency[i] + [i], dtype=int) for i in range(N)]
+    else:
+        centers = np.asarray(mesh.triangles_center, dtype=np.float64)
+        k = min(k_neighbors, N)
+        tree = cKDTree(centers)
+        _, idxs = tree.query(centers, k=k)
+        return [idxs[i] for i in range(N)]
 
 
 def vertex_median_filter_topology(vertices, faces, iterations=1,
@@ -189,6 +215,124 @@ def laplacian_smooth(vertices, faces, iterations=1, alpha=0.5, verbose=True):
     return vertices
 
 
+def filter_normals_median(normals, neighbor_lists, areas, verbose=True):
+    """
+    对每个面片，在邻域法向中选取加权球面中值。
+    """
+    N = len(normals)
+    new_normals = np.empty_like(normals)
+    report_interval = max(1, N // 10)
+    t0 = time.time()
+
+    for i in range(N):
+        if verbose and i % report_interval == 0:
+            print(f"    processing {i}/{N} ({100 * i / N:.0f}%) "
+                  f"+{time.time() - t0:.2f}s")
+
+        nb = neighbor_lists[i]
+        nb_normals = normals[nb]
+        nb_areas = areas[nb]
+
+        dots = nb_normals @ nb_normals.T
+        abs_dots = np.clip(np.abs(dots), 0.0, 1.0)
+        costs = (1.0 - abs_dots) @ nb_areas
+        best = int(np.argmin(costs))
+        n = nb_normals[best]
+        n_norm = np.linalg.norm(n)
+        new_normals[i] = n / n_norm if n_norm > 1e-12 else normals[i]
+
+    return new_normals
+
+
+def update_vertices_from_normals(mesh, target_normals, strength=1.0):
+    """
+    根据目标面法向，把每个顶点向相邻面片的切平面投影并加权平均。
+    """
+    vertices = mesh.vertices.copy().astype(np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    centers = mesh.triangles_center
+    areas = mesh.area_faces
+    n = np.asarray(target_normals, dtype=np.float64)
+
+    c0 = centers - vertices[faces[:, 0]]
+    c1 = centers - vertices[faces[:, 1]]
+    c2 = centers - vertices[faces[:, 2]]
+
+    d0 = np.einsum('ij,ij->i', c0, n)
+    d1 = np.einsum('ij,ij->i', c1, n)
+    d2 = np.einsum('ij,ij->i', c2, n)
+
+    disp0 = (areas * d0)[:, None] * n
+    disp1 = (areas * d1)[:, None] * n
+    disp2 = (areas * d2)[:, None] * n
+
+    disp = np.zeros_like(vertices)
+    wsum = np.zeros(len(vertices), dtype=np.float64)
+
+    np.add.at(disp, faces[:, 0], disp0)
+    np.add.at(disp, faces[:, 1], disp1)
+    np.add.at(disp, faces[:, 2], disp2)
+
+    np.add.at(wsum, faces[:, 0], areas)
+    np.add.at(wsum, faces[:, 1], areas)
+    np.add.at(wsum, faces[:, 2], areas)
+
+    avg_disp = disp / (wsum[:, None] + 1e-12)
+    return vertices + strength * avg_disp
+
+
+def normal_median_filter(mesh, neighborhood='topology', k_neighbors=10,
+                         iterations=1, strength=1.0, verbose=True):
+    """
+    法向中值滤波：对面片法向做中值滤波，再反投影更新顶点。
+    """
+    mesh = mesh.copy()
+    mesh.fix_normals()
+
+    vertices = mesh.vertices.copy()
+    faces = mesh.faces.copy()
+
+    for it in range(iterations):
+        if verbose:
+            print(f"  Normal-median iteration {it + 1}/{iterations} "
+                  f"(neighborhood={neighborhood})...")
+
+        m = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        m.fix_normals()
+
+        normals = m.face_normals.copy()
+        areas = m.area_faces
+
+        if verbose:
+            print("    Building neighbor lists...")
+        t0 = time.time()
+        neighbor_lists = build_face_neighbor_lists(
+            m, neighborhood=neighborhood, k_neighbors=k_neighbors
+        )
+        if verbose:
+            print(f"    neighbor lists built in {time.time() - t0:.2f}s")
+
+        if verbose:
+            print("    Filtering face normals...")
+        t0 = time.time()
+        new_normals = filter_normals_median(normals, neighbor_lists, areas,
+                                            verbose=verbose)
+        if verbose:
+            print(f"    normals filtered in {time.time() - t0:.2f}s")
+
+        if verbose:
+            print("    Updating vertex positions...")
+        t0 = time.time()
+        vertices = update_vertices_from_normals(
+            trimesh.Trimesh(vertices=vertices, faces=faces, process=False),
+            new_normals, strength=strength
+        )
+        if verbose:
+            print(f"    vertices updated in {time.time() - t0:.2f}s")
+
+    return vertices
+
+
 # ------------------------------------------------------------------
 #  主程序
 # ------------------------------------------------------------------
@@ -202,8 +346,8 @@ def main():
                         help="输出网格文件路径")
 
     parser.add_argument("--mode", type=str, default="median",
-                        choices=["median", "laplacian"],
-                        help="滤波模式（默认 median）")
+                        choices=["median", "laplacian", "normal-median"],
+                        help="滤波模式（默认 median；normal-median=法向中值滤波）")
 
     parser.add_argument("--neighborhood", type=str, default="topology",
                         choices=["topology", "euclidean"],
@@ -261,6 +405,15 @@ def main():
             mesh.vertices, mesh.faces,
             iterations=args.iterations,
             alpha=args.alpha,
+            verbose=args.verbose
+        )
+    elif args.mode == "normal-median":
+        new_vertices = normal_median_filter(
+            mesh,
+            neighborhood=args.neighborhood,
+            k_neighbors=args.k_neighbors,
+            iterations=args.iterations,
+            strength=args.strength,
             verbose=args.verbose
         )
     else:
