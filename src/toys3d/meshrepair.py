@@ -17,6 +17,7 @@ from toys3d.geometrics import (
     repair_mesh_by_removing_duplicates,
     repair_nonmanifold_edges,
     fill_small_holes,
+    extract_boundary_loops,
 )
 
 
@@ -28,6 +29,49 @@ def print_defect_summary(tag, defect_stats):
         f"open_faces={defect_stats['open_faces']}, "
         f"nonmanifold_faces={defect_stats['nonmanifold_faces']}"
     )
+
+
+def print_boundary_loop_stats(loops, max_hole_edges):
+    """
+    打印开放边界环的边数分布统计。
+
+    Parameters
+    ----------
+    loops : list of list of int
+        每个边界环的顶点索引列表。
+    max_hole_edges : int
+        允许封闭的最大边界环边数。
+    """
+    if not loops:
+        print("  Boundary loops: 0")
+        return
+
+    lengths = np.array([len(loop) for loop in loops])
+    stats = {
+        'count': len(lengths),
+        'mean': float(np.mean(lengths)),
+        'min': int(np.min(lengths)),
+        'p1': float(np.percentile(lengths, 1)),
+        'p5': float(np.percentile(lengths, 5)),
+        'p25': float(np.percentile(lengths, 25)),
+        'p50': float(np.percentile(lengths, 50)),
+        'p75': float(np.percentile(lengths, 75)),
+        'p90': float(np.percentile(lengths, 90)),
+        'p95': float(np.percentile(lengths, 95)),
+        'p99': float(np.percentile(lengths, 99)),
+        'max': int(np.max(lengths)),
+        'too_large': int(np.sum(lengths > max_hole_edges)),
+    }
+
+    print(f"  Boundary loops: {stats['count']}")
+    print(f"    edges: min={stats['min']}, "
+          f"p1={stats['p1']:.1f}, p5={stats['p5']:.1f}, "
+          f"p25={stats['p25']:.1f}, p50={stats['p50']:.1f}, "
+          f"p75={stats['p75']:.1f}, p90={stats['p90']:.1f}, "
+          f"p95={stats['p95']:.1f}, p99={stats['p99']:.1f}, "
+          f"max={stats['max']}")
+    print(f"    too large to fill (> {max_hole_edges} edges): "
+          f"{stats['too_large']}")
 
 
 def repair_mesh_iterative(mesh, max_iterations=5, max_hole_edges=50,
@@ -85,6 +129,11 @@ def repair_mesh_iterative(mesh, max_iterations=5, max_hole_edges=50,
         if fill_holes:
             defects, _, _ = analyze_mesh_defects(repaired)
             if defects['open_edges'] > 0:
+                if verbose:
+                    print("  Boundary loops before filling:")
+                    loops = extract_boundary_loops(repaired)
+                    print_boundary_loop_stats(loops, max_hole_edges)
+
                 repaired = fill_small_holes(
                     repaired, max_loop_edges=max_hole_edges, verbose=False
                 )
