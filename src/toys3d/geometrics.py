@@ -3241,3 +3241,563 @@ def segment_plates_by_plane_fitting(mesh, radius=5.0,
     n_plates = labels.max() + 1 if np.any(labels >= 0) else 0
     print(f"    merge done in {time.time() - t0:.2f}s, n_plates={n_plates}")
     return labels
+
+
+# ------------------------------------------------------------------
+#  自适应孔洞填补
+# ------------------------------------------------------------------
+
+def build_vertex_neighbors(faces, n_vertices):
+    """
+    从面片索引构建每个顶点的 1-ring 拓扑邻域顶点集合。
+    """
+    neighbors = [set() for _ in range(n_vertices)]
+    for f in faces:
+        a, b, c = int(f[0]), int(f[1]), int(f[2])
+        neighbors[a].update([b, c])
+        neighbors[b].update([a, c])
+        neighbors[c].update([a, b])
+    return neighbors
+
+
+def compute_loop_flatness(mesh, loop):
+    """
+    计算边界环的平坦度。
+
+    Returns
+    -------
+    flatness : float  [0, 1]
+        越接近 0 表示越平坦（近似共面），越接近 1 表示越弯曲。
+    relative_rmse : float
+        平面拟合残差相对于边界环包围盒对角线的比例。
+    """
+    pts = mesh.vertices[np.array(loop)]
+    if len(pts) < 3:
+        return 1.0, 1.0
+
+    center = pts.mean(axis=0)
+    centered = pts - center
+    _, s, _ = np.linalg.svd(centered, full_matrices=False)
+
+    if len(s) < 3 or s[0] < 1e-12:
+        return 0.0, 0.0
+
+    flatness = float(s[2] / (s.sum() + 1e-12))
+    rmse = float(np.sqrt(s[2] / len(pts)))
+    diag = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+    relative_rmse = rmse / (diag + 1e-12)
+
+    return flatness, relative_rmse
+
+
+def project_loop_to_plane(mesh, loop):
+    """
+    把边界环投影到最佳拟合切平面，返回 2D 坐标和平面基。
+    """
+    pts = mesh.vertices[np.array(loop)]
+    center = pts.mean(axis=0)
+    centered = pts - center
+    _, s, vh = np.linalg.svd(centered, full_matrices=False)
+
+    plane_normal = vh[2]
+    if np.linalg.norm(plane_normal) < 1e-12:
+        plane_normal = np.array([0.0, 0.0, 1.0])
+
+    if abs(plane_normal[2]) < 0.9:
+        basis_u = np.cross(plane_normal, [0, 0, 1])
+    else:
+        basis_u = np.cross(plane_normal, [1, 0, 0])
+    basis_u = basis_u / (np.linalg.norm(basis_u) + 1e-12)
+    basis_v = np.cross(plane_normal, basis_u)
+
+    pts_2d = np.column_stack([
+        np.dot(centered, basis_u),
+        np.dot(centered, basis_v)
+    ])
+
+    return pts_2d, basis_u, basis_v, center, plane_normal
+
+
+def _triangle_area_2d(a, b, c):
+    """计算 2D 三角形有向面积。"""
+    return 0.5 * ((b[0] - a[0]) * (c[1] - a[1]) -
+                  (b[1] - a[1]) * (c[0] - a[0]))
+
+
+def _is_convex_2d(pts_2d, prev, curr, next_idx, ccw=True):
+    """判断 curr 是否为凸顶点。"""
+    a, b, c = pts_2d[prev], pts_2d[curr], pts_2d[next_idx]
+    area = _triangle_area_2d(a, b, c)
+    return (area > 1e-12) if ccw else (area < -1e-12)
+
+
+def _point_in_triangle_2d(p, a, b, c):
+    """判断点 p 是否在三角形 abc 内部（含边界）。"""
+    def sign(p1, p2, p3):
+        return (p1[0] - p3[0]) * (p2[1] - p3[1]) - \
+               (p2[0] - p3[0]) * (p1[1] - p3[1])
+
+    d1 = sign(p, a, b)
+    d2 = sign(p, b, c)
+    d3 = sign(p, c, a)
+
+    has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
+    has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
+
+    return not (has_neg and has_pos)
+
+
+def ear_clip_polygon(pts_2d, min_area=1e-12):
+    """
+    对 2D 简单多边形做 Ear Clipping 三角化。
+
+    Returns
+    -------
+    triangles : list of [i, j, k]
+        三角形索引列表（相对于输入 pts_2d 的索引）。
+    """
+    n = len(pts_2d)
+    if n < 3:
+        return []
+    if n == 3:
+        return [[0, 1, 2]]
+
+    indices = list(range(n))
+    triangles = []
+
+    signed_area = 0.0
+    for i in range(n):
+        x1, y1 = pts_2d[i]
+        x2, y2 = pts_2d[(i + 1) % n]
+        signed_area += (x1 * y2 - x2 * y1)
+    ccw = signed_area > 0
+
+    max_steps = n * n
+    for _ in range(max_steps):
+        n_curr = len(indices)
+        if n_curr <= 3:
+            break
+
+        ear_found = False
+        for i in range(n_curr):
+            prev = indices[(i - 1) % n_curr]
+            curr = indices[i]
+            next_idx = indices[(i + 1) % n_curr]
+
+            a, b, c = pts_2d[prev], pts_2d[curr], pts_2d[next_idx]
+            area = abs(_triangle_area_2d(a, b, c))
+            if area < min_area:
+                continue
+
+            if not _is_convex_2d(pts_2d, prev, curr, next_idx, ccw):
+                continue
+
+            has_inside = False
+            for j in range(n):
+                if j == prev or j == curr or j == next_idx:
+                    continue
+                if _point_in_triangle_2d(pts_2d[j], a, b, c):
+                    has_inside = True
+                    break
+
+            if has_inside:
+                continue
+
+            triangles.append([prev, curr, next_idx])
+            indices.pop(i)
+            ear_found = True
+            break
+
+        if not ear_found:
+            triangles.append([indices[0], indices[1], indices[2]])
+            indices.pop(1)
+
+    if len(indices) == 3:
+        triangles.append([indices[0], indices[1], indices[2]])
+
+    return triangles
+
+
+def fill_loop_fan(mesh, loop):
+    """用质心扇形填补一个边界环。"""
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+    vertices = mesh.vertices.copy()
+
+    loop_pts = vertices[np.array(loop)]
+    centroid = loop_pts.mean(axis=0)
+    c_idx = len(vertices)
+    vertices = np.vstack([vertices, centroid[None, :]])
+
+    tris = []
+    for i in range(len(loop)):
+        tris.append([c_idx, loop[i], loop[(i + 1) % len(loop)]])
+
+    faces = np.vstack([faces, np.array(tris)])
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+
+def fill_loop_earclip(mesh, loop):
+    """用局部投影 + Ear Clipping 填补一个边界环。"""
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+    vertices = mesh.vertices.copy()
+
+    pts_2d, _, _, _, _ = project_loop_to_plane(mesh, loop)
+    tri_indices = ear_clip_polygon(pts_2d)
+
+    tris = []
+    for t in tri_indices:
+        tris.append([loop[t[0]], loop[t[1]], loop[t[2]]])
+
+    faces = np.vstack([faces, np.array(tris)])
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+
+def fill_loop_surface_fit(mesh, loop, num_samples=None):
+    """
+    用局部二次曲面拟合 + 规则采样填补大曲面孔洞。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+    vertices = mesh.vertices.copy()
+
+    pts_2d, basis_u, basis_v, origin, plane_normal = project_loop_to_plane(mesh, loop)
+
+    adjacency = build_vertex_neighbors(faces, len(vertices))
+    neighbor_set = set(loop)
+    for v in loop:
+        neighbor_set.update(adjacency[v])
+
+    fit_pts = []
+    fit_z = []
+    for v in neighbor_set:
+        vec = vertices[v] - origin
+        x = np.dot(vec, basis_u)
+        y = np.dot(vec, basis_v)
+        z = np.dot(vec, plane_normal)
+        fit_pts.append([x, y])
+        fit_z.append(z)
+
+    fit_pts = np.array(fit_pts)
+    fit_z = np.array(fit_z)
+
+    A = np.column_stack([
+        fit_pts[:, 0]**2,
+        fit_pts[:, 1]**2,
+        fit_pts[:, 0] * fit_pts[:, 1],
+        fit_pts[:, 0],
+        fit_pts[:, 1],
+        np.ones(len(fit_pts))
+    ])
+    coeffs, *_ = np.linalg.lstsq(A, fit_z, rcond=None)
+
+    if num_samples is None:
+        num_samples = max(20, int(len(loop) * 0.5))
+
+    from scipy.spatial import Delaunay
+    boundary_2d = pts_2d
+    xmin, ymin = boundary_2d.min(axis=0)
+    xmax, ymax = boundary_2d.max(axis=0)
+
+    rng = np.random.default_rng(42)
+    samples = []
+    max_attempts = num_samples * 20
+    attempts = 0
+    while len(samples) < num_samples and attempts < max_attempts:
+        p = rng.uniform([xmin, ymin], [xmax, ymax])
+        attempts += 1
+        inside = False
+        n = len(boundary_2d)
+        for i in range(n):
+            x1, y1 = boundary_2d[i]
+            x2, y2 = boundary_2d[(i + 1) % n]
+            if ((y1 > p[1]) != (y2 > p[1])) and \
+               (p[0] < (x2 - x1) * (p[1] - y1) / (y2 - y1 + 1e-12) + x1):
+                inside = not inside
+        if inside:
+            samples.append(p)
+
+    if len(samples) < 3:
+        return fill_loop_earclip(mesh, loop)
+
+    samples = np.array(samples)
+
+    all_2d = np.vstack([boundary_2d, samples])
+
+    tri = Delaunay(all_2d)
+
+    valid_tris = []
+    for simplex in tri.simplices:
+        tri_pts = all_2d[simplex]
+        centroid_2d = tri_pts.mean(axis=0)
+        inside = False
+        n = len(boundary_2d)
+        for i in range(n):
+            x1, y1 = boundary_2d[i]
+            x2, y2 = boundary_2d[(i + 1) % n]
+            if ((y1 > centroid_2d[1]) != (y2 > centroid_2d[1])) and \
+               (centroid_2d[0] < (x2 - x1) * (centroid_2d[1] - y1) /
+                (y2 - y1 + 1e-12) + x1):
+                inside = not inside
+        if inside:
+            valid_tris.append(simplex)
+
+    new_vertices = []
+    for p in samples:
+        z = (coeffs[0] * p[0]**2 + coeffs[1] * p[1]**2 +
+             coeffs[2] * p[0] * p[1] + coeffs[3] * p[0] +
+             coeffs[4] * p[1] + coeffs[5])
+        pos_3d = origin + p[0] * basis_u + p[1] * basis_v + z * plane_normal
+        new_vertices.append(pos_3d)
+
+    if new_vertices:
+        new_vertices = np.array(new_vertices)
+        vertex_offset = len(vertices)
+        vertices = np.vstack([vertices, new_vertices])
+
+    tris = []
+    for simplex in valid_tris:
+        v0 = vertex_offset + simplex[0] - len(loop) if simplex[0] >= len(loop) else loop[simplex[0]]
+        v1 = vertex_offset + simplex[1] - len(loop) if simplex[1] >= len(loop) else loop[simplex[1]]
+        v2 = vertex_offset + simplex[2] - len(loop) if simplex[2] >= len(loop) else loop[simplex[2]]
+        tris.append([v0, v1, v2])
+
+    faces = np.vstack([faces, np.array(tris)])
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+
+def fill_holes_adaptive(mesh,
+                        max_fan_edges=15,
+                        max_fan_flatness=0.05,
+                        max_earclip_flatness=0.15,
+                        max_surface_fit_edges=500,
+                        max_surface_fit_flatness=0.40,
+                        verbose=True):
+    """
+    自适应孔洞填补：按平坦度和边界范围选择策略。
+    """
+    loops = extract_boundary_loops(mesh)
+
+    fan_loops = []
+    earclip_loops = []
+    surface_fit_loops = []
+    skipped_loops = []
+
+    for loop in loops:
+        n_edges = len(loop)
+        flatness, rel_rmse = compute_loop_flatness(mesh, loop)
+
+        if n_edges <= max_fan_edges and flatness <= max_fan_flatness:
+            fan_loops.append(loop)
+        elif flatness <= max_earclip_flatness and n_edges <= max_surface_fit_edges:
+            earclip_loops.append(loop)
+        elif flatness <= max_surface_fit_flatness and n_edges <= max_surface_fit_edges:
+            surface_fit_loops.append(loop)
+        else:
+            skipped_loops.append(loop)
+
+    if verbose:
+        print(f"  Boundary loops: {len(loops)}")
+        print(f"    fan fill: {len(fan_loops)}")
+        print(f"    ear clip: {len(earclip_loops)}")
+        print(f"    surface fit: {len(surface_fit_loops)}")
+        print(f"    skipped: {len(skipped_loops)}")
+
+    result = mesh.copy()
+    for loop in fan_loops:
+        result = fill_loop_fan(result, loop)
+    for loop in earclip_loops:
+        result = fill_loop_earclip(result, loop)
+    for loop in surface_fit_loops:
+        result = fill_loop_surface_fit(result, loop)
+
+    result = result.copy()
+    result.remove_unreferenced_vertices()
+    result.fix_normals()
+    return result
+
+
+# ------------------------------------------------------------------
+#  孤立/准孤立结构移除
+# ------------------------------------------------------------------
+
+def remove_isolated_components(mesh, min_faces=20, min_area=None,
+                               min_ratio=0.001, verbose=True):
+    """
+    删除与主体不连通的小型孤立结构。
+    """
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    N = len(mesh.faces)
+    if N <= 1:
+        return mesh.copy()
+
+    adjacency = build_face_adjacency(mesh)
+
+    rows, cols = [], []
+    for i, neighbors in enumerate(adjacency):
+        for j in neighbors:
+            if j > i:
+                rows.extend([i, j])
+                cols.extend([j, i])
+
+    data = np.ones(len(rows), dtype=np.int8)
+    graph = csr_matrix((data, (rows, cols)), shape=(N, N))
+    _, labels = connected_components(graph, directed=False)
+
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    if len(unique_labels) <= 1:
+        return mesh.copy()
+
+    largest_label = unique_labels[np.argmax(counts)]
+
+    area_faces = mesh.area_faces
+    delete_mask = np.zeros(N, dtype=bool)
+
+    for lbl in unique_labels:
+        if lbl == largest_label:
+            continue
+
+        comp_idx = np.flatnonzero(labels == lbl)
+        count = len(comp_idx)
+        area = float(np.sum(area_faces[comp_idx]))
+        ratio = count / N
+
+        if (count < min_faces or
+                (min_area is not None and area < min_area) or
+                ratio < min_ratio):
+            delete_mask[comp_idx] = True
+
+    if verbose:
+        n_removed = int(np.sum(delete_mask))
+        print(f"  Isolated components removed: "
+              f"{len(unique_labels) - 1}, faces deleted: {n_removed}")
+
+    if not np.any(delete_mask):
+        return mesh.copy()
+
+    new_mesh = trimesh.Trimesh(
+        vertices=mesh.vertices,
+        faces=mesh.faces[~delete_mask],
+        process=False,
+    )
+    new_mesh.remove_unreferenced_vertices()
+    return new_mesh
+
+
+def remove_quasi_isolated_components(mesh, radius=None, n_sample=2000,
+                                     min_faces=30, max_ratio=0.05,
+                                     remove_bridge=False, rng=None,
+                                     verbose=True):
+    """
+    删除准孤立结构。
+
+    准孤立结构定义：
+        存在一个球状邻域 B(c,r)，如果删除 B 内所有面片，
+        会使得一个原本与主体连通的小结构 S 变成孤立结构。
+    """
+    from scipy.spatial import cKDTree
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+    import time
+
+    N = len(mesh.faces)
+    if N <= min_faces:
+        return mesh.copy()
+
+    adjacency = build_face_adjacency(mesh)
+    rows, cols = [], []
+    for i, neighbors in enumerate(adjacency):
+        for j in neighbors:
+            if j > i:
+                rows.extend([i, j])
+                cols.extend([j, i])
+    data = np.ones(len(rows), dtype=np.int8)
+    full_adj = csr_matrix((data, (rows, cols)), shape=(N, N))
+
+    centers = mesh.triangles_center
+
+    if radius is None:
+        median_edge = float(np.median(mesh.edges_unique_length)) \
+            if len(mesh.edges_unique_length) > 0 else 1.0
+        bbox_diag = float(np.linalg.norm(mesh.bounding_box.extents))
+        radius = max(5.0 * median_edge, 3.0 * bbox_diag / 1000.0)
+
+    radius = float(radius)
+    if radius <= 0:
+        raise ValueError("radius must be positive")
+
+    rng = np.random.default_rng(rng) if rng is None else rng
+    n_sample = min(n_sample, N)
+    sample_idx = rng.choice(N, size=n_sample, replace=False)
+
+    tree = cKDTree(centers)
+    max_bridge_ratio = 0.2
+    max_bridge_faces = int(max_bridge_ratio * N)
+    min_bridge_faces = 3
+
+    delete_mask = np.zeros(N, dtype=bool)
+    bridge_delete_mask = np.zeros(N, dtype=bool)
+    candidate_count = 0
+
+    if verbose:
+        print(f"  Sampling {n_sample} candidate balls "
+              f"(radius={radius:.4f})...")
+        t0 = time.time()
+        report_interval = max(1, n_sample // 10)
+
+    for k, fi in enumerate(sample_idx):
+        if verbose and k % report_interval == 0:
+            print(f"    evaluating {k}/{n_sample} "
+                  f"({100 * k / n_sample:.0f}%) +{time.time() - t0:.2f}s")
+
+        ball = tree.query_ball_point(centers[fi], r=radius)
+        nb = len(ball)
+        if nb < min_bridge_faces or nb > max_bridge_faces:
+            continue
+
+        remaining_mask = np.ones(N, dtype=bool)
+        remaining_mask[list(ball)] = False
+        remaining_idx = np.flatnonzero(remaining_mask)
+        if len(remaining_idx) == 0:
+            continue
+
+        sub_adj = full_adj[remaining_idx][:, remaining_idx]
+        _, comps = connected_components(sub_adj, directed=False)
+
+        unique_comps, comp_counts = np.unique(comps, return_counts=True)
+        if len(unique_comps) <= 1:
+            continue
+
+        main_comp = unique_comps[np.argmax(comp_counts)]
+
+        for comp in unique_comps:
+            if comp == main_comp:
+                continue
+            count = int(comp_counts[comp])
+            if count < min_faces or (count / N) > max_ratio:
+                continue
+
+            comp_original_faces = remaining_idx[comps == comp]
+            delete_mask[comp_original_faces] = True
+            candidate_count += 1
+
+            if remove_bridge:
+                bridge_delete_mask[list(ball)] = True
+
+    if verbose:
+        print(f"  Candidate quasi-isolated structures found: "
+              f"{candidate_count}")
+
+    if remove_bridge:
+        delete_mask |= bridge_delete_mask
+
+    if not np.any(delete_mask):
+        return mesh.copy()
+
+    new_mesh = trimesh.Trimesh(
+        vertices=mesh.vertices,
+        faces=mesh.faces[~delete_mask],
+        process=False,
+    )
+    new_mesh.remove_unreferenced_vertices()
+    return new_mesh
