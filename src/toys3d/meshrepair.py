@@ -16,7 +16,7 @@ from toys3d.geometrics import (
     analyze_mesh_defects,
     repair_mesh_by_removing_duplicates,
     repair_nonmanifold_edges,
-    fill_small_holes,
+    fill_holes_adaptive,
     extract_boundary_loops,
 )
 
@@ -134,8 +134,14 @@ def repair_mesh_iterative(mesh, max_iterations=5, max_hole_edges=50,
                     loops = extract_boundary_loops(repaired)
                     print_boundary_loop_stats(loops, max_hole_edges)
 
-                repaired = fill_small_holes(
-                    repaired, max_loop_edges=max_hole_edges, verbose=False
+                repaired = fill_holes_adaptive(
+                    repaired,
+                    max_fan_edges=15,
+                    max_fan_flatness=0.05,
+                    max_earclip_flatness=0.15,
+                    max_surface_fit_edges=500,
+                    max_surface_fit_flatness=0.40,
+                    verbose=False
                 )
 
         # 重新统计
@@ -183,6 +189,10 @@ def main():
                         help="输出详细统计信息")
 
     args = parser.parse_args()
+
+    if args.max_hole_edges != 50:
+        print("[WARNING] --max-hole-edges is deprecated; "
+              "adaptive hole filling uses flatness-based thresholds.")
 
     print(f"Loading: {args.input_file}")
     mesh = trimesh.load(args.input_file, force="mesh")
