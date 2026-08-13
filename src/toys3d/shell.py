@@ -519,7 +519,7 @@ def process_shell(mesh, num_passes=0, repair_mode=False,
     # 0. 基础统计
     with Timer("Initial stats/defect analysis"):
         stats = compute_mesh_stats(mesh)
-        print("Yo, mesh stats:")
+        print("Hey, mesh stats:")
         for k, v in stats.items():
             print(f"  {k}: {v}")
 
@@ -789,7 +789,7 @@ def main():
     if not isinstance(mesh, trimesh.Trimesh):
         mesh = mesh.dump(concatenate=True)
         print("Multiple meshes detected, merged.")
-    print(f"Yo, loading model: {args.input_file}")
+    print(f"Hey, loading model: {args.input_file}")
 
     scene, world_scene, processed_mesh, all_stats = process_shell(
         mesh,
