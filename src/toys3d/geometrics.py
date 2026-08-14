@@ -3452,10 +3452,26 @@ def fill_loop_earclip(mesh, loop):
     return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
 
-def fill_loop_surface_fit(mesh, loop, num_samples=None):
+def fill_loop_surface_fit(mesh, loop, num_samples=None, g2=False):
     """
     用局部二次曲面拟合 + 规则采样填补大曲面孔洞。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    loop : list of int
+        边界环顶点索引。
+    num_samples : int or None
+        内部采样点数量。
+    g2 : bool
+        是否使用 G2 光滑曲面拟合。当前预留接口，未实现；设置 True 时
+        抛出 NotImplementedError。
     """
+    if g2:
+        raise NotImplementedError(
+            "G2 smooth surface fitting is reserved but not yet implemented. "
+            "Use g2=False for quadratic surface fitting."
+        )
     faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
     vertices = mesh.vertices.copy()
 
@@ -3565,11 +3581,15 @@ def fill_loop_surface_fit(mesh, loop, num_samples=None):
 
 
 def fill_holes_adaptive(mesh,
+                        strategy='flatness',
                         max_fan_edges=15,
                         max_fan_flatness=0.05,
                         max_earclip_flatness=0.15,
                         max_surface_fit_edges=500,
                         max_surface_fit_flatness=0.40,
+                        edge_count_small_p=50.0,
+                        edge_count_large_p=95.0,
+                        g2=False,
                         verbose=True):
     """
     自适应孔洞填补：按平坦度和边界范围选择策略。
@@ -3581,18 +3601,49 @@ def fill_holes_adaptive(mesh,
     surface_fit_loops = []
     skipped_loops = []
 
-    for loop in loops:
-        n_edges = len(loop)
-        flatness, rel_rmse = compute_loop_flatness(mesh, loop)
-
-        if n_edges <= max_fan_edges and flatness <= max_fan_flatness:
-            fan_loops.append(loop)
-        elif flatness <= max_earclip_flatness and n_edges <= max_surface_fit_edges:
-            earclip_loops.append(loop)
-        elif flatness <= max_surface_fit_flatness and n_edges <= max_surface_fit_edges:
-            surface_fit_loops.append(loop)
+    if strategy == 'edge-count':
+        if len(loops) == 0:
+            small_thr = max(max_fan_edges, 3)
+            large_thr = max(max_surface_fit_edges, small_thr + 1)
         else:
-            skipped_loops.append(loop)
+            lengths = np.array([len(loop) for loop in loops], dtype=float)
+            small_thr = max(int(np.percentile(lengths, edge_count_small_p,
+                                              method='lower')), 3)
+            large_thr = max(int(np.percentile(lengths, edge_count_large_p,
+                                              method='lower')), small_thr + 1)
+
+        for loop in loops:
+            n = len(loop)
+            if n <= small_thr:
+                fan_loops.append(loop)
+            elif n <= large_thr:
+                earclip_loops.append(loop)
+            elif n <= max_surface_fit_edges:
+                surface_fit_loops.append(loop)
+            else:
+                skipped_loops.append(loop)
+
+        if verbose:
+            print(f"  Strategy: edge-count")
+            print(f"  Thresholds: small<={small_thr}, "
+                  f"medium<={large_thr}, large<={max_surface_fit_edges}")
+
+    else:  # flatness
+        for loop in loops:
+            n_edges = len(loop)
+            flatness, _ = compute_loop_flatness(mesh, loop)
+
+            if n_edges <= max_fan_edges and flatness <= max_fan_flatness:
+                fan_loops.append(loop)
+            elif flatness <= max_earclip_flatness and n_edges <= max_surface_fit_edges:
+                earclip_loops.append(loop)
+            elif flatness <= max_surface_fit_flatness and n_edges <= max_surface_fit_edges:
+                surface_fit_loops.append(loop)
+            else:
+                skipped_loops.append(loop)
+
+        if verbose:
+            print(f"  Strategy: flatness")
 
     if verbose:
         print(f"  Boundary loops: {len(loops)}")
@@ -3607,7 +3658,7 @@ def fill_holes_adaptive(mesh,
     for loop in earclip_loops:
         result = fill_loop_earclip(result, loop)
     for loop in surface_fit_loops:
-        result = fill_loop_surface_fit(result, loop)
+        result = fill_loop_surface_fit(result, loop, g2=g2)
 
     result = result.copy()
     result.remove_unreferenced_vertices()

@@ -18,6 +18,7 @@ from toys3d.geometrics import (
     repair_nonmanifold_edges,
     fill_holes_adaptive,
     extract_boundary_loops,
+    compute_loop_flatness,
 )
 
 
@@ -31,50 +32,46 @@ def print_defect_summary(tag, defect_stats):
     )
 
 
-def print_boundary_loop_stats(loops, max_hole_edges):
+def print_boundary_loop_stats(loops, mesh):
     """
-    打印开放边界环的边数分布统计。
-
-    Parameters
-    ----------
-    loops : list of list of int
-        每个边界环的顶点索引列表。
-    max_hole_edges : int
-        允许封闭的最大边界环边数。
+    打印开放边界环的边数分布与平坦度统计。
     """
     if not loops:
         print("  Boundary loops: 0")
         return
 
     lengths = np.array([len(loop) for loop in loops])
-    stats = {
-        'count': len(lengths),
-        'mean': float(np.mean(lengths)),
-        'min': int(np.min(lengths)),
-        'p1': float(np.percentile(lengths, 1)),
-        'p5': float(np.percentile(lengths, 5)),
-        'p25': float(np.percentile(lengths, 25)),
-        'p50': float(np.percentile(lengths, 50)),
-        'p75': float(np.percentile(lengths, 75)),
-        'p90': float(np.percentile(lengths, 90)),
-        'p95': float(np.percentile(lengths, 95)),
-        'p99': float(np.percentile(lengths, 99)),
-        'max': int(np.max(lengths)),
-        'too_large': int(np.sum(lengths > max_hole_edges)),
-    }
+    flatnesses = np.array([compute_loop_flatness(mesh, loop)[0]
+                           for loop in loops])
 
-    print(f"  Boundary loops: {stats['count']}")
-    print(f"    edges: min={stats['min']}, "
-          f"p1={stats['p1']:.1f}, p5={stats['p5']:.1f}, "
-          f"p25={stats['p25']:.1f}, p50={stats['p50']:.1f}, "
-          f"p75={stats['p75']:.1f}, p90={stats['p90']:.1f}, "
-          f"p95={stats['p95']:.1f}, p99={stats['p99']:.1f}, "
-          f"max={stats['max']}")
-    print(f"    too large to fill (> {max_hole_edges} edges): "
-          f"{stats['too_large']}")
+    def pct(arr, p):
+        return int(np.percentile(arr, p, method='lower'))
+
+    print(f"  Boundary loops: {len(lengths)}")
+    print(f"    edges: min={int(np.min(lengths))}, "
+          f"p1={pct(lengths, 1)}, p5={pct(lengths, 5)}, "
+          f"p25={pct(lengths, 25)}, p50={pct(lengths, 50)}, "
+          f"p75={pct(lengths, 75)}, p90={pct(lengths, 90)}, "
+          f"p95={pct(lengths, 95)}, p99={pct(lengths, 99)}, "
+          f"max={int(np.max(lengths))}")
+    print(f"    flatness: min={flatnesses.min():.3f}, "
+          f"p50={np.percentile(flatnesses, 50):.3f}, "
+          f"p95={np.percentile(flatnesses, 95):.3f}, "
+          f"max={flatnesses.max():.3f}")
 
 
-def repair_mesh_iterative(mesh, max_iterations=5, max_hole_edges=50,
+def repair_mesh_iterative(mesh,
+                          max_iterations=5,
+                          max_hole_edges=50,
+                          strategy='flatness',
+                          max_fan_edges=15,
+                          max_fan_flatness=0.05,
+                          max_earclip_flatness=0.15,
+                          max_surface_fit_edges=500,
+                          max_surface_fit_flatness=0.40,
+                          edge_count_small_p=50.0,
+                          edge_count_large_p=95.0,
+                          g2=False,
                           remove_duplicate=True,
                           repair_nonmanifold=True,
                           fill_holes=True,
@@ -88,7 +85,25 @@ def repair_mesh_iterative(mesh, max_iterations=5, max_hole_edges=50,
     max_iterations : int
         最大修复轮数
     max_hole_edges : int
-        允许封闭的开放边界环最大边数
+        允许封闭的开放边界环最大边数 (已弃用，保留兼容)
+    strategy : str
+        孔洞填补策略：'flatness' 或 'edge-count'
+    max_fan_edges : int
+        fan fill 最大边数
+    max_fan_flatness : float
+        fan fill 最大平坦度
+    max_earclip_flatness : float
+        ear clip 最大平坦度
+    max_surface_fit_edges : int
+        surface fit 最大边数
+    max_surface_fit_flatness : float
+        surface fit 最大平坦度
+    edge_count_small_p : float
+        edge-count 策略下小孔边数百分位
+    edge_count_large_p : float
+        edge-count 策略下中孔边数百分位
+    g2 : bool
+        是否使用 G2 光滑曲面拟合（预留接口）
     remove_duplicate : bool
         是否去重/去退化面
     repair_nonmanifold : bool
@@ -132,16 +147,20 @@ def repair_mesh_iterative(mesh, max_iterations=5, max_hole_edges=50,
                 if verbose:
                     print("  Boundary loops before filling:")
                     loops = extract_boundary_loops(repaired)
-                    print_boundary_loop_stats(loops, max_hole_edges)
+                    print_boundary_loop_stats(loops, repaired)
 
                 repaired = fill_holes_adaptive(
                     repaired,
-                    max_fan_edges=15,
-                    max_fan_flatness=0.05,
-                    max_earclip_flatness=0.15,
-                    max_surface_fit_edges=500,
-                    max_surface_fit_flatness=0.40,
-                    verbose=False
+                    strategy=strategy,
+                    max_fan_edges=max_fan_edges,
+                    max_fan_flatness=max_fan_flatness,
+                    max_earclip_flatness=max_earclip_flatness,
+                    max_surface_fit_edges=max_surface_fit_edges,
+                    max_surface_fit_flatness=max_surface_fit_flatness,
+                    edge_count_small_p=edge_count_small_p,
+                    edge_count_large_p=edge_count_large_p,
+                    g2=g2,
+                    verbose=verbose
                 )
 
         # 重新统计
@@ -176,7 +195,33 @@ def main():
     parser.add_argument("--max-iterations", type=int, default=5,
                         help="最大修复轮数（默认 5）")
     parser.add_argument("--max-hole-edges", type=int, default=50,
-                        help="允许封闭的开放边界环最大边数（默认 50）")
+                        help="(已弃用，自适应填补不再使用)")
+
+    parser.add_argument("--hole-strategy", type=str, default="flatness",
+                        choices=["flatness", "edge-count"],
+                        help="孔洞填补策略：flatness=基于平坦度，"
+                             "edge-count=基于边数统计（默认 flatness）")
+
+    # flatness 策略阈值
+    parser.add_argument("--max-fan-edges", type=int, default=15,
+                        help="fan fill 最大边数（默认 15）")
+    parser.add_argument("--max-fan-flatness", type=float, default=0.05,
+                        help="fan fill 最大平坦度（默认 0.05）")
+    parser.add_argument("--max-earclip-flatness", type=float, default=0.15,
+                        help="ear clip 最大平坦度（默认 0.15）")
+    parser.add_argument("--max-surface-fit-edges", type=int, default=500,
+                        help="surface fit 最大边数（默认 500）")
+    parser.add_argument("--max-surface-fit-flatness", type=float, default=0.40,
+                        help="surface fit 最大平坦度（默认 0.40）")
+
+    # edge-count 策略阈值
+    parser.add_argument("--edge-count-small-p", type=float, default=50.0,
+                        help="edge-count 策略下小孔边数百分位（默认 50）")
+    parser.add_argument("--edge-count-large-p", type=float, default=95.0,
+                        help="edge-count 策略下中孔边数百分位（默认 95）")
+
+    parser.add_argument("--g2", action="store_true",
+                        help="使用 G2 光滑曲面拟合（当前预留接口，未实现）")
 
     parser.add_argument("--no-duplicate", action="store_true",
                         help="关闭去重 / 去退化面")
@@ -192,7 +237,11 @@ def main():
 
     if args.max_hole_edges != 50:
         print("[WARNING] --max-hole-edges is deprecated; "
-              "adaptive hole filling uses flatness-based thresholds.")
+              "adaptive hole filling uses strategy-based thresholds.")
+
+    if args.g2:
+        print("[WARNING] --g2 is reserved but not yet implemented; "
+              "will raise NotImplementedError if a surface-fit hole is encountered.")
 
     print(f"Loading: {args.input_file}")
     mesh = trimesh.load(args.input_file, force="mesh")
@@ -209,6 +258,15 @@ def main():
         mesh,
         max_iterations=args.max_iterations,
         max_hole_edges=args.max_hole_edges,
+        strategy=args.hole_strategy,
+        max_fan_edges=args.max_fan_edges,
+        max_fan_flatness=args.max_fan_flatness,
+        max_earclip_flatness=args.max_earclip_flatness,
+        max_surface_fit_edges=args.max_surface_fit_edges,
+        max_surface_fit_flatness=args.max_surface_fit_flatness,
+        edge_count_small_p=args.edge_count_small_p,
+        edge_count_large_p=args.edge_count_large_p,
+        g2=args.g2,
         remove_duplicate=not args.no_duplicate,
         repair_nonmanifold=not args.no_nonmanifold,
         fill_holes=not args.no_fill_holes,
