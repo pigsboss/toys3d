@@ -22,6 +22,7 @@ from toys3d.geometrics import (
     analyze_mesh_defects,
     compute_hole_area_stats,
     extract_boundary_loops,
+    polygon_area_from_3d_ccw,
 )
 
 
@@ -94,6 +95,35 @@ def build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask):
     colors[both] = [255, 128, 0, 255]            # 橙
 
     vis.visual.face_colors = colors
+    return vis
+
+
+def make_double_sided(mesh):
+    """
+    将网格渲染为双面几何，避免薄壳背面被背面剔除而显示为透明。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+    if len(faces) == 0:
+        return mesh.copy()
+
+    double_faces = np.vstack([
+        faces,
+        faces[:, ::-1],
+    ])
+
+    vis = trimesh.Trimesh(
+        vertices=mesh.vertices.copy(),
+        faces=double_faces,
+        process=False,
+    )
+
+    if hasattr(mesh.visual, 'face_colors') and mesh.visual.face_colors.shape[0] == len(faces):
+        colors = np.asarray(mesh.visual.face_colors)
+        vis.visual.face_colors = np.vstack([colors, colors])
+    else:
+        colors = np.full((len(faces), 4), [200, 200, 200, 255], dtype=np.uint8)
+        vis.visual.face_colors = np.vstack([colors, colors])
+
     return vis
 
 
@@ -197,37 +227,42 @@ def _greedy_color_hole_loops(loops):
     return color_indices, palette
 
 
-def add_hole_boundaries_to_scene(scene, mesh, radius=None, verbose=False):
+def add_hole_boundaries_to_scene(scene, mesh, radius=None,
+                                 min_edges=3, min_area=0.0,
+                                 verbose=False):
     """
     检测网格中的闭合孔洞边界环，并在场景中用高饱和度颜色绘制。
 
-    每个孔洞的边界边使用同一种颜色；相邻孔洞尽量使用不同颜色。
-
-    Parameters
-    ----------
-    scene : trimesh.Scene
-    mesh : trimesh.Trimesh
-    radius : float or None
-        圆柱半径。默认基于包围盒对角线的 0.1%。
-    verbose : bool
-        是否打印每个孔洞的颜色与边数。
+    只绘制边长和面积均满足阈值的闭合环。
     """
     loops = extract_boundary_loops(mesh)
-    if not loops:
+
+    filtered_loops = []
+    for loop in loops:
+        if len(loop) < min_edges:
+            continue
+        pts = mesh.vertices[np.array(loop)]
+        area = polygon_area_from_3d_ccw(pts)
+        if area < min_area:
+            continue
+        filtered_loops.append(loop)
+
+    if not filtered_loops:
         if verbose:
-            print("  No closed hole boundary loops found.")
+            print("  No closed hole boundary loops matching thresholds.")
         return
 
-    color_indices, palette = _greedy_color_hole_loops(loops)
+    color_indices, palette = _greedy_color_hole_loops(filtered_loops)
 
     if radius is None or radius <= 0:
         diag = float(np.linalg.norm(mesh.bounding_box.extents))
         radius = max(diag * 0.001, 1e-6)
 
     if verbose:
-        print(f"  Drawing {len(loops)} hole boundary loops with distinct colors:")
+        print(f"  Drawing {len(filtered_loops)} hole boundary loops "
+              f"(filtered from {len(loops)} total):")
 
-    for loop_idx, loop in enumerate(loops):
+    for loop_idx, loop in enumerate(filtered_loops):
         color = palette[color_indices[loop_idx]]
         if verbose:
             print(f"    hole {loop_idx}: {len(loop)} edges, color={color.tolist()}")
@@ -339,6 +374,11 @@ def inspect_mesh(mesh, args):
         print("  orange:  faces with both defects")
 
         vis = build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask)
+
+        # 默认双面渲染：薄壳从任何一侧观察都可见
+        if args.double_sided:
+            vis = make_double_sided(vis)
+
         scene = trimesh.Scene(vis)
 
         # 先导出着色的缺陷网格（不含线框）
@@ -359,6 +399,8 @@ def inspect_mesh(mesh, args):
             add_hole_boundaries_to_scene(
                 scene, mesh,
                 radius=args.hole_radius,
+                min_edges=args.min_hole_edges,
+                min_area=args.min_hole_area,
                 verbose=True,
             )
 
@@ -401,6 +443,16 @@ def main():
                         help="高亮显示闭合孔洞边界，相邻孔洞使用不同高饱和度颜色")
     parser.add_argument("--hole-radius", type=float, default=None,
                         help="孔洞边界圆柱半径（默认自动计算，通常比普通线框略粗）")
+    parser.add_argument("--double-sided", dest='double_sided',
+                        action='store_true', default=True,
+                        help="双面渲染薄壳网格（默认开启）")
+    parser.add_argument("--no-double-sided", dest='double_sided',
+                        action='store_false',
+                        help="关闭双面渲染，恢复默认背面剔除")
+    parser.add_argument("--min-hole-edges", type=int, default=3,
+                        help="高亮孔洞的最小边界边数（默认 3）")
+    parser.add_argument("--min-hole-area", type=float, default=0.0,
+                        help="高亮孔洞的最小面积（默认 0，不过滤）")
     args = parser.parse_args()
 
     args.wireframe_color = _parse_color_string(args.wireframe_color)

@@ -1846,12 +1846,15 @@ def fill_small_holes(mesh, max_loop_edges=50, verbose=True):
 
 def extract_boundary_loops(mesh):
     """
-    提取网格的所有开放边界环。
+    用有向半边界追踪提取所有闭合开放边界环。
+
+    相比简单点邻接贪心，此方法在遇到分叉或非流形边界时更稳健。
+    只返回真正闭合的环，忽略无法闭合的开放链条。
 
     Returns
     -------
     loops : list of list of int
-        每个元素是一个边界环的顶点索引列表。
+        每个元素是一个闭合边界环的顶点索引列表。
     """
     faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
 
@@ -1862,38 +1865,81 @@ def extract_boundary_loops(mesh):
             key = (a, b) if a < b else (b, a)
             edge_face_map.setdefault(key, []).append(fi)
 
-    boundary_edges = [e for e, fl in edge_face_map.items() if len(fl) == 1]
+    boundary_edges = [edge for edge, fl in edge_face_map.items()
+                      if len(fl) == 1]
 
     if not boundary_edges:
         return []
 
+    # 无向邻接，用于从当前顶点找到候选开放边
     adjacency = {}
     for a, b in boundary_edges:
         adjacency.setdefault(a, []).append(b)
         adjacency.setdefault(b, []).append(a)
 
-    visited = set()
+    unvisited = set(boundary_edges)
     loops = []
-    for start in adjacency:
-        if start in visited:
-            continue
-        loop = [start]
-        visited.add(start)
-        prev, curr = None, start
+
+    while unvisited:
+        start_edge = next(iter(unvisited))
+        unvisited.remove(start_edge)
+
+        # 任意选择追踪方向
+        a, b = start_edge
+        loop = [a, b]
+        prev_vertex, curr_vertex = a, b
+
         while True:
-            neighbors = [v for v in adjacency[curr] if v != prev]
-            if not neighbors:
+            # 找从 curr_vertex 出发、不是回到 prev_vertex 的未访问开放边
+            candidates = []
+            for nxt in adjacency.get(curr_vertex, []):
+                if nxt == prev_vertex:
+                    continue
+                edge = tuple(sorted((curr_vertex, nxt)))
+                if edge in unvisited:
+                    candidates.append(edge)
+
+            if not candidates:
+                # 无法闭合：放弃当前链
                 break
-            nxt = neighbors[0]
-            if nxt == start and len(loop) > 2:
+
+            # 根据方向连续性选择最优下一条边
+            if len(candidates) > 1:
+                dir_prev = mesh.vertices[curr_vertex] - mesh.vertices[prev_vertex]
+                dir_prev = dir_prev / (np.linalg.norm(dir_prev) + 1e-12)
+
+                best_edge = None
+                best_score = -np.inf
+                for edge in candidates:
+                    a2, b2 = edge
+                    nxt = b2 if a2 == curr_vertex else a2
+                    dir_next = mesh.vertices[nxt] - mesh.vertices[curr_vertex]
+                    dir_next = dir_next / (np.linalg.norm(dir_next) + 1e-12)
+
+                    dot = float(np.dot(dir_prev, dir_next))
+                    score = dot if dot >= 0 else -0.5 * dot
+                    if score > best_score:
+                        best_score = score
+                        best_edge = edge
+                next_edge = best_edge
+            else:
+                next_edge = candidates[0]
+
+            unvisited.remove(next_edge)
+            a2, b2 = next_edge
+            next_vertex = b2 if a2 == curr_vertex else a2
+            loop.append(next_vertex)
+
+            # 成功回到起点
+            if next_vertex == a and len(loop) > 2:
+                loops.append(loop[:-1])
                 break
-            if nxt in visited:
+
+            prev_vertex, curr_vertex = curr_vertex, next_vertex
+
+            # 安全上限，防止异常拓扑死循环
+            if len(loop) > 10000:
                 break
-            loop.append(nxt)
-            visited.add(nxt)
-            prev, curr = curr, nxt
-        if len(loop) >= 3:
-            loops.append(loop)
 
     return loops
 
@@ -1907,17 +1953,17 @@ def compute_hole_area_stats(mesh):
         return {
             'total_area': 0.0,
             'count': 0,
-            'min_area': np.nan,
-            'max_area': np.nan,
-            'mean_area': np.nan,
-            'p1_area': np.nan,
-            'p5_area': np.nan,
-            'p25_area': np.nan,
-            'p50_area': np.nan,
-            'p75_area': np.nan,
-            'p90_area': np.nan,
-            'p95_area': np.nan,
-            'p99_area': np.nan,
+            'min_area': 0.0,
+            'max_area': 0.0,
+            'mean_area': 0.0,
+            'p1_area': 0.0,
+            'p5_area': 0.0,
+            'p25_area': 0.0,
+            'p50_area': 0.0,
+            'p75_area': 0.0,
+            'p90_area': 0.0,
+            'p95_area': 0.0,
+            'p99_area': 0.0,
         }
 
     areas = []
