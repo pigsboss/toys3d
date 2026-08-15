@@ -1898,6 +1898,52 @@ def extract_boundary_loops(mesh):
     return loops
 
 
+def compute_hole_area_stats(mesh):
+    """
+    统计网格开放孔洞（边界环）的面积分布。
+    """
+    loops = extract_boundary_loops(mesh)
+    if not loops:
+        return {
+            'total_area': 0.0,
+            'count': 0,
+            'min_area': np.nan,
+            'max_area': np.nan,
+            'mean_area': np.nan,
+            'p1_area': np.nan,
+            'p5_area': np.nan,
+            'p25_area': np.nan,
+            'p50_area': np.nan,
+            'p75_area': np.nan,
+            'p90_area': np.nan,
+            'p95_area': np.nan,
+            'p99_area': np.nan,
+        }
+
+    areas = []
+    for loop in loops:
+        pts = mesh.vertices[np.array(loop)]
+        area = polygon_area_from_3d_ccw(pts)
+        areas.append(area)
+    areas = np.array(areas)
+
+    return {
+        'total_area': float(areas.sum()),
+        'count': int(len(areas)),
+        'min_area': float(areas.min()),
+        'max_area': float(areas.max()),
+        'mean_area': float(areas.mean()),
+        'p1_area': float(np.percentile(areas, 1)),
+        'p5_area': float(np.percentile(areas, 5)),
+        'p25_area': float(np.percentile(areas, 25)),
+        'p50_area': float(np.percentile(areas, 50)),
+        'p75_area': float(np.percentile(areas, 75)),
+        'p90_area': float(np.percentile(areas, 90)),
+        'p95_area': float(np.percentile(areas, 95)),
+        'p99_area': float(np.percentile(areas, 99)),
+    }
+
+
 # ------------------------------------------------------------------
 #  新增：薄板分割核心函数（向量化实现）
 # ------------------------------------------------------------------

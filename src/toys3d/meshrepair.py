@@ -19,6 +19,7 @@ from toys3d.geometrics import (
     fill_holes_adaptive,
     extract_boundary_loops,
     compute_loop_flatness,
+    polygon_area_from_3d_ccw,
 )
 
 
@@ -58,6 +59,25 @@ def print_boundary_loop_stats(loops, mesh):
           f"p50={np.percentile(flatnesses, 50):.3f}, "
           f"p95={np.percentile(flatnesses, 95):.3f}, "
           f"max={flatnesses.max():.3f}")
+
+    areas = []
+    for loop in loops:
+        pts = mesh.vertices[np.array(loop)]
+        area = polygon_area_from_3d_ccw(pts)
+        areas.append(area)
+    areas = np.array(areas)
+
+    print(f"    hole area percentiles: "
+          f"total={areas.sum():.4f}, "
+          f"p1={np.percentile(areas, 1):.4f}, "
+          f"p5={np.percentile(areas, 5):.4f}, "
+          f"p25={np.percentile(areas, 25):.4f}, "
+          f"p50={np.percentile(areas, 50):.4f}, "
+          f"p75={np.percentile(areas, 75):.4f}, "
+          f"p90={np.percentile(areas, 90):.4f}, "
+          f"p95={np.percentile(areas, 95):.4f}, "
+          f"p99={np.percentile(areas, 99):.4f}, "
+          f"max={areas.max():.4f}")
 
 
 def repair_mesh_iterative(mesh,

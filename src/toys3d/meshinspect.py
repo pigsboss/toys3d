@@ -20,6 +20,7 @@ import trimesh
 from toys3d.geometrics import (
     compute_mesh_stats,
     analyze_mesh_defects,
+    compute_hole_area_stats,
 )
 
 
@@ -160,6 +161,21 @@ def inspect_mesh(mesh, args):
     print(f"  nonmanifold edges: {defect_stats['nonmanifold_edges']}")
     print(f"  open faces:        {defect_stats['open_faces']}")
     print(f"  nonmanifold faces: {defect_stats['nonmanifold_faces']}")
+
+    hole_stats = compute_hole_area_stats(mesh)
+    print(f"  open boundary loops: {hole_stats['count']}")
+    print(f"  total hole area:     {hole_stats['total_area']:.6f}")
+    if hole_stats['count'] > 0:
+        print(f"  hole area percentiles: "
+              f"p1={hole_stats['p1_area']:.6f}, "
+              f"p5={hole_stats['p5_area']:.6f}, "
+              f"p25={hole_stats['p25_area']:.6f}, "
+              f"p50={hole_stats['p50_area']:.6f}, "
+              f"p75={hole_stats['p75_area']:.6f}, "
+              f"p90={hole_stats['p90_area']:.6f}, "
+              f"p95={hole_stats['p95_area']:.6f}, "
+              f"p99={hole_stats['p99_area']:.6f}, "
+              f"max={hole_stats['max_area']:.6f}")
 
     print_separator("Bounding Box")
     print(f"  min:      [{bbox_stats['min'][0]:.4f}, "
