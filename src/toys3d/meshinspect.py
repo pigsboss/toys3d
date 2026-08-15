@@ -21,6 +21,7 @@ from toys3d.geometrics import (
     compute_mesh_stats,
     analyze_mesh_defects,
     compute_hole_area_stats,
+    extract_boundary_loops,
 )
 
 
@@ -133,6 +134,116 @@ def add_wireframe_to_scene(scene, mesh, color=None, radius=None):
         scene.add_geometry(seg)
 
 
+def _high_saturation_hole_palette():
+    """
+    返回一组高饱和度、且相互区分的 RGBA 颜色。
+    """
+    palette = [
+        (255,   0,   0, 255),   # 红
+        (  0, 255,   0, 255),   # 绿
+        (  0, 128, 255, 255),   # 蓝
+        (255, 255,   0, 255),   # 黄
+        (255,   0, 255, 255),   # 品红
+        (  0, 255, 255, 255),   # 青
+        (255, 128,   0, 255),   # 橙
+        (128,   0, 255, 255),   # 紫
+        (  0, 255, 128, 255),   # 春绿
+        (255,   0, 128, 255),   # 粉红
+    ]
+    return [np.array(c, dtype=np.uint8) for c in palette]
+
+
+def _greedy_color_hole_loops(loops):
+    """
+    为孔洞边界环分配调色板颜色索引。
+
+    如果两个孔洞共享顶点，则认为它们相邻，应使用不同颜色。
+    使用贪心染色。返回 (color_indices, palette)。
+    """
+    n = len(loops)
+    if n == 0:
+        return [], _high_saturation_hole_palette()
+
+    vertex_to_loops = {}
+    for i, loop in enumerate(loops):
+        for v in loop:
+            vertex_to_loops.setdefault(int(v), []).append(i)
+
+    adjacency = [set() for _ in range(n)]
+    for loop_indices in vertex_to_loops.values():
+        if len(loop_indices) <= 1:
+            continue
+        for i in loop_indices:
+            for j in loop_indices:
+                if i != j:
+                    adjacency[i].add(j)
+                    adjacency[j].add(i)
+
+    palette = _high_saturation_hole_palette()
+    color_indices = [None] * n
+
+    for i in range(n):
+        used = {color_indices[j] for j in adjacency[i]
+                if color_indices[j] is not None}
+        chosen = None
+        for c in range(len(palette)):
+            if c not in used:
+                chosen = c
+                break
+        if chosen is None:
+            chosen = i % len(palette)
+        color_indices[i] = chosen
+
+    return color_indices, palette
+
+
+def add_hole_boundaries_to_scene(scene, mesh, radius=None, verbose=False):
+    """
+    检测网格中的闭合孔洞边界环，并在场景中用高饱和度颜色绘制。
+
+    每个孔洞的边界边使用同一种颜色；相邻孔洞尽量使用不同颜色。
+
+    Parameters
+    ----------
+    scene : trimesh.Scene
+    mesh : trimesh.Trimesh
+    radius : float or None
+        圆柱半径。默认基于包围盒对角线的 0.1%。
+    verbose : bool
+        是否打印每个孔洞的颜色与边数。
+    """
+    loops = extract_boundary_loops(mesh)
+    if not loops:
+        if verbose:
+            print("  No closed hole boundary loops found.")
+        return
+
+    color_indices, palette = _greedy_color_hole_loops(loops)
+
+    if radius is None or radius <= 0:
+        diag = float(np.linalg.norm(mesh.bounding_box.extents))
+        radius = max(diag * 0.001, 1e-6)
+
+    if verbose:
+        print(f"  Drawing {len(loops)} hole boundary loops with distinct colors:")
+
+    for loop_idx, loop in enumerate(loops):
+        color = palette[color_indices[loop_idx]]
+        if verbose:
+            print(f"    hole {loop_idx}: {len(loop)} edges, color={color.tolist()}")
+
+        for k in range(len(loop)):
+            v0 = mesh.vertices[int(loop[k])]
+            v1 = mesh.vertices[int(loop[(k + 1) % len(loop)])]
+            seg = trimesh.creation.cylinder(
+                radius=radius,
+                segment=[v0, v1],
+                sections=4,
+            )
+            seg.visual.face_colors = color
+            scene.add_geometry(seg)
+
+
 def print_separator(title=None):
     if title:
         print(f"\n{'=' * 60}")
@@ -243,6 +354,14 @@ def inspect_mesh(mesh, args):
                 radius=args.wireframe_radius
             )
 
+        # 高亮显示闭合孔洞边界
+        if args.highlight_holes:
+            add_hole_boundaries_to_scene(
+                scene, mesh,
+                radius=args.hole_radius,
+                verbose=True,
+            )
+
     return scene
 
 
@@ -278,6 +397,10 @@ def main():
                         help="线框圆柱半径（默认按包围盒自动计算）")
     parser.add_argument("--wireframe-color", type=str, default="0,0,0,255",
                         help="线框 RGBA 颜色，默认 '0,0,0,255'")
+    parser.add_argument("--highlight-holes", action="store_true",
+                        help="高亮显示闭合孔洞边界，相邻孔洞使用不同高饱和度颜色")
+    parser.add_argument("--hole-radius", type=float, default=None,
+                        help="孔洞边界圆柱半径（默认自动计算，通常比普通线框略粗）")
     args = parser.parse_args()
 
     args.wireframe_color = _parse_color_string(args.wireframe_color)
