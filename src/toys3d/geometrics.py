@@ -3354,64 +3354,110 @@ def build_vertex_neighbors(faces, n_vertices):
 
 def repair_normals(mesh, verbose=False):
     """
-    修复网格面片法线方向，使其在流形邻域内一致。
+    修复网格面片绕序，使相邻流形面片的法线方向一致。
 
     方法：
-      1. 构建边到面的映射，仅保留共享边的两个面片（流形边）。
-      2. 使用 BFS 从每个连通区域传播方向。
-      3. 若相邻面片法向点积 < 0，则翻转该面片绕序，并同步更新其法线。
-      4. 返回重建后的 Trimesh。
+      1. 构建无向边 -> 面片映射，并记录每条边在每个面片中的有向半边。
+      2. 仅对流形边（恰好被两个面片共享）建立邻接关系。
+      3. 从每个连通区域种子面片开始 BFS。
+      4. 对每条共享边，要求两个面片的有向半边互为反向：
+             face_i 中为 (a, b)
+             face_j 中应为 (b, a)
+         如果不满足，则翻转 face_j 的绕序。
+      5. 对非流形边不传播；无法从种子到达的面片保持原方向。
 
-    非流形边不会参与传播，相关面片保持原方向。
+    与旧版本相比，本版本不根据法向量点积符号判断，因此不会在凹面处
+    误翻本来正确的面片。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    verbose : bool
+        是否打印翻转面片数量。
+
+    Returns
+    -------
+    repaired : trimesh.Trimesh
+        绕序修正后的网格。
     """
     faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
     N = len(faces)
     if N == 0:
         return mesh.copy()
 
-    edge_face_map = {}
+    # edge_data[key] = list of (face_idx, directed_halfedge)
+    # 其中 directed_halfedge 为该面片在构造时实际使用的有向边。
+    edge_data = {}
     for fi, face in enumerate(faces):
         v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
         for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
             key = (a, b) if a < b else (b, a)
-            edge_face_map.setdefault(key, []).append(fi)
+            edge_data.setdefault(key, []).append((fi, (a, b)))
 
-    adjacency = [[] for _ in range(N)]
-    for fl in edge_face_map.values():
-        if len(fl) == 2:
-            fi, fj = fl
-            adjacency[fi].append(fj)
-            adjacency[fj].append(fi)
+    # 仅保留恰好被两个面片共享的边
+    manifold_adjacency = [[] for _ in range(N)]
+    for key, face_list in edge_data.items():
+        if len(face_list) == 2:
+            fi, _fi_dir = face_list[0]
+            fj, _fj_dir = face_list[1]
+            manifold_adjacency[fi].append((fj, key))
+            manifold_adjacency[fj].append((fi, key))
 
-    normals = mesh.face_normals.copy()
-    flipped_count = 0
+    # 记录每个面片在每条边上的原始有向半边，便于 O(1) 查询
+    halfedge_lookup = {}
+    for key, face_list in edge_data.items():
+        for fi, directed in face_list:
+            halfedge_lookup[(fi, key)] = directed
+
+    flipped = np.zeros(N, dtype=bool)
     visited = np.zeros(N, dtype=bool)
+    flip_count = 0
 
     for seed in range(N):
         if visited[seed]:
             continue
 
         visited[seed] = True
+        flipped[seed] = False
         queue = [seed]
 
         while queue:
             i = queue.pop(0)
-            ni = normals[i]
 
-            for j in adjacency[i]:
+            for j, key in manifold_adjacency[i]:
                 if visited[j]:
                     continue
 
-                if np.dot(ni, normals[j]) < 0.0:
-                    faces[j] = faces[j][[1, 0, 2]]
-                    normals[j] = -normals[j]
-                    flipped_count += 1
+                di = halfedge_lookup[(i, key)]
+                dj = halfedge_lookup[(j, key)]
+
+                # actual_di：考虑 i 是否已经翻转
+                actual_di = (di[1], di[0]) if flipped[i] else di
+
+                # 对于一致的流形网格，j 的 actual_dj 应等于 actual_di 的反向
+                required_dj = (actual_di[1], actual_di[0])
+
+                if dj == required_dj:
+                    flipped[j] = False
+                else:
+                    # 此时 dj 的反向应等于 required_dj
+                    if (dj[1], dj[0]) == required_dj:
+                        flipped[j] = True
+                    else:
+                        # 理论上不会发生；若非流形边误入，保持 j 不翻转
+                        flipped[j] = False
 
                 visited[j] = True
                 queue.append(j)
 
+    # 应用翻转
+    for fi in range(N):
+        if flipped[fi]:
+            faces[fi] = faces[fi][[1, 0, 2]]
+            flip_count += 1
+
     if verbose:
-        print(f"  Normal repair: flipped {flipped_count} faces")
+        print(f"  Normal repair: flipped {flip_count} faces")
 
     return trimesh.Trimesh(vertices=mesh.vertices, faces=faces, process=False)
 
