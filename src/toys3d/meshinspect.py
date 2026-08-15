@@ -14,6 +14,7 @@ if os.path.exists(os.path.join(os.getcwd(), 'inspect.py')):
         sys.path.remove('')
 
 import argparse
+import colorsys
 import numpy as np
 import trimesh
 
@@ -106,7 +107,9 @@ def make_double_sided(mesh, backface_color=None):
     ----------
     mesh : trimesh.Trimesh
     backface_color : list or None
-        背面子颜色（RGBA）。若为 None，则使用与正面相同的颜色。
+        背面子颜色（RGBA）。
+        若为 None，则根据每个正面颜色自动生成同色系暗色：
+        保持 Hue 不变，Saturation * 0.8，Value * 0.5。
     """
     faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
     if len(faces) == 0:
@@ -129,7 +132,21 @@ def make_double_sided(mesh, backface_color=None):
         colors = np.full((len(faces), 4), [200, 200, 200, 255], dtype=np.uint8)
 
     if backface_color is None:
-        back_colors = colors.copy()
+        # 根据每个正面颜色自动生成同色系暗色背面颜色
+        n = len(colors)
+        back_colors = np.empty_like(colors)
+        for i in range(n):
+            r, g, b, a = colors[i].astype(np.float64) / 255.0
+            h, s, v = colorsys.rgb_to_hsv(r, g, b)
+            back_s = np.clip(s * 0.8, 0.0, 1.0)
+            back_v = np.clip(v * 0.5, 0.0, 1.0)
+            br, bg, bb = colorsys.hsv_to_rgb(h, back_s, back_v)
+            back_colors[i] = np.array([
+                br * 255.0,
+                bg * 255.0,
+                bb * 255.0,
+                a * 255.0,
+            ], dtype=np.uint8)
     else:
         back_colors = np.full_like(colors, np.asarray(backface_color, dtype=np.uint8))
 
@@ -461,7 +478,7 @@ def main():
                         help="关闭双面渲染，恢复默认背面剔除")
     parser.add_argument("--backface-color", type=str, default=None,
                         help="双面渲染时背面子颜色，格式 'R,G,B,A'。"
-                             "默认使用与正面相同的颜色")
+                             "默认自动根据正面颜色生成同色系暗色")
     parser.add_argument("--min-hole-edges", type=int, default=3,
                         help="高亮孔洞的最小边界边数（默认 3）")
     parser.add_argument("--min-hole-area", type=float, default=0.0,
