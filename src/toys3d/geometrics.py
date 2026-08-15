@@ -3747,10 +3747,16 @@ def fill_holes_adaptive(mesh,
     result = mesh.copy()
     for loop in fan_loops:
         result = fill_loop_fan(result, loop)
+        result = result.copy()
+        result.fix_normals()
     for loop in earclip_loops:
         result = fill_loop_earclip(result, loop)
+        result = result.copy()
+        result.fix_normals()
     for loop in surface_fit_loops:
         result = fill_loop_surface_fit(result, loop, g2=g2)
+        result = result.copy()
+        result.fix_normals()
 
     result = result.copy()
     result.remove_unreferenced_vertices()

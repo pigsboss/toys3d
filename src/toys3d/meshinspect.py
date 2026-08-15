@@ -98,9 +98,15 @@ def build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask):
     return vis
 
 
-def make_double_sided(mesh):
+def make_double_sided(mesh, backface_color=None):
     """
     将网格渲染为双面几何，避免薄壳背面被背面剔除而显示为透明。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    backface_color : list or None
+        背面子颜色（RGBA）。若为 None，则使用与正面相同的颜色。
     """
     faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
     if len(faces) == 0:
@@ -119,11 +125,15 @@ def make_double_sided(mesh):
 
     if hasattr(mesh.visual, 'face_colors') and mesh.visual.face_colors.shape[0] == len(faces):
         colors = np.asarray(mesh.visual.face_colors)
-        vis.visual.face_colors = np.vstack([colors, colors])
     else:
         colors = np.full((len(faces), 4), [200, 200, 200, 255], dtype=np.uint8)
-        vis.visual.face_colors = np.vstack([colors, colors])
 
+    if backface_color is None:
+        back_colors = colors.copy()
+    else:
+        back_colors = np.full_like(colors, np.asarray(backface_color, dtype=np.uint8))
+
+    vis.visual.face_colors = np.vstack([colors, back_colors])
     return vis
 
 
@@ -377,7 +387,7 @@ def inspect_mesh(mesh, args):
 
         # 默认双面渲染：薄壳从任何一侧观察都可见
         if args.double_sided:
-            vis = make_double_sided(vis)
+            vis = make_double_sided(vis, args.backface_color)
 
         scene = trimesh.Scene(vis)
 
@@ -449,6 +459,9 @@ def main():
     parser.add_argument("--no-double-sided", dest='double_sided',
                         action='store_false',
                         help="关闭双面渲染，恢复默认背面剔除")
+    parser.add_argument("--backface-color", type=str, default=None,
+                        help="双面渲染时背面子颜色，格式 'R,G,B,A'。"
+                             "默认使用与正面相同的颜色")
     parser.add_argument("--min-hole-edges", type=int, default=3,
                         help="高亮孔洞的最小边界边数（默认 3）")
     parser.add_argument("--min-hole-area", type=float, default=0.0,
@@ -456,6 +469,9 @@ def main():
     args = parser.parse_args()
 
     args.wireframe_color = _parse_color_string(args.wireframe_color)
+
+    if args.backface_color is not None:
+        args.backface_color = _parse_color_string(args.backface_color)
 
     print(f"Loading: {args.input_file}")
     mesh = trimesh.load(args.input_file, force="mesh")
