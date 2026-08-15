@@ -20,6 +20,7 @@ from toys3d.geometrics import (
     extract_boundary_loops,
     compute_loop_flatness,
     polygon_area_from_3d_ccw,
+    repair_normals,
 )
 
 
@@ -92,6 +93,7 @@ def repair_mesh_iterative(mesh,
                           edge_count_small_p=50.0,
                           edge_count_large_p=95.0,
                           g2=False,
+                          normal_repair=True,
                           remove_duplicate=True,
                           repair_nonmanifold=True,
                           fill_holes=True,
@@ -124,6 +126,8 @@ def repair_mesh_iterative(mesh,
         edge-count 策略下中孔边数百分位
     g2 : bool
         是否使用 G2 光滑曲面拟合（预留接口）
+    normal_repair : bool
+        是否在最终修复后执行法向一致性修复（默认 True）。
     remove_duplicate : bool
         是否去重/去退化面
     repair_nonmanifold : bool
@@ -195,11 +199,15 @@ def repair_mesh_iterative(mesh,
                 print("\nAll open and non-manifold edges resolved.")
             break
 
-    # 最终清理
+    # 最终清理并修复法向
     repaired = repaired.copy()
     repaired.merge_vertices()
     repaired.remove_unreferenced_vertices()
-    repaired.fix_normals()
+
+    if normal_repair:
+        repaired = repair_normals(repaired, verbose=verbose)
+    else:
+        repaired.fix_normals()
 
     return repaired
 
@@ -242,6 +250,8 @@ def main():
 
     parser.add_argument("--g2", action="store_true",
                         help="使用 G2 光滑曲面拟合（当前预留接口，未实现）")
+    parser.add_argument("--no-normal-repair", action="store_true",
+                        help="关闭最终法向一致性修复")
 
     parser.add_argument("--no-duplicate", action="store_true",
                         help="关闭去重 / 去退化面")
@@ -290,6 +300,7 @@ def main():
         remove_duplicate=not args.no_duplicate,
         repair_nonmanifold=not args.no_nonmanifold,
         fill_holes=not args.no_fill_holes,
+        normal_repair=not args.no_normal_repair,
         verbose=args.verbose,
     )
 

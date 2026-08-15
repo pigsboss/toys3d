@@ -3352,6 +3352,70 @@ def build_vertex_neighbors(faces, n_vertices):
     return neighbors
 
 
+def repair_normals(mesh, verbose=False):
+    """
+    修复网格面片法线方向，使其在流形邻域内一致。
+
+    方法：
+      1. 构建边到面的映射，仅保留共享边的两个面片（流形边）。
+      2. 使用 BFS 从每个连通区域传播方向。
+      3. 若相邻面片法向点积 < 0，则翻转该面片绕序，并同步更新其法线。
+      4. 返回重建后的 Trimesh。
+
+    非流形边不会参与传播，相关面片保持原方向。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+    N = len(faces)
+    if N == 0:
+        return mesh.copy()
+
+    edge_face_map = {}
+    for fi, face in enumerate(faces):
+        v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
+            edge_face_map.setdefault(key, []).append(fi)
+
+    adjacency = [[] for _ in range(N)]
+    for fl in edge_face_map.values():
+        if len(fl) == 2:
+            fi, fj = fl
+            adjacency[fi].append(fj)
+            adjacency[fj].append(fi)
+
+    normals = mesh.face_normals.copy()
+    flipped_count = 0
+    visited = np.zeros(N, dtype=bool)
+
+    for seed in range(N):
+        if visited[seed]:
+            continue
+
+        visited[seed] = True
+        queue = [seed]
+
+        while queue:
+            i = queue.pop(0)
+            ni = normals[i]
+
+            for j in adjacency[i]:
+                if visited[j]:
+                    continue
+
+                if np.dot(ni, normals[j]) < 0.0:
+                    faces[j] = faces[j][[1, 0, 2]]
+                    normals[j] = -normals[j]
+                    flipped_count += 1
+
+                visited[j] = True
+                queue.append(j)
+
+    if verbose:
+        print(f"  Normal repair: flipped {flipped_count} faces")
+
+    return trimesh.Trimesh(vertices=mesh.vertices, faces=faces, process=False)
+
+
 def compute_loop_flatness(mesh, loop):
     """
     计算边界环的平坦度。
@@ -3748,19 +3812,19 @@ def fill_holes_adaptive(mesh,
     for loop in fan_loops:
         result = fill_loop_fan(result, loop)
         result = result.copy()
-        result.fix_normals()
+        result = repair_normals(result, verbose=False)
     for loop in earclip_loops:
         result = fill_loop_earclip(result, loop)
         result = result.copy()
-        result.fix_normals()
+        result = repair_normals(result, verbose=False)
     for loop in surface_fit_loops:
         result = fill_loop_surface_fit(result, loop, g2=g2)
         result = result.copy()
-        result.fix_normals()
+        result = repair_normals(result, verbose=False)
 
     result = result.copy()
     result.remove_unreferenced_vertices()
-    result.fix_normals()
+    result = repair_normals(result, verbose=False)
     return result
 
 
