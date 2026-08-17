@@ -3620,41 +3620,99 @@ def ear_clip_polygon(pts_2d, min_area=1e-12):
     return triangles
 
 
-def fill_loop_fan(mesh, loop):
+def _build_edge_face_direction_map(mesh):
+    """
+    构建无向边 -> [(face_idx, directed_halfedge), ...] 的映射。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+    edge_info = {}
+    for fi, face in enumerate(faces):
+        v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
+            edge_info.setdefault(key, []).append((fi, (a, b)))
+    return edge_info
+
+
+def _should_flip_loop(loop, edge_info):
+    """
+    判断当前 loop 顺序生成的新面片是否需要整体翻转。
+
+    规则：新面片在共享第一边上的有向半边，必须与原始相邻面片的
+    有向半边相反。若 loop_dir 不等于 desired_new_dir，则需要翻转。
+    """
+    if len(loop) < 3:
+        return False
+
+    a, b = int(loop[0]), int(loop[1])
+    key = (a, b) if a < b else (b, a)
+    face_list = edge_info.get(key, [])
+
+    if not face_list:
+        return False
+
+    original_dir = face_list[0][1]            # 原始面片的有向半边
+    desired_new_dir = (original_dir[1], original_dir[0])
+    loop_dir = (a, b)
+
+    return desired_new_dir != loop_dir
+
+
+def fill_loop_fan(mesh, loop, edge_info=None):
     """用质心扇形填补一个边界环。"""
     faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
     vertices = mesh.vertices.copy()
+
+    if edge_info is None:
+        edge_info = _build_edge_face_direction_map(mesh)
 
     loop_pts = vertices[np.array(loop)]
     centroid = loop_pts.mean(axis=0)
     c_idx = len(vertices)
     vertices = np.vstack([vertices, centroid[None, :]])
 
+    flip = _should_flip_loop(loop, edge_info)
+
     tris = []
     for i in range(len(loop)):
-        tris.append([c_idx, loop[i], loop[(i + 1) % len(loop)]])
+        v0 = loop[i]
+        v1 = loop[(i + 1) % len(loop)]
+        if flip:
+            tris.append([c_idx, v1, v0])
+        else:
+            tris.append([c_idx, v0, v1])
 
     faces = np.vstack([faces, np.array(tris)])
     return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
 
-def fill_loop_earclip(mesh, loop):
+def fill_loop_earclip(mesh, loop, edge_info=None):
     """用局部投影 + Ear Clipping 填补一个边界环。"""
     faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
     vertices = mesh.vertices.copy()
 
+    if edge_info is None:
+        edge_info = _build_edge_face_direction_map(mesh)
+
     pts_2d, _, _, _, _ = project_loop_to_plane(mesh, loop)
     tri_indices = ear_clip_polygon(pts_2d)
 
+    flip = _should_flip_loop(loop, edge_info)
+
     tris = []
     for t in tri_indices:
-        tris.append([loop[t[0]], loop[t[1]], loop[t[2]]])
+        v0, v1, v2 = loop[t[0]], loop[t[1]], loop[t[2]]
+        if flip:
+            tris.append([v2, v1, v0])
+        else:
+            tris.append([v0, v1, v2])
 
     faces = np.vstack([faces, np.array(tris)])
     return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
 
-def fill_loop_surface_fit(mesh, loop, num_samples=None, g2=False):
+def fill_loop_surface_fit(mesh, loop, num_samples=None, g2=False,
+                          edge_info=None):
     """
     用局部二次曲面拟合 + 规则采样填补大曲面孔洞。
 
@@ -3676,6 +3734,9 @@ def fill_loop_surface_fit(mesh, loop, num_samples=None, g2=False):
         )
     faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
     vertices = mesh.vertices.copy()
+
+    if edge_info is None:
+        edge_info = _build_edge_face_direction_map(mesh)
 
     pts_2d, basis_u, basis_v, origin, plane_normal = project_loop_to_plane(mesh, loop)
 
@@ -3734,7 +3795,7 @@ def fill_loop_surface_fit(mesh, loop, num_samples=None, g2=False):
             samples.append(p)
 
     if len(samples) < 3:
-        return fill_loop_earclip(mesh, loop)
+        return fill_loop_earclip(mesh, loop, edge_info=edge_info)
 
     samples = np.array(samples)
 
@@ -3757,6 +3818,11 @@ def fill_loop_surface_fit(mesh, loop, num_samples=None, g2=False):
                 inside = not inside
         if inside:
             valid_tris.append(simplex)
+
+    # 根据边界绕序决定是否需要整体翻转新三角形
+    flip = _should_flip_loop(loop, edge_info)
+    if flip:
+        valid_tris = [s[::-1] for s in valid_tris]
 
     new_vertices = []
     for p in samples:
@@ -3867,13 +3933,16 @@ def fill_holes_adaptive(mesh,
 
     result = mesh.copy()
 
+    # 预先构建原始网格的边方向映射，修补时反复使用
+    edge_info = _build_edge_face_direction_map(result)
+
     if verbose:
         print(f"  Filling fan loops ({len(fan_loops)}):", flush=True)
     for idx, loop in enumerate(fan_loops):
         if verbose:
             print(f"    [{idx+1}/{len(fan_loops)}] fan fill "
                   f"{len(loop)} edges...", flush=True)
-        result = fill_loop_fan(result, loop)
+        result = fill_loop_fan(result, loop, edge_info=edge_info)
 
     if verbose:
         print(f"  Filling ear clip loops ({len(earclip_loops)}):", flush=True)
@@ -3881,7 +3950,7 @@ def fill_holes_adaptive(mesh,
         if verbose:
             print(f"    [{idx+1}/{len(earclip_loops)}] ear clip "
                   f"{len(loop)} edges...", flush=True)
-        result = fill_loop_earclip(result, loop)
+        result = fill_loop_earclip(result, loop, edge_info=edge_info)
 
     if verbose:
         print(f"  Filling surface-fit loops ({len(surface_fit_loops)}):", flush=True)
@@ -3889,7 +3958,7 @@ def fill_holes_adaptive(mesh,
         if verbose:
             print(f"    [{idx+1}/{len(surface_fit_loops)}] surface fit "
                   f"{len(loop)} edges...", flush=True)
-        result = fill_loop_surface_fit(result, loop, g2=g2)
+        result = fill_loop_surface_fit(result, loop, g2=g2, edge_info=edge_info)
 
     result = result.copy()
     result.remove_unreferenced_vertices()
