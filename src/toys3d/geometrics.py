@@ -3786,6 +3786,7 @@ def fill_holes_adaptive(mesh,
                         strategy='flatness',
                         max_fan_edges=15,
                         max_fan_flatness=0.05,
+                        max_earclip_edges=100,
                         max_earclip_flatness=0.15,
                         max_surface_fit_edges=500,
                         max_surface_fit_flatness=0.40,
@@ -3813,6 +3814,9 @@ def fill_holes_adaptive(mesh,
                                               method='lower')), 3)
             large_thr = max(int(np.percentile(lengths, edge_count_large_p,
                                               method='lower')), small_thr + 1)
+            large_thr = min(large_thr, max_earclip_edges)
+            if large_thr < small_thr:
+                large_thr = small_thr
 
         for loop in loops:
             n = len(loop)
@@ -3837,7 +3841,7 @@ def fill_holes_adaptive(mesh,
 
             if n_edges <= max_fan_edges and flatness <= max_fan_flatness:
                 fan_loops.append(loop)
-            elif flatness <= max_earclip_flatness and n_edges <= max_surface_fit_edges:
+            elif flatness <= max_earclip_flatness and n_edges <= max_earclip_edges:
                 earclip_loops.append(loop)
             elif flatness <= max_surface_fit_flatness and n_edges <= max_surface_fit_edges:
                 surface_fit_loops.append(loop)
@@ -3854,19 +3858,48 @@ def fill_holes_adaptive(mesh,
         print(f"    surface fit: {len(surface_fit_loops)}")
         print(f"    skipped: {len(skipped_loops)}")
 
+    import time  # 新增：用于进度耗时统计
+
     result = mesh.copy()
-    for loop in fan_loops:
+
+    if verbose:
+        print(f"  Filling fan loops ({len(fan_loops)}):", flush=True)
+    for idx, loop in enumerate(fan_loops):
+        if verbose:
+            print(f"    [{idx+1}/{len(fan_loops)}] fan fill "
+                  f"{len(loop)} edges...", flush=True)
+        t0 = time.time()
         result = fill_loop_fan(result, loop)
         result = result.copy()
         result = repair_normals(result, verbose=False)
-    for loop in earclip_loops:
+        if verbose:
+            print(f"      done in {time.time() - t0:.2f}s", flush=True)
+
+    if verbose:
+        print(f"  Filling ear clip loops ({len(earclip_loops)}):", flush=True)
+    for idx, loop in enumerate(earclip_loops):
+        if verbose:
+            print(f"    [{idx+1}/{len(earclip_loops)}] ear clip "
+                  f"{len(loop)} edges...", flush=True)
+        t0 = time.time()
         result = fill_loop_earclip(result, loop)
         result = result.copy()
         result = repair_normals(result, verbose=False)
-    for loop in surface_fit_loops:
+        if verbose:
+            print(f"      done in {time.time() - t0:.2f}s", flush=True)
+
+    if verbose:
+        print(f"  Filling surface-fit loops ({len(surface_fit_loops)}):", flush=True)
+    for idx, loop in enumerate(surface_fit_loops):
+        if verbose:
+            print(f"    [{idx+1}/{len(surface_fit_loops)}] surface fit "
+                  f"{len(loop)} edges...", flush=True)
+        t0 = time.time()
         result = fill_loop_surface_fit(result, loop, g2=g2)
         result = result.copy()
         result = repair_normals(result, verbose=False)
+        if verbose:
+            print(f"      done in {time.time() - t0:.2f}s", flush=True)
 
     result = result.copy()
     result.remove_unreferenced_vertices()

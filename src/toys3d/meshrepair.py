@@ -87,6 +87,7 @@ def repair_mesh_iterative(mesh,
                           strategy='flatness',
                           max_fan_edges=15,
                           max_fan_flatness=0.05,
+                          max_earclip_edges=100,
                           max_earclip_flatness=0.15,
                           max_surface_fit_edges=500,
                           max_surface_fit_flatness=0.40,
@@ -114,6 +115,8 @@ def repair_mesh_iterative(mesh,
         fan fill 最大边数
     max_fan_flatness : float
         fan fill 最大平坦度
+    max_earclip_edges : int
+        ear clip 最大边数
     max_earclip_flatness : float
         ear clip 最大平坦度
     max_surface_fit_edges : int
@@ -178,6 +181,7 @@ def repair_mesh_iterative(mesh,
                     strategy=strategy,
                     max_fan_edges=max_fan_edges,
                     max_fan_flatness=max_fan_flatness,
+                    max_earclip_edges=max_earclip_edges,
                     max_earclip_flatness=max_earclip_flatness,
                     max_surface_fit_edges=max_surface_fit_edges,
                     max_surface_fit_flatness=max_surface_fit_flatness,
@@ -235,6 +239,8 @@ def main():
                         help="fan fill 最大边数（默认 15）")
     parser.add_argument("--max-fan-flatness", type=float, default=0.05,
                         help="fan fill 最大平坦度（默认 0.05）")
+    parser.add_argument("--max-earclip-edges", type=int, default=100,
+                        help="ear clip 最大边数（默认 100）")
     parser.add_argument("--max-earclip-flatness", type=float, default=0.15,
                         help="ear clip 最大平坦度（默认 0.15）")
     parser.add_argument("--max-surface-fit-edges", type=int, default=500,
@@ -291,6 +297,7 @@ def main():
         strategy=args.hole_strategy,
         max_fan_edges=args.max_fan_edges,
         max_fan_flatness=args.max_fan_flatness,
+        max_earclip_edges=args.max_earclip_edges,
         max_earclip_flatness=args.max_earclip_flatness,
         max_surface_fit_edges=args.max_surface_fit_edges,
         max_surface_fit_flatness=args.max_surface_fit_flatness,
