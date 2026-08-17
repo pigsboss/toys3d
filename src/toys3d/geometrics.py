@@ -3812,9 +3812,12 @@ def fill_holes_adaptive(mesh,
             lengths = np.array([len(loop) for loop in loops], dtype=float)
             small_thr = max(int(np.percentile(lengths, edge_count_small_p,
                                               method='lower')), 3)
+            small_thr = min(small_thr, max_fan_edges)
+
             large_thr = max(int(np.percentile(lengths, edge_count_large_p,
                                               method='lower')), small_thr + 1)
             large_thr = min(large_thr, max_earclip_edges)
+
             if large_thr < small_thr:
                 large_thr = small_thr
 
@@ -3858,7 +3861,9 @@ def fill_holes_adaptive(mesh,
         print(f"    surface fit: {len(surface_fit_loops)}")
         print(f"    skipped: {len(skipped_loops)}")
 
-    import time  # 新增：用于进度耗时统计
+    import time
+
+    overall_start = time.time()
 
     result = mesh.copy()
 
@@ -3868,12 +3873,7 @@ def fill_holes_adaptive(mesh,
         if verbose:
             print(f"    [{idx+1}/{len(fan_loops)}] fan fill "
                   f"{len(loop)} edges...", flush=True)
-        t0 = time.time()
         result = fill_loop_fan(result, loop)
-        result = result.copy()
-        result = repair_normals(result, verbose=False)
-        if verbose:
-            print(f"      done in {time.time() - t0:.2f}s", flush=True)
 
     if verbose:
         print(f"  Filling ear clip loops ({len(earclip_loops)}):", flush=True)
@@ -3881,12 +3881,7 @@ def fill_holes_adaptive(mesh,
         if verbose:
             print(f"    [{idx+1}/{len(earclip_loops)}] ear clip "
                   f"{len(loop)} edges...", flush=True)
-        t0 = time.time()
         result = fill_loop_earclip(result, loop)
-        result = result.copy()
-        result = repair_normals(result, verbose=False)
-        if verbose:
-            print(f"      done in {time.time() - t0:.2f}s", flush=True)
 
     if verbose:
         print(f"  Filling surface-fit loops ({len(surface_fit_loops)}):", flush=True)
@@ -3894,16 +3889,16 @@ def fill_holes_adaptive(mesh,
         if verbose:
             print(f"    [{idx+1}/{len(surface_fit_loops)}] surface fit "
                   f"{len(loop)} edges...", flush=True)
-        t0 = time.time()
         result = fill_loop_surface_fit(result, loop, g2=g2)
-        result = result.copy()
-        result = repair_normals(result, verbose=False)
-        if verbose:
-            print(f"      done in {time.time() - t0:.2f}s", flush=True)
 
     result = result.copy()
     result.remove_unreferenced_vertices()
-    result = repair_normals(result, verbose=False)
+    result = repair_normals(result, verbose=verbose)
+
+    overall_elapsed = time.time() - overall_start
+    if verbose:
+        print(f"  Total hole filling time: {overall_elapsed:.2f}s", flush=True)
+
     return result
 
 
