@@ -326,7 +326,7 @@ def fill_holes_adaptive(mesh,
         return mesh.copy()
 
     counts = {'fan': 0, 'earclip': 0, 'surface_fit': 0, 'skipped': 0}
-    selected_loops = []
+    selected_by_type = {'fan': [], 'earclip': [], 'surface_fit': []}
 
     for loop in loops:
         n = len(loop)
@@ -356,7 +356,7 @@ def fill_holes_adaptive(mesh,
 
         counts[key] += 1
         if key != 'skipped':
-            selected_loops.append(loop)
+            selected_by_type[key].append(loop)
 
     if verbose:
         print(f"  Strategy: {strategy}")
@@ -370,7 +370,8 @@ def fill_holes_adaptive(mesh,
         print(f"    surface fit: {counts['surface_fit']}")
         print(f"    skipped: {counts['skipped']}")
 
-    if not selected_loops:
+    total_selected = sum(len(v) for v in selected_by_type.values())
+    if total_selected == 0:
         if verbose:
             print("  No holes within thresholds to fill.")
         return mesh.copy()
@@ -378,20 +379,26 @@ def fill_holes_adaptive(mesh,
     t0 = time.time()
     added_faces = []
 
-    if verbose:
-        print(f"  Filling {len(selected_loops)} hole loops...",
-              flush=True)
+    for fill_type in ['fan', 'earclip', 'surface_fit']:
+        loops_of_type = selected_by_type[fill_type]
+        if not loops_of_type:
+            continue
 
-    report_interval = max(1, len(selected_loops) // 10)
+        if verbose:
+            print(f"  Filling {fill_type} loops ({len(loops_of_type)}):",
+                  flush=True)
 
-    for idx, loop in enumerate(selected_loops, 1):
-        tris = _triangulate_hole_loop(mesh.vertices, loop)
-        added_faces.extend(tris)
+        report_interval = max(1, len(loops_of_type) // 10)
 
-        if verbose and idx % report_interval == 0:
-            print(f"    filled {idx}/{len(selected_loops)} loops "
-                  f"({100 * idx / len(selected_loops):.0f}%) "
-                  f"+{time.time() - t0:.2f}s", flush=True)
+        for idx, loop in enumerate(loops_of_type, 1):
+            tris = _triangulate_hole_loop(mesh.vertices, loop)
+            added_faces.extend(tris)
+
+            if verbose and idx % report_interval == 0:
+                print(f"    [{idx}/{len(loops_of_type)}] "
+                      f"{fill_type} fill "
+                      f"({100 * idx / len(loops_of_type):.0f}%) "
+                      f"+{time.time() - t0:.2f}s", flush=True)
 
     if not added_faces:
         if verbose:
