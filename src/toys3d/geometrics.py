@@ -96,7 +96,6 @@ def repair_mesh_by_removing_duplicates(mesh):
     new_mesh = mesh.copy()
     new_mesh.update_faces(keep)
     new_mesh.remove_unreferenced_vertices()
-    new_mesh.remove_degenerate_faces()
     return new_mesh
 
 
