@@ -114,6 +114,188 @@ def repair_nonmanifold_edges(mesh, max_iterations=10, verbose=False):
     return repaired
 
 
+def _signed_area_2d(points):
+    x = points[:, 0]
+    y = points[:, 1]
+    return 0.5 * float(
+        np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)
+    )
+
+
+def _point_in_triangle_2d(pt, a, b, c, eps=1e-12):
+    """Barycentric test: pt is inside/on triangle a,b,c in 2D."""
+    v0x, v0y = c[0] - a[0], c[1] - a[1]
+    v1x, v1y = b[0] - a[0], b[1] - a[1]
+    v2x, v2y = pt[0] - a[0], pt[1] - a[1]
+
+    dot00 = v0x * v0x + v0y * v0y
+    dot01 = v0x * v1x + v0y * v1y
+    dot02 = v0x * v2x + v0y * v2y
+    dot11 = v1x * v1x + v1y * v1y
+    dot12 = v1x * v2x + v1y * v2y
+
+    denom = dot00 * dot11 - dot01 * dot01
+    if abs(denom) < 1e-30:
+        return False
+
+    inv = 1.0 / denom
+    u = (dot11 * dot02 - dot01 * dot12) * inv
+    v = (dot00 * dot12 - dot01 * dot02) * inv
+
+    return (u >= -eps) and (v >= -eps) and (u + v <= 1.0 + eps)
+
+
+def _triangulate_hole_loop(vertices, loop):
+    """
+    将单个 3D 边界环三角化。
+
+    此函数将环投影到最佳拟合平面，使用 ear clipping 生成三角形。
+    若 ear clipping 失败，则退化为 fan triangulation。
+    """
+    loop = np.asarray(loop, dtype=np.int64)
+    n = len(loop)
+
+    if n < 3:
+        return []
+    if n == 3:
+        return [tuple(int(v) for v in loop)]
+
+    pts = vertices[loop]
+    centroid = pts.mean(axis=0)
+    centered = pts - centroid
+
+    # 用 SVD 找到最佳拟合平面，将 3D 环投影到 2D
+    _, _, vh = np.linalg.svd(centered)
+    u = vh[0]
+    v = vh[1]
+    coords = np.column_stack([centered @ u, centered @ v])
+
+    # 保持 2D 多边形为逆时针
+    if _signed_area_2d(coords) < 0:
+        loop = loop[::-1]
+        coords = coords[::-1]
+
+    idxs = list(range(n))
+    triangles = []
+
+    eps = 1e-12
+
+    while len(idxs) > 3:
+        m = len(idxs)
+        ear_found = False
+
+        for i in range(m):
+            p = idxs[i - 1]
+            c = idxs[i]
+            q = idxs[(i + 1) % m]
+
+            # 凸顶点判断
+            cross = (
+                (coords[c, 0] - coords[p, 0]) *
+                (coords[q, 1] - coords[p, 1]) -
+                (coords[c, 1] - coords[p, 1]) *
+                (coords[q, 0] - coords[p, 0])
+            )
+            if cross <= eps:
+                continue
+
+            inside = False
+            for other in idxs:
+                if other in (p, c, q):
+                    continue
+                if _point_in_triangle_2d(
+                    coords[other],
+                    coords[p],
+                    coords[c],
+                    coords[q],
+                ):
+                    inside = True
+                    break
+
+            if not inside:
+                triangles.append((
+                    int(loop[p]),
+                    int(loop[c]),
+                    int(loop[q]),
+                ))
+                del idxs[i]
+                ear_found = True
+                break
+
+        if not ear_found:
+            # 退化情况，退化为 fan
+            break
+
+    if len(idxs) == 3:
+        p, c, q = idxs
+        triangles.append((
+            int(loop[p]),
+            int(loop[c]),
+            int(loop[q]),
+        ))
+    elif len(idxs) > 3:
+        # fallback fan from first vertex
+        for k in range(1, len(idxs) - 1):
+            triangles.append((
+                int(loop[idxs[0]]),
+                int(loop[idxs[k]]),
+                int(loop[idxs[k + 1]]),
+            ))
+
+    return triangles
+
+
+def _extract_boundary_loops_oriented(mesh):
+    """
+    提取开放边界环，并调整为适合补孔的方向。
+
+    新三角面片需要与相邻面片保持相反的共享有向半边。此函数返回
+    经过方向校正后的边界环。
+    """
+    loops = extract_boundary_loops(mesh)
+    if not loops:
+        return []
+
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+
+    edge_counts = {}
+    for face in faces:
+        v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
+            edge_counts[key] = edge_counts.get(key, 0) + 1
+
+    boundary_face_dir = {}
+    for face in faces:
+        v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
+            if edge_counts.get(key, 0) == 1:
+                boundary_face_dir[key] = (a, b)
+
+    oriented = []
+    for loop in loops:
+        loop = list(loop)
+        if len(loop) < 3:
+            oriented.append(loop)
+            continue
+
+        for i in range(len(loop)):
+            a = int(loop[i])
+            b = int(loop[(i + 1) % len(loop)])
+            key = (a, b) if a < b else (b, a)
+            face_dir = boundary_face_dir.get(key)
+            if face_dir is not None:
+                # 若当前 loop 方向与相邻面片一致，需要反向
+                if face_dir == (a, b):
+                    loop = loop[::-1]
+                break
+
+        oriented.append(loop)
+
+    return oriented
+
+
 def fill_holes_adaptive(mesh,
                         strategy='flatness',
                         max_fan_edges=15,
@@ -129,21 +311,21 @@ def fill_holes_adaptive(mesh,
     """
     自适应孔洞修复。
 
-    该实现先用边界环大小/平坦度对孔洞分类并打印统计，然后：
-    - 对超过阈值的孔洞临时用扇形面片封住，避免被 trimesh fill_holes 填充；
-    - 调用 trimesh.repair.fill_holes 填充剩余的小、中、大孔洞；
-    - 最后移除临时扇形面片，保留被跳过的孔洞。
+    对阈值内的开放边界环直接三角化：
+    - 小环：fan fill
+    - 中环：ear clip
+    - 大环：surface fit（此处使用同一 ear clipping 三角化）
+    - 超过最大阈值的环保持开放，不填充
     """
     import time
 
-    loops = extract_boundary_loops(mesh)
+    loops = _extract_boundary_loops_oriented(mesh)
     if not loops:
         if verbose:
             print("  Boundary loops: 0")
         return mesh.copy()
 
     counts = {'fan': 0, 'earclip': 0, 'surface_fit': 0, 'skipped': 0}
-    skip_loops = []
     selected_loops = []
 
     for loop in loops:
@@ -173,9 +355,7 @@ def fill_holes_adaptive(mesh,
                 key = 'skipped'
 
         counts[key] += 1
-        if key == 'skipped':
-            skip_loops.append(loop)
-        else:
+        if key != 'skipped':
             selected_loops.append(loop)
 
     if verbose:
@@ -195,42 +375,47 @@ def fill_holes_adaptive(mesh,
             print("  No holes within thresholds to fill.")
         return mesh.copy()
 
-    # 临时封住 skipped 孔洞，避免 trimesh.fill_holes 填充它们
-    temp_mesh = mesh.copy()
-    temp_face_keys = set()
-
-    if skip_loops:
-        added_faces = []
-        for loop in skip_loops:
-            n = len(loop)
-            for k in range(1, n - 1):
-                tri = (int(loop[0]), int(loop[k]), int(loop[k + 1]))
-                added_faces.append(tri)
-                temp_face_keys.add(tuple(sorted(tri)))
-
-        if added_faces:
-            temp_mesh.faces = np.vstack([
-                temp_mesh.faces,
-                np.asarray(added_faces, dtype=np.int64)
-            ])
-
-    from trimesh.repair import fill_holes as trimesh_fill_holes
-
     t0 = time.time()
-    trimesh_fill_holes(temp_mesh)
+    added_faces = []
+
     if verbose:
-        print(f"  Trimesh fill_holes completed in {time.time() - t0:.2f}s")
+        print(f"  Filling {len(selected_loops)} hole loops...",
+              flush=True)
 
-    # 移除临时 skipped 孔洞扇形面片
-    if temp_face_keys:
-        def is_keep(face):
-            return tuple(sorted(face)) not in temp_face_keys
+    report_interval = max(1, len(selected_loops) // 10)
 
-        keep = np.array([is_keep(f) for f in temp_mesh.faces], dtype=bool)
-        temp_mesh.update_faces(keep)
-        temp_mesh.remove_unreferenced_vertices()
+    for idx, loop in enumerate(selected_loops, 1):
+        tris = _triangulate_hole_loop(mesh.vertices, loop)
+        added_faces.extend(tris)
 
-    return temp_mesh
+        if verbose and idx % report_interval == 0:
+            print(f"    filled {idx}/{len(selected_loops)} loops "
+                  f"({100 * idx / len(selected_loops):.0f}%) "
+                  f"+{time.time() - t0:.2f}s", flush=True)
+
+    if not added_faces:
+        if verbose:
+            print("  Hole filling produced no triangles.")
+        return mesh.copy()
+
+    new_faces = np.vstack([
+        np.asarray(mesh.faces, dtype=np.int64),
+        np.asarray(added_faces, dtype=np.int64).reshape(-1, 3),
+    ])
+
+    repaired = trimesh.Trimesh(
+        vertices=mesh.vertices.copy(),
+        faces=new_faces,
+        process=False,
+    )
+
+    repaired.remove_unreferenced_vertices()
+
+    if verbose:
+        print(f"  Hole filling completed in {time.time() - t0:.2f}s, "
+              f"added {len(added_faces)} faces")
+
+    return repaired
 
 
 def extract_boundary_loops(mesh):
