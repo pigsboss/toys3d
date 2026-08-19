@@ -1023,15 +1023,36 @@ def repair_to_watertight(mesh,
 
         verts = result.vertices.astype(np.float64)
 
-        # trimesh.proximity.closest_point 返回最近点、距离和三角形索引
+        # 先检测 rtree 是否可用；trimesh 精确最近点查询依赖 rtree
         try:
-            from trimesh.proximity import closest_point
+            import rtree  # noqa
+            have_rtree = True
+        except ImportError:
+            have_rtree = False
 
-            closest, distances, _ = closest_point(m, verts)
-        except Exception:
-            # 兼容旧版或不同命名
-            prox = trimesh.proximity.ProximityQuery(m)
-            closest, distances, _ = prox.on_surface(verts)
+        if have_rtree:
+            # 优先使用 trimesh 的精确表面最近点
+            try:
+                from trimesh.proximity import closest_point
+
+                closest, distances, _ = closest_point(m, verts)
+            except Exception:
+                # 若调用失败，也回退到顶点最近邻
+                have_rtree = False
+
+        if not have_rtree:
+            # 无 rtree 时使用 cKDTree 查询最近顶点作为近似投影
+            if verbose:
+                print("  [watertight] rtree not available; "
+                      "using vertex-nearest projection fallback",
+                      flush=True)
+
+            from scipy.spatial import cKDTree
+
+            tree = cKDTree(m.vertices)
+            distances, vertex_indices = tree.query(verts, k=1)
+            distances = np.asarray(distances, dtype=np.float64)
+            closest = m.vertices[vertex_indices]
 
         distances = np.asarray(distances, dtype=np.float64)
         moved_mask = distances < project_distance
