@@ -953,37 +953,44 @@ def repair_to_watertight(mesh,
     # 填充内部空腔；对于已经封闭的表面，这会把内部变成实心。
     big = ndi.binary_fill_holes(big)
 
-    grid_filled = big[pad:-pad, pad:-pad, pad:-pad]
+    # 使用完整 padded 体素栅格提取表面，不再裁剪。
+    # 否则裁剪会在体素边界处制造人工开放边。
+    grid_filled = big
 
-    # 优先尝试直接修改 VoxelGrid.matrix，再调用其 marching_cubes
     try:
-        vox.matrix = grid_filled
-        result = vox.marching_cubes
-        if callable(result):
-            result = result()
-    except Exception:
-        # 回退到 scikit-image 的 marching cubes
+        from skimage.measure import marching_cubes
+
+        verts, faces, normals, _ = marching_cubes(
+            grid_filled.astype(np.float32),
+            level=0.5,
+        )
+
+        # big 比原始 grid 多出 pad 层，因此世界坐标原点需要回退 pad * pitch
+        origin = np.asarray(vox.transform[:3, 3]) - pitch * pad
+        verts_world = origin + verts * pitch
+
+        result = trimesh.Trimesh(
+            vertices=verts_world,
+            faces=faces,
+            process=False,
+        )
+    except Exception as e:
+        # 如果 scikit-image 不可用，尝试用调整过 transform 的 VoxelGrid
         try:
-            from skimage.measure import marching_cubes
+            from trimesh.voxel import VoxelGrid
 
-            verts, faces, normals, _ = marching_cubes(
-                grid_filled.astype(np.float32),
-                level=0.5,
-            )
+            new_transform = np.array(vox.transform)
+            new_transform[:3, 3] -= pitch * pad
 
-            origin = np.asarray(vox.transform[:3, 3]) - pitch * pad
-            verts_world = origin + verts * pitch
-
-            result = trimesh.Trimesh(
-                vertices=verts_world,
-                faces=faces,
-                process=False,
-            )
-        except Exception as e:
+            big_vox = VoxelGrid(big, transform=new_transform)
+            result = big_vox.marching_cubes
+            if callable(result):
+                result = result()
+        except Exception as e2:
             raise RuntimeError(
                 "Unable to extract watertight surface. "
                 "Install scikit-image or adjust trimesh voxel grid handling."
-            ) from e
+            ) from e2
 
     result.merge_vertices()
     result.remove_unreferenced_vertices()
@@ -998,6 +1005,13 @@ def repair_to_watertight(mesh,
             min_faces=min_component_faces,
             verbose=verbose,
         )
+
+    # 诊断最终仍有多少开放边 / 非流形边
+    defects, _, _ = analyze_mesh_defects(result)
+    if verbose:
+        print(f"  [watertight] remaining defects: "
+              f"open_edges={defects['open_edges']}, "
+              f"nonmanifold_edges={defects['nonmanifold_edges']}")
 
     if verbose:
         print(f"  [watertight] reconstruction completed in "
