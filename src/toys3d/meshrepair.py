@@ -146,6 +146,10 @@ def repair_mesh_iterative(mesh,
     """
     repaired = mesh.copy()
 
+    # 修复前先合并重合顶点，去除重复顶点导致的伪开放边/非流形边
+    repaired.merge_vertices()
+    repaired.remove_unreferenced_vertices()
+
     if verbose:
         print("\n[Initial defects]")
         defect_stats, _, _ = analyze_mesh_defects(repaired)
