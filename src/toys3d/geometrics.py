@@ -426,58 +426,248 @@ def fill_holes_adaptive(mesh,
 
 
 def extract_boundary_loops(mesh):
-    """Extract closed boundary loops as lists of vertex indices."""
+    """
+    只提取真正闭合的开放边界环。
+
+    孤立的开放边或断开的开放边链不会作为闭合环返回，
+    避免后续补孔逻辑把它们误认为可以三角化的孔洞。
+    """
     edges = np.asarray(mesh.edges, dtype=np.int64)
     if len(edges) == 0:
         return []
-    edges_sorted = np.sort(edges, axis=1)
 
+    edges_sorted = np.sort(edges, axis=1)
     edge_counts = {}
     for e in edges_sorted:
         key = (int(e[0]), int(e[1]))
         edge_counts[key] = edge_counts.get(key, 0) + 1
 
-    boundary = [key for key, cnt in edge_counts.items() if cnt == 1]
-    if not boundary:
+    boundary_edges = [key for key, cnt in edge_counts.items() if cnt == 1]
+    if not boundary_edges:
         return []
 
     adj = {}
-    for a, b in boundary:
-        adj.setdefault(a, []).append(b)
-        adj.setdefault(b, []).append(a)
+    for a, b in boundary_edges:
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
 
+    visited_edges = set()
     loops = []
-    visited = set()
-    for start in list(adj.keys()):
-        if start in visited:
+
+    for a, b in boundary_edges:
+        key = (a, b) if a < b else (b, a)
+        if key in visited_edges:
             continue
-        loop = []
-        current = start
+
+        # 提取该边界边所在的完整连通分量
+        component_edges = []
+        stack = [key]
+
+        while stack:
+            u, v = stack.pop()
+            k = (u, v) if u < v else (v, u)
+            if k in visited_edges:
+                continue
+            visited_edges.add(k)
+            component_edges.append((u, v))
+
+            for w in adj.get(u, ()):
+                k2 = (u, w) if u < w else (w, u)
+                if k2 not in visited_edges:
+                    stack.append(k2)
+
+            for w in adj.get(v, ()):
+                k2 = (v, w) if v < w else (w, v)
+                if k2 not in visited_edges:
+                    stack.append(k2)
+
+        vertices = set()
+        for u, v in component_edges:
+            vertices.add(u)
+            vertices.add(v)
+
+        deg = {v: len(adj.get(v, ())) for v in vertices}
+
+        # 是否为单一简单闭合环：
+        # 顶点数 == 边数，每个顶点度数为 2，且至少 3 个顶点
+        is_closed_loop = (
+            len(component_edges) == len(vertices) and
+            len(vertices) >= 3 and
+            all(d == 2 for d in deg.values())
+        )
+
+        if not is_closed_loop:
+            continue
+
+        component_adj = {v: list(adj[v]) for v in vertices}
+        start = next(iter(vertices))
         prev = None
+        cur = start
+        loop = []
+
         while True:
-            if current in visited:
-                break
-            loop.append(current)
-            visited.add(current)
-            nbrs = adj.get(current, [])
-            nxt = None
-            for nb in nbrs:
-                if nb != prev:
-                    nxt = nb
-                    break
-            if nxt is None:
-                break
-            prev = current
-            current = nxt
+            loop.append(cur)
 
-        # Remove duplicate end if the loop is closed
-        if loop and loop[0] == loop[-1]:
-            loop = loop[:-1]
+            nbrs = [nb for nb in component_adj.get(cur, []) if nb != prev]
+            if not nbrs:
+                loop = []
+                break
 
-        if len(loop) > 1:
+            nxt = nbrs[0]
+            prev, cur = cur, nxt
+
+            if cur == start:
+                break
+
+        if len(loop) >= 3:
             loops.append(loop)
 
     return loops
+
+
+def extract_open_edge_chains(mesh):
+    """
+    提取不闭合的开放边链。
+
+    返回列表，每个元素为 dict：
+        edges:      list of (u, v)
+        vertices:   set of vertices
+        is_cycle:   bool
+        endpoints:  度数为 1 的端点列表
+    """
+    edges = np.asarray(mesh.edges, dtype=np.int64)
+    if len(edges) == 0:
+        return []
+
+    edges_sorted = np.sort(edges, axis=1)
+    edge_counts = {}
+    for e in edges_sorted:
+        key = (int(e[0]), int(e[1]))
+        edge_counts[key] = edge_counts.get(key, 0) + 1
+
+    boundary_edges = [key for key, cnt in edge_counts.items() if cnt == 1]
+    if not boundary_edges:
+        return []
+
+    adj = {}
+    for a, b in boundary_edges:
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+
+    visited_edges = set()
+    chains = []
+
+    for a, b in boundary_edges:
+        key = (a, b) if a < b else (b, a)
+        if key in visited_edges:
+            continue
+
+        component_edges = []
+        stack = [key]
+
+        while stack:
+            u, v = stack.pop()
+            k = (u, v) if u < v else (v, u)
+            if k in visited_edges:
+                continue
+            visited_edges.add(k)
+            component_edges.append((u, v))
+
+            for w in adj.get(u, ()):
+                k2 = (u, w) if u < w else (w, u)
+                if k2 not in visited_edges:
+                    stack.append(k2)
+
+            for w in adj.get(v, ()):
+                k2 = (v, w) if v < w else (w, v)
+                if k2 not in visited_edges:
+                    stack.append(k2)
+
+        vertices = set()
+        for u, v in component_edges:
+            vertices.add(u)
+            vertices.add(v)
+
+        deg = {v: len(adj.get(v, ())) for v in vertices}
+
+        is_cycle = (
+            len(component_edges) == len(vertices) and
+            len(vertices) >= 3 and
+            all(d == 2 for d in deg.values())
+        )
+
+        endpoints = [v for v in vertices if deg[v] == 1]
+
+        chains.append({
+            'edges': component_edges,
+            'vertices': vertices,
+            'is_cycle': is_cycle,
+            'endpoints': endpoints,
+        })
+
+    return chains
+
+
+def remove_small_open_edge_chains(mesh,
+                                  max_chain_edges=2,
+                                  verbose=False):
+    """
+    删除短小且不闭合的开放边链关联面片。
+
+    这类结构通常是由非流形修复或 STL 拼接产生的细长尖刺/孤边，
+    无法通过孔洞三角化补成水密。删除后可让下一轮填孔更稳定。
+    """
+    chains = extract_open_edge_chains(mesh)
+    if not chains:
+        return mesh.copy()
+
+    edge_to_faces = {}
+    for fi, face in enumerate(mesh.faces):
+        v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+        for a, b in ((v1, v2), (v2, v3), (v3, v1)):
+            key = (a, b) if a < b else (b, a)
+            edge_to_faces.setdefault(key, []).append(fi)
+
+    face_remove = set()
+    removed_chain_count = 0
+
+    for chain in chains:
+        if chain['is_cycle']:
+            continue
+
+        if len(chain['edges']) > max_chain_edges:
+            continue
+
+        # 只处理简单开放链，不处理分叉结构
+        if len(chain['endpoints']) != 2:
+            continue
+
+        # 边数 == 顶点数 - 1，确保是没有分支的简单路径
+        if len(chain['vertices']) != len(chain['edges']) + 1:
+            continue
+
+        for a, b in chain['edges']:
+            key = (a, b) if a < b else (b, a)
+            face_remove.update(edge_to_faces.get(key, []))
+
+        removed_chain_count += 1
+
+    if not face_remove:
+        return mesh.copy()
+
+    keep = np.ones(len(mesh.faces), dtype=bool)
+    for fi in face_remove:
+        keep[fi] = False
+
+    repaired = mesh.copy()
+    repaired.update_faces(keep)
+    repaired.remove_unreferenced_vertices()
+
+    if verbose:
+        print(f"  Removed {removed_chain_count} small open edge chains, "
+              f"{len(face_remove)} faces")
+
+    return repaired
 
 
 def compute_loop_flatness(mesh, loop):

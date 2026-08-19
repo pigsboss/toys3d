@@ -21,6 +21,7 @@ from toys3d.geometrics import (
     compute_loop_flatness,
     polygon_area_from_3d_ccw,
     repair_normals,
+    remove_small_open_edge_chains,
 )
 
 
@@ -175,6 +176,12 @@ def repair_mesh_iterative(mesh,
         if fill_holes:
             defects, _, _ = analyze_mesh_defects(repaired)
             if defects['open_edges'] > 0:
+                repaired = remove_small_open_edge_chains(
+                    repaired,
+                    max_chain_edges=2,
+                    verbose=verbose,
+                )
+
                 if verbose:
                     print("  Boundary loops before filling:")
                     loops = extract_boundary_loops(repaired)
