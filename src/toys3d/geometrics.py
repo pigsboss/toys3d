@@ -913,7 +913,7 @@ def repair_to_watertight(mesh,
     project_to_input : bool
         是否将重建网格顶点投影回原始输入网格表面，减少体素锯齿感。
     project_distance : float or None
-        投影最大搜索/移动距离。默认取 2.0 * pitch。
+        投影最大搜索/移动距离。默认取 0.5 * pitch。
     smooth_watertight : bool
         是否在投影后执行 Taubin 平滑。
     smooth_iterations : int
@@ -1008,71 +1008,68 @@ def repair_to_watertight(mesh,
     result.remove_unreferenced_vertices()
     result = repair_mesh_by_removing_duplicates(result)
 
+    # 保存基础水密代理壳，供可选增强失败时回退
+    result_before_enhancements = result.copy()
+
     # -------------------------------------------------------------
     # 可选：把体素化代理壳顶点投影回原始网格表面
     # 可显著减少轴对齐体素造成的阶梯状锯齿。
     # -------------------------------------------------------------
     if project_to_input:
         if project_distance is None:
-            project_distance = 2.0 * pitch
+            project_distance = 0.5 * pitch
 
-        if verbose:
-            print(f"  [watertight] projecting to input surface "
-                  f"(distance={project_distance:.4f})...",
-                  flush=True)
-
-        verts = result.vertices.astype(np.float64)
-
-        # 先检测 rtree 是否可用；trimesh 精确最近点查询依赖 rtree
+        # 精确表面投影依赖 rtree；没有 rtree 时放弃投影
         try:
             import rtree  # noqa
             have_rtree = True
         except ImportError:
             have_rtree = False
 
-        if have_rtree:
-            # 优先使用 trimesh 的精确表面最近点
+        if not have_rtree:
+            if verbose:
+                print("  [watertight] rtree not available; "
+                      "skipping projection to input surface.",
+                      flush=True)
+        else:
+            if verbose:
+                print(f"  [watertight] projecting to input surface "
+                      f"(distance={project_distance:.4f})...",
+                      flush=True)
+
+            verts = result.vertices.astype(np.float64)
+
             try:
                 from trimesh.proximity import closest_point
 
                 closest, distances, _ = closest_point(m, verts)
-            except Exception:
-                # 若调用失败，也回退到顶点最近邻
-                have_rtree = False
+            except Exception as e:
+                if verbose:
+                    print(f"  [watertight] projection failed: {e}; "
+                          f"skipping projection.",
+                          flush=True)
+                closest = None
 
-        if not have_rtree:
-            # 无 rtree 时使用 cKDTree 查询最近顶点作为近似投影
-            if verbose:
-                print("  [watertight] rtree not available; "
-                      "using vertex-nearest projection fallback",
-                      flush=True)
+            if closest is not None:
+                distances = np.asarray(distances, dtype=np.float64)
+                moved_mask = distances < project_distance
 
-            from scipy.spatial import cKDTree
+                if verbose:
+                    print(f"  [watertight] projected "
+                          f"{int(moved_mask.sum())}/{len(verts)} vertices",
+                          flush=True)
 
-            tree = cKDTree(m.vertices)
-            distances, vertex_indices = tree.query(verts, k=1)
-            distances = np.asarray(distances, dtype=np.float64)
-            closest = m.vertices[vertex_indices]
+                verts[moved_mask] = closest[moved_mask]
 
-        distances = np.asarray(distances, dtype=np.float64)
-        moved_mask = distances < project_distance
+                result = trimesh.Trimesh(
+                    vertices=verts,
+                    faces=result.faces,
+                    process=False,
+                )
 
-        if verbose:
-            print(f"  [watertight] projected "
-                  f"{int(moved_mask.sum())}/{len(verts)} vertices",
-                  flush=True)
-
-        verts[moved_mask] = closest[moved_mask]
-
-        result = trimesh.Trimesh(
-            vertices=verts,
-            faces=result.faces,
-            process=False,
-        )
-
-        result.merge_vertices()
-        result.remove_unreferenced_vertices()
-        result = repair_mesh_by_removing_duplicates(result)
+                result.merge_vertices()
+                result.remove_unreferenced_vertices()
+                result = repair_mesh_by_removing_duplicates(result)
 
     # -------------------------------------------------------------
     # 可选：Taubin 平滑，进一步降低残留锯齿。
@@ -1089,7 +1086,7 @@ def repair_to_watertight(mesh,
             result = filter_taubin(
                 result,
                 lamb=0.5,
-                mu=-0.53,
+                nu=-0.53,
                 iterations=smooth_iterations,
             )
         except Exception as e:
@@ -1132,6 +1129,16 @@ def repair_to_watertight(mesh,
         result.merge_vertices()
         result.remove_unreferenced_vertices()
         result = repair_mesh_by_removing_duplicates(result)
+
+    # 如果增强操作引入的缺陷无法完全修复，回退到基础水密代理壳
+    defects_after_enhancements, _, _ = analyze_mesh_defects(result)
+    if (defects_after_enhancements['open_edges'] > 0 or
+            defects_after_enhancements['nonmanifold_edges'] > 0):
+        if verbose:
+            print("  [watertight] enhancements introduced defects that "
+                  "could not be fully repaired; reverting to base proxy.",
+                  flush=True)
+        result = result_before_enhancements
 
     if len(result.faces) > 0:
         result = repair_normals(result, verbose=verbose)

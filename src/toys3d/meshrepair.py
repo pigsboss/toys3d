@@ -289,7 +289,7 @@ def main():
     parser.add_argument("--watertight-project-to-input", action="store_true",
                         help="将水密代理壳顶点投影回原始输入网格表面，减少锯齿感")
     parser.add_argument("--watertight-project-distance", type=float, default=None,
-                        help="投影最大移动距离；默认取 2 倍体素边长")
+                        help="投影最大移动距离；默认取 0.5 倍体素边长")
     parser.add_argument("--watertight-smooth", action="store_true",
                         help="对水密重建结果执行 Taubin 平滑")
     parser.add_argument("--watertight-smooth-iterations", type=int, default=10,
