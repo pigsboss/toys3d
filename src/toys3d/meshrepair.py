@@ -286,6 +286,14 @@ def main():
                         help="水密模式显式体素边长；优先级高于分辨率")
     parser.add_argument("--watertight-closing-iterations", type=int, default=2,
                         help="水密模式 3D 形态学闭运算迭代次数（默认 2）")
+    parser.add_argument("--watertight-project-to-input", action="store_true",
+                        help="将水密代理壳顶点投影回原始输入网格表面，减少锯齿感")
+    parser.add_argument("--watertight-project-distance", type=float, default=None,
+                        help="投影最大移动距离；默认取 2 倍体素边长")
+    parser.add_argument("--watertight-smooth", action="store_true",
+                        help="对水密重建结果执行 Taubin 平滑")
+    parser.add_argument("--watertight-smooth-iterations", type=int, default=10,
+                        help="Taubin 平滑迭代次数（默认 10）")
 
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="输出详细统计信息")
@@ -317,6 +325,10 @@ def main():
             resolution=args.watertight_resolution,
             voxel_size=args.watertight_voxel_size,
             closing_iterations=args.watertight_closing_iterations,
+            project_to_input=args.watertight_project_to_input,
+            project_distance=args.watertight_project_distance,
+            smooth_watertight=args.watertight_smooth,
+            smooth_iterations=args.watertight_smooth_iterations,
             verbose=args.verbose,
         )
     else:

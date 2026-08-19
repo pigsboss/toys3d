@@ -891,6 +891,10 @@ def repair_to_watertight(mesh,
                          voxel_size=None,
                          closing_iterations=2,
                          min_component_faces=100,
+                         project_to_input=False,
+                         project_distance=None,
+                         smooth_watertight=False,
+                         smooth_iterations=10,
                          verbose=False):
     """
     通过体素化 + 形态学封闭 + Marching Cubes 重建水密网格。
@@ -906,6 +910,14 @@ def repair_to_watertight(mesh,
         3D 形态学闭运算迭代次数，用于关闭细小孔洞和缝隙。
     min_component_faces : int
         删除小于该面片数的孤立连通分量。
+    project_to_input : bool
+        是否将重建网格顶点投影回原始输入网格表面，减少体素锯齿感。
+    project_distance : float or None
+        投影最大搜索/移动距离。默认取 2.0 * pitch。
+    smooth_watertight : bool
+        是否在投影后执行 Taubin 平滑。
+    smooth_iterations : int
+        Taubin 平滑迭代次数，默认 10。
     verbose : bool
         是否输出进度与耗时。
     """
@@ -995,6 +1007,110 @@ def repair_to_watertight(mesh,
     result.merge_vertices()
     result.remove_unreferenced_vertices()
     result = repair_mesh_by_removing_duplicates(result)
+
+    # -------------------------------------------------------------
+    # 可选：把体素化代理壳顶点投影回原始网格表面
+    # 可显著减少轴对齐体素造成的阶梯状锯齿。
+    # -------------------------------------------------------------
+    if project_to_input:
+        if project_distance is None:
+            project_distance = 2.0 * pitch
+
+        if verbose:
+            print(f"  [watertight] projecting to input surface "
+                  f"(distance={project_distance:.4f})...",
+                  flush=True)
+
+        verts = result.vertices.astype(np.float64)
+
+        # trimesh.proximity.closest_point 返回最近点、距离和三角形索引
+        try:
+            from trimesh.proximity import closest_point
+
+            closest, distances, _ = closest_point(m, verts)
+        except Exception:
+            # 兼容旧版或不同命名
+            prox = trimesh.proximity.ProximityQuery(m)
+            closest, distances, _ = prox.on_surface(verts)
+
+        distances = np.asarray(distances, dtype=np.float64)
+        moved_mask = distances < project_distance
+
+        if verbose:
+            print(f"  [watertight] projected "
+                  f"{int(moved_mask.sum())}/{len(verts)} vertices",
+                  flush=True)
+
+        verts[moved_mask] = closest[moved_mask]
+
+        result = trimesh.Trimesh(
+            vertices=verts,
+            faces=result.faces,
+            process=False,
+        )
+
+        result.merge_vertices()
+        result.remove_unreferenced_vertices()
+        result = repair_mesh_by_removing_duplicates(result)
+
+    # -------------------------------------------------------------
+    # 可选：Taubin 平滑，进一步降低残留锯齿。
+    # -------------------------------------------------------------
+    if smooth_watertight:
+        if verbose:
+            print(f"  [watertight] applying Taubin smoothing "
+                  f"(iterations={smooth_iterations})...",
+                  flush=True)
+
+        try:
+            from trimesh.smoothing import filter_taubin
+
+            result = filter_taubin(
+                result,
+                lamb=0.5,
+                mu=-0.53,
+                iterations=smooth_iterations,
+            )
+        except Exception as e:
+            if verbose:
+                print(f"  [watertight] smoothing failed: {e}",
+                      flush=True)
+
+        result.merge_vertices()
+        result.remove_unreferenced_vertices()
+        result = repair_mesh_by_removing_duplicates(result)
+
+    # 投影/平滑可能重新产生少量开放边；这里进行一次局部水密修复
+    defects, _, _ = analyze_mesh_defects(result)
+    if defects['open_edges'] > 0 or defects['nonmanifold_edges'] > 0:
+        if verbose:
+            print(f"  [watertight] projection/smoothing introduced defects: "
+                  f"open_edges={defects['open_edges']}, "
+                  f"nonmanifold_edges={defects['nonmanifold_edges']}; "
+                  f"attempting local repair...",
+                  flush=True)
+
+        if defects['nonmanifold_edges'] > 0:
+            result = repair_nonmanifold_edges(
+                result,
+                max_iterations=3,
+                verbose=False,
+            )
+
+        defects, _, _ = analyze_mesh_defects(result)
+        if defects['open_edges'] > 0:
+            result = fill_holes_adaptive(
+                result,
+                strategy='edge-count',
+                max_fan_edges=20,
+                max_earclip_edges=200,
+                max_surface_fit_edges=1000,
+                verbose=verbose,
+            )
+
+        result.merge_vertices()
+        result.remove_unreferenced_vertices()
+        result = repair_mesh_by_removing_duplicates(result)
 
     if len(result.faces) > 0:
         result = repair_normals(result, verbose=verbose)
