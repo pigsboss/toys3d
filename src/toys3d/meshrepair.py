@@ -22,6 +22,7 @@ from toys3d.geometrics import (
     polygon_area_from_3d_ccw,
     repair_normals,
     remove_small_open_edge_chains,
+    repair_to_watertight,
 )
 
 
@@ -277,6 +278,15 @@ def main():
     parser.add_argument("--no-fill-holes", action="store_true",
                         help="关闭小孔封闭")
 
+    parser.add_argument("--watertight", action="store_true",
+                        help="使用体素化 + Marching Cubes 重建水密外壳")
+    parser.add_argument("--watertight-resolution", type=int, default=256,
+                        help="水密模式默认体素分辨率（默认 256）")
+    parser.add_argument("--watertight-voxel-size", type=float, default=None,
+                        help="水密模式显式体素边长；优先级高于分辨率")
+    parser.add_argument("--watertight-closing-iterations", type=int, default=2,
+                        help="水密模式 3D 形态学闭运算迭代次数（默认 2）")
+
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="输出详细统计信息")
 
@@ -301,26 +311,35 @@ def main():
         for k, v in compute_mesh_stats(mesh).items():
             print(f"  {k}: {v}")
 
-    repaired = repair_mesh_iterative(
-        mesh,
-        max_iterations=args.max_iterations,
-        max_hole_edges=args.max_hole_edges,
-        strategy=args.hole_strategy,
-        max_fan_edges=args.max_fan_edges,
-        max_fan_flatness=args.max_fan_flatness,
-        max_earclip_edges=args.max_earclip_edges,
-        max_earclip_flatness=args.max_earclip_flatness,
-        max_surface_fit_edges=args.max_surface_fit_edges,
-        max_surface_fit_flatness=args.max_surface_fit_flatness,
-        edge_count_small_p=args.edge_count_small_p,
-        edge_count_large_p=args.edge_count_large_p,
-        g2=args.g2,
-        remove_duplicate=not args.no_duplicate,
-        repair_nonmanifold=not args.no_nonmanifold,
-        fill_holes=not args.no_fill_holes,
-        normal_repair=not args.no_normal_repair,
-        verbose=args.verbose,
-    )
+    if args.watertight:
+        repaired = repair_to_watertight(
+            mesh,
+            resolution=args.watertight_resolution,
+            voxel_size=args.watertight_voxel_size,
+            closing_iterations=args.watertight_closing_iterations,
+            verbose=args.verbose,
+        )
+    else:
+        repaired = repair_mesh_iterative(
+            mesh,
+            max_iterations=args.max_iterations,
+            max_hole_edges=args.max_hole_edges,
+            strategy=args.hole_strategy,
+            max_fan_edges=args.max_fan_edges,
+            max_fan_flatness=args.max_fan_flatness,
+            max_earclip_edges=args.max_earclip_edges,
+            max_earclip_flatness=args.max_earclip_flatness,
+            max_surface_fit_edges=args.max_surface_fit_edges,
+            max_surface_fit_flatness=args.max_surface_fit_flatness,
+            edge_count_small_p=args.edge_count_small_p,
+            edge_count_large_p=args.edge_count_large_p,
+            g2=args.g2,
+            remove_duplicate=not args.no_duplicate,
+            repair_nonmanifold=not args.no_nonmanifold,
+            fill_holes=not args.no_fill_holes,
+            normal_repair=not args.no_normal_repair,
+            verbose=args.verbose,
+        )
 
     if args.verbose:
         print("\n[Output mesh stats]")

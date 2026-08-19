@@ -886,6 +886,128 @@ def repair_normals(mesh, reference_face_mask=None, verbose=False):
     return repaired
 
 
+def repair_to_watertight(mesh,
+                         resolution=256,
+                         voxel_size=None,
+                         closing_iterations=2,
+                         min_component_faces=100,
+                         verbose=False):
+    """
+    通过体素化 + 形态学封闭 + Marching Cubes 重建水密网格。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    resolution : int
+        默认体素分辨率，按包围盒对角线均分。
+    voxel_size : float or None
+        显式指定体素边长；若给出，则 resolution 被忽略。
+    closing_iterations : int
+        3D 形态学闭运算迭代次数，用于关闭细小孔洞和缝隙。
+    min_component_faces : int
+        删除小于该面片数的孤立连通分量。
+    verbose : bool
+        是否输出进度与耗时。
+    """
+    import time
+
+    try:
+        import scipy.ndimage as ndi
+    except Exception as e:
+        raise RuntimeError("scipy is required for --watertight mode") from e
+
+    t0 = time.time()
+
+    m = mesh.copy()
+    m.merge_vertices()
+    m.remove_unreferenced_vertices()
+    m = repair_mesh_by_removing_duplicates(m)
+
+    if len(m.faces) == 0:
+        return m
+
+    extents = m.bounding_box.extents
+    diag = float(np.linalg.norm(extents))
+    pitch = voxel_size if voxel_size is not None else (diag / max(resolution, 1))
+    pitch = float(pitch)
+
+    if verbose:
+        print(f"  [watertight] diag={diag:.4f}, pitch={pitch:.6f}")
+
+    from trimesh.voxel.creation import voxelize
+
+    vox = voxelize(m, pitch=pitch)
+    grid = np.asarray(vox.matrix, dtype=bool)
+
+    pad = closing_iterations + 1
+    big = np.pad(grid, pad, mode='constant', constant_values=False)
+
+    if closing_iterations > 0:
+        struct = ndi.generate_binary_structure(3, 1)
+        big = ndi.binary_closing(
+            big,
+            structure=struct,
+            iterations=closing_iterations,
+        )
+
+    # 填充内部空腔；对于已经封闭的表面，这会把内部变成实心。
+    big = ndi.binary_fill_holes(big)
+
+    grid_filled = big[pad:-pad, pad:-pad, pad:-pad]
+
+    # 优先尝试直接修改 VoxelGrid.matrix，再调用其 marching_cubes
+    try:
+        vox.matrix = grid_filled
+        result = vox.marching_cubes
+        if callable(result):
+            result = result()
+    except Exception:
+        # 回退到 scikit-image 的 marching cubes
+        try:
+            from skimage.measure import marching_cubes
+
+            verts, faces, normals, _ = marching_cubes(
+                grid_filled.astype(np.float32),
+                level=0.5,
+            )
+
+            origin = np.asarray(vox.transform[:3, 3]) - pitch * pad
+            verts_world = origin + verts * pitch
+
+            result = trimesh.Trimesh(
+                vertices=verts_world,
+                faces=faces,
+                process=False,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "Unable to extract watertight surface. "
+                "Install scikit-image or adjust trimesh voxel grid handling."
+            ) from e
+
+    result.merge_vertices()
+    result.remove_unreferenced_vertices()
+    result = repair_mesh_by_removing_duplicates(result)
+
+    if len(result.faces) > 0:
+        result = repair_normals(result, verbose=verbose)
+
+    if min_component_faces and min_component_faces > 0:
+        result = remove_isolated_components(
+            result,
+            min_faces=min_component_faces,
+            verbose=verbose,
+        )
+
+    if verbose:
+        print(f"  [watertight] reconstruction completed in "
+              f"{time.time() - t0:.2f}s")
+        print(f"  watertight result: is_watertight={result.is_watertight}, "
+              f"vertices={len(result.vertices)}, faces={len(result.faces)}")
+
+    return result
+
+
 def remove_isolated_components(mesh,
                                min_faces=20,
                                min_area=None,
