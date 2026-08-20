@@ -895,6 +895,7 @@ def repair_to_watertight(mesh,
                          project_distance=None,
                          smooth_watertight=False,
                          smooth_iterations=10,
+                         progress=False,
                          verbose=False):
     """
     通过体素化 + 形态学封闭 + Marching Cubes 重建水密网格。
@@ -918,6 +919,8 @@ def repair_to_watertight(mesh,
         是否在投影后执行 Taubin 平滑。
     smooth_iterations : int
         Taubin 平滑迭代次数，默认 10。
+    progress : bool
+        是否显示形态学闭运算等阶段进度条。需要 tqdm；如未安装则打印百分比。
     verbose : bool
         是否输出进度与耗时。
     """
@@ -944,23 +947,81 @@ def repair_to_watertight(mesh,
     pitch = float(pitch)
 
     if verbose:
-        print(f"  [watertight] diag={diag:.4f}, pitch={pitch:.6f}")
+        print(
+            f"  [watertight] resolution={resolution}, "
+            f"voxel_size={voxel_size}, "
+            f"closing_iterations={closing_iterations}, "
+            f"diag={diag:.4f}, pitch={pitch:.6f}"
+        )
 
     from trimesh.voxel.creation import voxelize
 
+    if verbose:
+        print("  [watertight] voxelizing surface...", flush=True)
+
+    t_vox = time.time()
     vox = voxelize(m, pitch=pitch)
     grid = np.asarray(vox.matrix, dtype=bool)
+
+    if verbose:
+        print(f"  [watertight] voxelization done in "
+              f"{time.time() - t_vox:.2f}s, "
+              f"grid shape={grid.shape}",
+              flush=True)
 
     pad = closing_iterations + 1
     big = np.pad(grid, pad, mode='constant', constant_values=False)
 
     if closing_iterations > 0:
         struct = ndi.generate_binary_structure(3, 1)
-        big = ndi.binary_closing(
-            big,
-            structure=struct,
-            iterations=closing_iterations,
-        )
+
+        has_tqdm = False
+        try:
+            from tqdm import tqdm
+            has_tqdm = True
+        except ImportError:
+            has_tqdm = False
+
+        total_steps = closing_iterations * 2
+
+        if progress and has_tqdm:
+            pbar = tqdm(total=total_steps,
+                        desc="Morphological closing",
+                        unit="step")
+        elif progress:
+            pbar = None
+            print(f"  Morphological closing: 0/{total_steps} steps",
+                  flush=True)
+        else:
+            pbar = None
+
+        t_close = time.time()
+
+        # Dilation
+        for i in range(closing_iterations):
+            big = ndi.binary_dilation(big, structure=struct)
+            if pbar is not None:
+                pbar.update(1)
+            elif progress:
+                print(f"    closing dilation {i+1}/{closing_iterations}",
+                      flush=True)
+
+        # Erosion
+        for i in range(closing_iterations):
+            big = ndi.binary_erosion(big, structure=struct)
+            if pbar is not None:
+                pbar.update(1)
+            elif progress:
+                print(f"    closing erosion {i+1}/{closing_iterations}",
+                      flush=True)
+
+        if pbar is not None:
+            pbar.close()
+
+        if verbose:
+            print(f"  [watertight] morphological closing done in "
+                  f"{time.time() - t_close:.2f}s",
+                  flush=True)
 
     # 填充内部空腔；对于已经封闭的表面，这会把内部变成实心。
     big = ndi.binary_fill_holes(big)
@@ -968,6 +1029,10 @@ def repair_to_watertight(mesh,
     # 使用完整 padded 体素栅格提取表面，不再裁剪。
     # 否则裁剪会在体素边界处制造人工开放边。
     grid_filled = big
+
+    if verbose:
+        print("  [watertight] marching cubes...", flush=True)
+    t_mc = time.time()
 
     try:
         from skimage.measure import marching_cubes
@@ -1003,6 +1068,11 @@ def repair_to_watertight(mesh,
                 "Unable to extract watertight surface. "
                 "Install scikit-image or adjust trimesh voxel grid handling."
             ) from e2
+
+    if verbose:
+        print(f"  [watertight] marching cubes done in "
+              f"{time.time() - t_mc:.2f}s",
+              flush=True)
 
     result.merge_vertices()
     result.remove_unreferenced_vertices()

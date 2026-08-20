@@ -294,6 +294,8 @@ def main():
                         help="对水密重建结果执行 Taubin 平滑")
     parser.add_argument("--watertight-smooth-iterations", type=int, default=10,
                         help="Taubin 平滑迭代次数（默认 10）")
+    parser.add_argument("--watertight-progress", action="store_true",
+                        help="显示水密模式阶段进度条（需要 tqdm，否则打印百分比）")
 
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="输出详细统计信息")
@@ -329,6 +331,7 @@ def main():
             project_distance=args.watertight_project_distance,
             smooth_watertight=args.watertight_smooth,
             smooth_iterations=args.watertight_smooth_iterations,
+            progress=args.watertight_progress,
             verbose=args.verbose,
         )
     else:
