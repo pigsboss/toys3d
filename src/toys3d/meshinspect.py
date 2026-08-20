@@ -418,6 +418,12 @@ def inspect_mesh(mesh, args):
 
     # 可视化
     scene = None
+
+    if len(mesh.faces) == 0 or len(mesh.vertices) == 0:
+        if args.show or args.output:
+            print("  Mesh is empty; visualization skipped.")
+        return scene
+
     if args.show or args.output:
         print_separator("Defect Visualization")
         print("  gray:    normal faces")
