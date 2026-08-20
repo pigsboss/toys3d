@@ -52,15 +52,30 @@ def compute_face_area_stats(mesh):
 def compute_bounding_box_stats(mesh):
     """
     计算包围盒相关统计。
+
+    直接使用 mesh.vertices 计算，避免在超大网格上依赖
+    trimesh 的 mesh.bounding_box / mesh.bounds 缓存属性。
     """
-    bbox = mesh.bounding_box
-    extents = bbox.extents
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    if len(vertices) == 0:
+        return {
+            'min': np.zeros(3),
+            'max': np.zeros(3),
+            'extents': np.zeros(3),
+            'diagonal': 0.0,
+            'centroid': np.zeros(3),
+        }
+
+    vmin = vertices.min(axis=0)
+    vmax = vertices.max(axis=0)
+    extents = vmax - vmin
+
     return {
-        'min': bbox.bounds[0],
-        'max': bbox.bounds[1],
+        'min': vmin,
+        'max': vmax,
         'extents': extents,
         'diagonal': float(np.linalg.norm(extents)),
-        'centroid': bbox.centroid,
+        'centroid': (vmin + vmax) / 2.0,
     }
 
 
@@ -177,8 +192,13 @@ def add_wireframe_to_scene(scene, mesh, color=None, radius=None):
         return
 
     if radius is None or radius <= 0:
-        diag = float(np.linalg.norm(mesh.bounding_box.extents))
-        radius = max(diag * 0.0005, 1e-6)
+        if len(mesh.vertices) == 0:
+            radius = 1e-6
+        else:
+            vmin = mesh.vertices.min(axis=0)
+            vmax = mesh.vertices.max(axis=0)
+            diag = float(np.linalg.norm(vmax - vmin))
+            radius = max(diag * 0.0005, 1e-6)
 
     for e in edges_unique:
         v0, v1 = mesh.vertices[e[0]], mesh.vertices[e[1]]
@@ -282,8 +302,13 @@ def add_hole_boundaries_to_scene(scene, mesh, radius=None,
     color_indices, palette = _greedy_color_hole_loops(filtered_loops)
 
     if radius is None or radius <= 0:
-        diag = float(np.linalg.norm(mesh.bounding_box.extents))
-        radius = max(diag * 0.001, 1e-6)
+        if len(mesh.vertices) == 0:
+            radius = 1e-6
+        else:
+            vmin = mesh.vertices.min(axis=0)
+            vmax = mesh.vertices.max(axis=0)
+            diag = float(np.linalg.norm(vmax - vmin))
+            radius = max(diag * 0.001, 1e-6)
 
     if verbose:
         print(f"  Drawing {len(filtered_loops)} hole boundary loops "
