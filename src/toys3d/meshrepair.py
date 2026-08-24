@@ -22,6 +22,7 @@ from toys3d.geometrics import (
     polygon_area_from_3d_ccw,
     repair_normals,
     remove_small_open_edge_chains,
+    remove_pseudo_holes,
     repair_to_watertight,
     fuse_reliable_faces_with_shell,
 )
@@ -279,6 +280,14 @@ def main():
     parser.add_argument("--no-fill-holes", action="store_true",
                         help="关闭小孔封闭")
 
+    # 伪孔洞清理
+    parser.add_argument("--remove-pseudo-holes", action="store_true",
+                        help="在拓扑修复前执行伪孔洞清理，删除短小开放边链")
+    parser.add_argument("--pseudo-hole-max-edges", type=int, default=2,
+                        help="伪孔洞最大开放边链边数（默认 2）")
+    parser.add_argument("--pseudo-hole-iterations", type=int, default=5,
+                        help="伪孔洞清理迭代次数（默认 5）")
+
     # 融合模式参数
     parser.add_argument("--fuse-shell", type=str, default=None,
                         help="指定水密壳网格文件路径，启用可靠面片+壳融合模式")
@@ -335,6 +344,18 @@ def main():
         print("\n[Input mesh stats]")
         for k, v in compute_mesh_stats(mesh).items():
             print(f"  {k}: {v}")
+
+    if args.remove_pseudo_holes:
+        if args.verbose:
+            print("\n[Pre-clean] removing pseudo holes...")
+        mesh = remove_pseudo_holes(
+            mesh,
+            max_chain_edges=args.pseudo_hole_max_edges,
+            max_iterations=args.pseudo_hole_iterations,
+            verbose=args.verbose,
+        )
+        if args.verbose:
+            print("[Pre-clean] done")
 
     if args.fuse_shell:
         print(f"Loading shell: {args.fuse_shell}")

@@ -670,6 +670,59 @@ def remove_small_open_edge_chains(mesh,
     return repaired
 
 
+def remove_pseudo_holes(mesh,
+                        max_chain_edges=2,
+                        max_iterations=5,
+                        verbose=False):
+    """
+    迭代删除短小且不闭合的开放边链（伪孔洞）。
+
+    这类结构通常不是真正的拓扑孔洞，而是由拼接、错位或非流形修复
+    产生的细长尖刺/裂缝。直接补孔容易引入新的非流形边，因此先删除
+    它们可以显著减少后续修复和融合时的边界环数量。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        输入网格。
+    max_chain_edges : int
+        伪孔洞开放边链的最大边数，默认 2。
+    max_iterations : int
+        最大迭代清理次数。每次删除会暴露新的短链，因此需要迭代。
+    verbose : bool
+        是否打印每轮删除统计。
+
+    Returns
+    -------
+    cleaned : trimesh.Trimesh
+    """
+    cleaned = mesh.copy()
+    merged_vertices = False
+
+    for it in range(1, max_iterations + 1):
+        before_faces = len(cleaned.faces)
+        cleaned = remove_small_open_edge_chains(
+            cleaned,
+            max_chain_edges=max_chain_edges,
+            verbose=verbose,
+        )
+        after_faces = len(cleaned.faces)
+
+        if verbose:
+            print(f"  [remove_pseudo_holes] iteration {it}: "
+                  f"removed {before_faces - after_faces} faces")
+
+        if after_faces == before_faces:
+            break
+
+    # 清理可能因删除产生的孤立顶点和重复面片
+    cleaned.merge_vertices()
+    cleaned.remove_unreferenced_vertices()
+    cleaned = repair_mesh_by_removing_duplicates(cleaned)
+
+    return cleaned
+
+
 def compute_loop_flatness(mesh, loop):
     """Return a flatness measure for a boundary loop (0 = perfect plane)."""
     pts = mesh.vertices[np.asarray(loop, dtype=np.int64)]
