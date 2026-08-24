@@ -1313,3 +1313,142 @@ def compute_hole_area_stats(mesh):
             stats[f'p{p}_area'] = 0.0
         stats['max_area'] = 0.0
     return stats
+
+
+def compute_reliable_face_mask(mesh,
+                               k_defect=3,
+                               min_area_ratio=0.01,
+                               normal_thresh_deg=60,
+                               min_component_faces=20,
+                               use_soft_weights=True):
+    """
+    计算每个三角面片的可靠性权重。
+
+    综合以下因素：
+    - 开放边/非流形边的邻域扩展
+    - 退化面片（面积过小）
+    - 法线一致性（与邻域平均法线夹角过大）
+    - 孤立小连通分量
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    k_defect : int
+        缺陷邻域扩展步数
+    min_area_ratio : float
+        面积过滤阈值比例（相对于平均面积）
+    normal_thresh_deg : float
+        法线一致性角度阈值（度）
+    min_component_faces : int
+        连通分量最小面片数
+    use_soft_weights : bool
+        若 True，返回连续权重（1.0可靠，0.5缺陷邻域，0.0不可靠）；
+        若 False，返回二值权重（>0.5视为可靠）
+
+    Returns
+    -------
+    weights : np.ndarray, shape (N,), dtype float32
+        每个面片的可靠性权重，取值范围 0~1
+    """
+    n_faces = len(mesh.faces)
+    weights = np.ones(n_faces, dtype=np.float32)  # 初始全部可靠
+
+    # 1. 拓扑缺陷邻域扩展
+    _, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+    defect_mask = open_face_mask | nonmanifold_face_mask
+    if k_defect > 0 and defect_mask.any():
+        current = defect_mask.copy()
+        visited = current.copy()
+        for _ in range(k_defect):
+            if not current.any():
+                break
+            idx_current = np.where(current)[0]
+            # 找到与当前缺陷面相邻的边
+            mask_edges = (
+                np.isin(mesh.face_adjacency[:, 0], idx_current) |
+                np.isin(mesh.face_adjacency[:, 1], idx_current)
+            )
+            neighbor_faces = np.unique(mesh.face_adjacency[mask_edges].ravel())
+            new_faces = neighbor_faces[~visited[neighbor_faces]]
+            if len(new_faces) == 0:
+                break
+            visited[new_faces] = True
+            current.fill(False)
+            current[new_faces] = True
+        defect_mask = visited
+    # 缺陷邻域赋予中间权重 0.5（后续可能被其他硬条件覆盖为 0）
+    weights[defect_mask] = 0.5
+
+    # 2. 退化面片
+    areas = mesh.area_faces
+    mean_area = areas.mean() if len(areas) > 0 else 0.0
+    area_thresh = max(1e-12, min_area_ratio * mean_area)
+    degenerate_mask = areas < area_thresh
+    weights[degenerate_mask] = 0.0
+
+    # 3. 法线一致性（邻域平均法线夹角）
+    normal_bad_mask = np.zeros(n_faces, dtype=bool)
+    if normal_thresh_deg is not None:
+        face_normals = mesh.face_normals
+        neighbor_sum = np.zeros_like(face_normals, dtype=np.float64)
+        neighbor_count = np.zeros(n_faces, dtype=np.int32)
+        # 累加每个面的邻域法线
+        for f0, f1 in mesh.face_adjacency:
+            neighbor_sum[f0] += face_normals[f1]
+            neighbor_count[f0] += 1
+            neighbor_sum[f1] += face_normals[f0]
+            neighbor_count[f1] += 1
+
+        valid = neighbor_count > 0
+        avg_normals = np.zeros_like(face_normals)
+        avg_normals[valid] = neighbor_sum[valid] / neighbor_count[valid, None]
+        avg_normals[~valid] = face_normals[~valid]  # 无邻居的面暂时认为自己一致，后续可能因孤立分量被剔除
+
+        dot = np.einsum('ij,ij->i', face_normals, avg_normals)
+        norms = np.linalg.norm(face_normals, axis=1) * np.linalg.norm(avg_normals, axis=1)
+        cos_angle = np.clip(dot / (norms + 1e-12), -1.0, 1.0)
+        angle_deg = np.degrees(np.arccos(cos_angle))
+        normal_bad_mask = angle_deg > normal_thresh_deg
+        weights[normal_bad_mask] = 0.0
+
+    # 4. 孤立小连通分量（只对当前权重>0.5的面片进行）
+    if min_component_faces and min_component_faces > 0:
+        # 候选可靠面片：权重 > 0.5，即未因缺陷邻域、退化或法线问题被置零
+        candidate_mask = weights > 0.5
+        if candidate_mask.any():
+            # 只保留两端都是候选面的邻接边
+            candidate_edges = mesh.face_adjacency[
+                candidate_mask[mesh.face_adjacency[:, 0]] &
+                candidate_mask[mesh.face_adjacency[:, 1]]
+            ]
+            if len(candidate_edges) > 0:
+                try:
+                    from scipy.sparse import csr_matrix
+                    from scipy.sparse.csgraph import connected_components
+                    orig_indices = np.where(candidate_mask)[0]
+                    index_map = -np.ones(n_faces, dtype=np.int64)
+                    index_map[orig_indices] = np.arange(len(orig_indices))
+                    rows = index_map[candidate_edges[:, 0]]
+                    cols = index_map[candidate_edges[:, 1]]
+                    data = np.ones(len(rows))
+                    # 对称矩阵
+                    rows_all = np.concatenate([rows, cols])
+                    cols_all = np.concatenate([cols, rows])
+                    data_all = np.concatenate([data, data])
+                    graph = csr_matrix(
+                        (data_all, (rows_all, cols_all)),
+                        shape=(len(orig_indices), len(orig_indices))
+                    )
+                    n_components, labels = connected_components(graph, directed=False)
+                    comp_sizes = np.bincount(labels)
+                    small_components = np.where(comp_sizes < min_component_faces)[0]
+                    small_orig_indices = orig_indices[np.isin(labels, small_components)]
+                    weights[small_orig_indices] = 0.0
+                except ImportError:
+                    # 无 scipy 时跳过连通分量过滤
+                    pass
+
+    if not use_soft_weights:
+        weights = (weights > 0.5).astype(np.float32)
+
+    return weights

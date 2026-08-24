@@ -24,6 +24,7 @@ from toys3d.geometrics import (
     compute_hole_area_stats,
     extract_boundary_loops,
     polygon_area_from_3d_ccw,
+    compute_reliable_face_mask,
 )
 
 
@@ -109,6 +110,26 @@ def build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask):
     colors[open_only] = [255, 220, 0, 255]      # 黄
     colors[nonmanifold_only] = [255, 0, 0, 255]  # 红
     colors[both] = [255, 128, 0, 255]            # 橙
+
+    vis.visual.face_colors = colors
+    return vis
+
+
+def build_reliable_visualization(mesh, weights):
+    """
+    根据可靠性权重生成可视化网格。
+    - 绿色：可靠（权重 > 0.75）
+    - 黄色：中间状态（0.25 < 权重 <= 0.75）
+    - 红色：不可靠（权重 <= 0.25）
+    """
+    vis = mesh.copy()
+    N = len(vis.faces)
+
+    colors = np.full((N, 4), [255, 0, 0, 255], dtype=np.uint8)  # 默认红
+    reliable = weights > 0.75
+    intermediate = (~reliable) & (weights > 0.25)
+    colors[reliable] = [0, 200, 0, 255]       # 绿
+    colors[intermediate] = [255, 220, 0, 255] # 黄
 
     vis.visual.face_colors = colors
     return vis
@@ -425,13 +446,22 @@ def inspect_mesh(mesh, args):
         return scene
 
     if args.show or args.output:
-        print_separator("Defect Visualization")
-        print("  gray:    normal faces")
-        print("  yellow:  faces adjacent to open edges")
-        print("  red:     faces adjacent to non-manifold edges")
-        print("  orange:  faces with both defects")
+        if args.highlight_reliable:
+            print_separator("Reliable Neighborhood Visualization")
+            print("  green:  reliable faces")
+            print("  yellow: defect neighborhood (intermediate)")
+            print("  red:    unreliable faces")
 
-        vis = build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask)
+            weights = compute_reliable_face_mask(mesh)
+            vis = build_reliable_visualization(mesh, weights)
+        else:
+            print_separator("Defect Visualization")
+            print("  gray:    normal faces")
+            print("  yellow:  faces adjacent to open edges")
+            print("  red:     faces adjacent to non-manifold edges")
+            print("  orange:  faces with both defects")
+
+            vis = build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask)
 
         # 默认双面渲染：薄壳从任何一侧观察都可见
         if args.double_sided:
@@ -439,10 +469,13 @@ def inspect_mesh(mesh, args):
 
         scene = trimesh.Scene(vis)
 
-        # 先导出着色的缺陷网格（不含线框）
+        # 导出着色网格
         if args.output:
             vis.export(args.output)
-            print(f"\nColored defect mesh saved to: {args.output}")
+            if args.highlight_reliable:
+                print(f"\nReliable-neighborhood mesh saved to: {args.output}")
+            else:
+                print(f"\nColored defect mesh saved to: {args.output}")
 
         # 再叠加线框到场景用于可视化
         if args.wireframe:
@@ -499,6 +532,8 @@ def main():
                         help="线框 RGBA 颜色，默认 '0,0,0,255'")
     parser.add_argument("--highlight-holes", action="store_true",
                         help="高亮显示闭合孔洞边界，相邻孔洞使用不同高饱和度颜色")
+    parser.add_argument("--highlight-reliable", action="store_true",
+                        help="高亮显示可靠邻域（绿色=可靠，黄色=缺陷邻域，红色=不可靠）")
     parser.add_argument("--hole-radius", type=float, default=None,
                         help="孔洞边界圆柱半径（默认自动计算，通常比普通线框略粗）")
     parser.add_argument("--double-sided", dest='double_sided',
