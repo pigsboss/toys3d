@@ -353,6 +353,41 @@ def add_hole_boundaries_to_scene(scene, mesh, radius=None,
             scene.add_geometry(seg)
 
 
+def add_proxy_overlay_to_scene(scene, args):
+    """加载代理网格并以半透明方式叠加到场景。"""
+    if not args.overlay_proxy:
+        return
+
+    proxy = trimesh.load(args.overlay_proxy, force="mesh")
+    if isinstance(proxy, trimesh.Scene):
+        proxy = proxy.dump(concatenate=True)
+
+    if len(proxy.faces) == 0:
+        print("[WARNING] Proxy mesh is empty; skipping overlay")
+        return
+
+    # 解析代理颜色
+    if args.proxy_color is not None:
+        color_components = args.proxy_color
+        if len(color_components) == 3:
+            alpha = int(np.clip(args.proxy_alpha, 0.0, 1.0) * 255)
+            color = [*color_components, alpha]
+        else:
+            color = color_components
+    else:
+        base = [128, 180, 255]
+        alpha = int(np.clip(args.proxy_alpha, 0.0, 1.0) * 255)
+        color = [*base, alpha]
+
+    color_arr = np.array(color, dtype=np.uint8)
+    proxy.visual.face_colors = np.tile(color_arr, (len(proxy.faces), 1))
+
+    if args.proxy_double_sided:
+        proxy = make_double_sided(proxy, backface_color=None)
+
+    scene.add_geometry(proxy)
+
+
 def print_separator(title=None):
     if title:
         print(f"\n{'=' * 60}")
@@ -517,6 +552,8 @@ def inspect_mesh(mesh, args):
                     verbose=True,
                 )
 
+            if scene is not None:
+                add_proxy_overlay_to_scene(scene, args)
             return scene
 
         if args.highlight_reliable:
@@ -568,6 +605,8 @@ def inspect_mesh(mesh, args):
                 verbose=True,
             )
 
+    if scene is not None:
+        add_proxy_overlay_to_scene(scene, args)
     return scene
 
 
@@ -579,6 +618,21 @@ def _parse_color_string(s):
     if len(parts) != 4:
         raise argparse.ArgumentTypeError(
             f"Color must be 'R,G,B,A', got '{s}'"
+        )
+    try:
+        return [int(p.strip()) for p in parts]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Color components must be integers, got '{s}'"
+        )
+
+
+def _parse_color_string_flexible(s):
+    """将 'R,G,B' 或 'R,G,B,A' 字符串解析为整数列表。"""
+    parts = s.split(',')
+    if len(parts) not in (3, 4):
+        raise argparse.ArgumentTypeError(
+            f"Color must be 'R,G,B' or 'R,G,B,A', got '{s}'"
         )
     try:
         return [int(p.strip()) for p in parts]
@@ -628,12 +682,28 @@ def main():
                         help="高亮孔洞的最小边界边数（默认 3）")
     parser.add_argument("--min-hole-area", type=float, default=0.0,
                         help="高亮孔洞的最小面积（默认 0，不过滤）")
+    parser.add_argument("--overlay-proxy", type=str, default=None,
+                        help="同时显示输入的代理网格文件（例如体素壳），路径为 STL/PLY/OBJ")
+    parser.add_argument("--proxy-alpha", type=float, default=0.45,
+                        help="代理网格透明度，0=全透明，1=不透明，默认 0.45")
+    parser.add_argument("--proxy-color", type=str, default=None,
+                        help="代理网格统一颜色，格式 'R,G,B' 或 'R,G,B,A'。"
+                             "默认使用浅蓝灰色半透明 [128, 180, 255, alpha]")
+    parser.add_argument("--proxy-double-sided", dest='proxy_double_sided',
+                        action='store_true', default=True,
+                        help="双面渲染代理网格（默认开启）")
+    parser.add_argument("--no-proxy-double-sided", dest='proxy_double_sided',
+                        action='store_false',
+                        help="关闭代理网格双面渲染")
     args = parser.parse_args()
 
     args.wireframe_color = _parse_color_string(args.wireframe_color)
 
     if args.backface_color is not None:
         args.backface_color = _parse_color_string(args.backface_color)
+
+    if args.proxy_color is not None:
+        args.proxy_color = _parse_color_string_flexible(args.proxy_color)
 
     print(f"Loading: {args.input_file}")
     mesh = trimesh.load(args.input_file, force="mesh")
