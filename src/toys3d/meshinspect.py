@@ -488,8 +488,16 @@ def inspect_mesh(mesh, args):
                 reliable_mesh.export(args.output)
                 print(f"\nReliable-only mesh saved to: {args.output}")
 
-            # 构造场景用于显示
-            scene = trimesh.Scene(reliable_mesh)
+            # 构造用于显示的双面网格，避免背面剔除导致透明
+            if args.double_sided:
+                display_mesh = make_double_sided(
+                    reliable_mesh,
+                    backface_color=args.backface_color,
+                )
+            else:
+                display_mesh = reliable_mesh
+
+            scene = trimesh.Scene(display_mesh)
 
             # 若用户要求线框，可叠加在提取网格上
             if args.wireframe:
