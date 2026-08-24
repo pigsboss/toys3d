@@ -1131,9 +1131,6 @@ def repair_to_watertight(mesh,
     result.remove_unreferenced_vertices()
     result = repair_mesh_by_removing_duplicates(result)
 
-    # 保存基础水密代理壳，供可选增强失败时回退
-    result_before_enhancements = result.copy()
-
     # -------------------------------------------------------------
     # 可选：把体素化代理壳顶点投影回原始网格表面
     # 可显著减少轴对齐体素造成的阶梯状锯齿。
@@ -1221,23 +1218,47 @@ def repair_to_watertight(mesh,
         result.remove_unreferenced_vertices()
         result = repair_mesh_by_removing_duplicates(result)
 
-    # 投影/平滑可能重新产生少量开放边；这里进行一次局部水密修复
-    defects, _, _ = analyze_mesh_defects(result)
-    if defects['open_edges'] > 0 or defects['nonmanifold_edges'] > 0:
+    # 投影/平滑可能重新产生少量开放边和非流形边。
+    # 这里进行多轮局部修复，尽量在不整体回退的前提下恢复水密性。
+    max_local_repair_iterations = 5
+
+    for repair_iter in range(1, max_local_repair_iterations + 1):
+        defects, _, _ = analyze_mesh_defects(result)
+        if defects['open_edges'] == 0 and defects['nonmanifold_edges'] == 0:
+            if verbose:
+                print(f"  [watertight] enhancement repair converged "
+                      f"after {repair_iter - 1} iteration(s).",
+                      flush=True)
+            break
+
         if verbose:
-            print(f"  [watertight] projection/smoothing introduced defects: "
+            print(f"  [watertight] enhancement repair iteration {repair_iter}: "
                   f"open_edges={defects['open_edges']}, "
-                  f"nonmanifold_edges={defects['nonmanifold_edges']}; "
-                  f"attempting local repair...",
+                  f"nonmanifold_edges={defects['nonmanifold_edges']}",
                   flush=True)
 
+        # 1. 删除非流形边关联面片
         if defects['nonmanifold_edges'] > 0:
             result = repair_nonmanifold_edges(
                 result,
-                max_iterations=3,
+                max_iterations=5,
                 verbose=False,
             )
 
+        # 2. 删除投影产生的细碎开放边链（伪孔洞）
+        #    不闭合的短链无法补孔，先清理掉。
+        result = remove_small_open_edge_chains(
+            result,
+            max_chain_edges=3,
+            verbose=False,
+        )
+
+        # 3. 清理重复/退化面片
+        result.merge_vertices()
+        result.remove_unreferenced_vertices()
+        result = repair_mesh_by_removing_duplicates(result)
+
+        # 4. 填补剩余闭合孔洞
         defects, _, _ = analyze_mesh_defects(result)
         if defects['open_edges'] > 0:
             result = fill_holes_adaptive(
@@ -1246,22 +1267,24 @@ def repair_to_watertight(mesh,
                 max_fan_edges=20,
                 max_earclip_edges=200,
                 max_surface_fit_edges=1000,
-                verbose=verbose,
+                verbose=False,
             )
 
         result.merge_vertices()
         result.remove_unreferenced_vertices()
         result = repair_mesh_by_removing_duplicates(result)
 
-    # 如果增强操作引入的缺陷无法完全修复，回退到基础水密代理壳
-    defects_after_enhancements, _, _ = analyze_mesh_defects(result)
-    if (defects_after_enhancements['open_edges'] > 0 or
-            defects_after_enhancements['nonmanifold_edges'] > 0):
+    # 经过局部修复后，即使仍有少量缺陷，也保留增强网格，不再整体回退。
+    defects_final, _, _ = analyze_mesh_defects(result)
+    if defects_final['open_edges'] > 0 or defects_final['nonmanifold_edges'] > 0:
         if verbose:
-            print("  [watertight] enhancements introduced defects that "
-                  "could not be fully repaired; reverting to base proxy.",
+            print("  [watertight] warning: enhancement repair did not fully "
+                  "resolve all defects; keeping enhanced mesh anyway.",
                   flush=True)
-        result = result_before_enhancements
+    else:
+        if verbose:
+            print("  [watertight] enhancement repair completed successfully.",
+                  flush=True)
 
     if len(result.faces) > 0:
         result = repair_normals(result, verbose=verbose)
