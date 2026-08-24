@@ -25,6 +25,7 @@ from toys3d.geometrics import (
     extract_boundary_loops,
     polygon_area_from_3d_ccw,
     compute_reliable_face_mask,
+    repair_mesh_by_removing_duplicates,
 )
 
 
@@ -446,6 +447,70 @@ def inspect_mesh(mesh, args):
         return scene
 
     if args.show or args.output:
+        if args.keep_reliable_only:
+            print_separator("Reliable-Only Extracted Mesh")
+            print(f"  threshold: {args.reliable_threshold}")
+
+            # 计算可靠面片掩码
+            weights = compute_reliable_face_mask(mesh)
+            reliable_mask = weights > args.reliable_threshold
+            reliable_count = int(reliable_mask.sum())
+            print(f"  reliable faces: {reliable_count}/{len(mesh.faces)}")
+
+            if reliable_count == 0:
+                print("  No reliable faces selected; skipping extraction.")
+                return None
+
+            # 提取可靠面片子网格
+            reliable_faces = np.asarray(mesh.faces, dtype=np.int64)[reliable_mask]
+            flat_faces = reliable_faces.ravel()
+            unique_verts, inverse = np.unique(flat_faces, return_inverse=True)
+            reliable_mesh = trimesh.Trimesh(
+                vertices=mesh.vertices[unique_verts],
+                faces=inverse.reshape(-1, 3),
+                process=False,
+            )
+            # 清理提取后的网格
+            reliable_mesh.remove_unreferenced_vertices()
+            reliable_mesh.merge_vertices()
+            reliable_mesh = repair_mesh_by_removing_duplicates(reliable_mesh)
+
+            # 打印提取后的简要统计
+            extracted_stats = compute_mesh_stats(reliable_mesh)
+            extracted_defects, _, _ = analyze_mesh_defects(reliable_mesh)
+            print(f"  extracted vertices: {extracted_stats['vertices']}")
+            print(f"  extracted faces:    {extracted_stats['faces']}")
+            print(f"  extracted open edges:        {extracted_defects['open_edges']}")
+            print(f"  extracted nonmanifold edges: {extracted_defects['nonmanifold_edges']}")
+
+            # 导出或显示
+            if args.output:
+                reliable_mesh.export(args.output)
+                print(f"\nReliable-only mesh saved to: {args.output}")
+
+            # 构造场景用于显示
+            scene = trimesh.Scene(reliable_mesh)
+
+            # 若用户要求线框，可叠加在提取网格上
+            if args.wireframe:
+                add_wireframe_to_scene(
+                    scene, reliable_mesh,
+                    color=args.wireframe_color,
+                    radius=args.wireframe_radius
+                )
+
+            # 若用户要求高亮孔洞，也可以基于提取网格显示
+            if args.highlight_holes:
+                add_hole_boundaries_to_scene(
+                    scene, reliable_mesh,
+                    radius=args.hole_radius,
+                    min_edges=args.min_hole_edges,
+                    min_area=args.min_hole_area,
+                    verbose=True,
+                )
+
+            return scene
+
         if args.highlight_reliable:
             print_separator("Reliable Neighborhood Visualization")
             print("  green:  reliable faces")
@@ -534,6 +599,12 @@ def main():
                         help="高亮显示闭合孔洞边界，相邻孔洞使用不同高饱和度颜色")
     parser.add_argument("--highlight-reliable", action="store_true",
                         help="高亮显示可靠邻域（绿色=可靠，黄色=缺陷邻域，红色=不可靠）")
+    parser.add_argument("--keep-reliable-only", action="store_true",
+                        help="只保留可靠面片，删除其余面片。"
+                             "需配合 --output 或 --show 使用。")
+    parser.add_argument("--reliable-threshold", type=float, default=0.75,
+                        help="可靠面片权重阈值，默认 0.75。"
+                             "仅当 --keep-reliable-only 时生效。")
     parser.add_argument("--hole-radius", type=float, default=None,
                         help="孔洞边界圆柱半径（默认自动计算，通常比普通线框略粗）")
     parser.add_argument("--double-sided", dest='double_sided',
