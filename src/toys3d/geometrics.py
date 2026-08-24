@@ -1452,3 +1452,233 @@ def compute_reliable_face_mask(mesh,
         weights = (weights > 0.5).astype(np.float32)
 
     return weights
+
+
+def fuse_reliable_faces_with_shell(
+    source_mesh,
+    shell_mesh,
+    reliable_face_mask=None,
+    mask_threshold=0.75,
+    distance_thresh=None,
+    normal_thresh_deg=60.0,
+    smooth_transition=True,
+    smooth_iterations=3,
+    smooth_alpha=0.5,
+    verbose=False,
+):
+    """
+    将 source_mesh 的可靠面片与 watertight shell_mesh 融合。
+
+    参数：
+    ----------
+    source_mesh : trimesh.Trimesh
+        原始网格。
+    shell_mesh : trimesh.Trimesh
+        水密代理壳（例如体素化结果）。
+    reliable_face_mask : None 或 bool 数组
+        若为 None，内部使用 compute_reliable_face_mask 计算。
+    mask_threshold : float
+        可靠权重阈值，默认 0.75。
+    distance_thresh : float or None
+        重叠判断距离阈值。默认取壳平均边长的 0.5 倍。
+    normal_thresh_deg : float
+        法线一致性阈值，默认 60 度。
+    smooth_transition : bool
+        是否平滑接缝过渡区域。
+    smooth_iterations : int
+        平滑迭代次数。
+    smooth_alpha : float
+        平滑步长。
+    verbose : bool
+        是否输出详细日志。
+
+    返回：
+    -------
+    fused : trimesh.Trimesh
+    """
+    if not isinstance(source_mesh, trimesh.Trimesh) or not isinstance(shell_mesh, trimesh.Trimesh):
+        raise TypeError("Both meshes must be trimesh.Trimesh instances")
+
+    # 1. 可靠面片掩码
+    if reliable_face_mask is None:
+        weights = compute_reliable_face_mask(source_mesh)
+        reliable_face_mask = np.asarray(weights > mask_threshold, dtype=bool)
+    else:
+        reliable_face_mask = np.asarray(reliable_face_mask, dtype=bool)
+        if len(reliable_face_mask) != len(source_mesh.faces):
+            raise ValueError("reliable_face_mask length does not match source_mesh faces")
+
+    if not reliable_face_mask.any():
+        raise ValueError("No reliable faces selected")
+
+    # 2. 提取可靠子网格
+    src_faces = np.asarray(source_mesh.faces, dtype=np.int64)
+    rel_faces_idx = np.where(reliable_face_mask)[0]
+    rel_faces = src_faces[rel_faces_idx]
+
+    unique_verts, inverse = np.unique(rel_faces, return_inverse=True)
+    reliable_mesh = trimesh.Trimesh(
+        vertices=source_mesh.vertices[unique_verts],
+        faces=inverse.reshape(-1, 3),
+        process=False,
+    )
+    reliable_mesh.remove_unreferenced_vertices()
+    reliable_mesh.merge_vertices()
+    reliable_mesh = repair_mesh_by_removing_duplicates(reliable_mesh)
+
+    if len(reliable_mesh.faces) == 0:
+        raise RuntimeError("Reliable submesh became empty after cleaning")
+
+    # 3. 裁剪壳面片
+    if distance_thresh is None:
+        edge_lengths = shell_mesh.edges_unique_length
+        if len(edge_lengths) > 0:
+            distance_thresh = 0.5 * float(np.mean(edge_lengths))
+        else:
+            distance_thresh = 0.01
+
+    try:
+        prox = trimesh.proximity.ProximityQuery(reliable_mesh)
+        shell_centers = np.asarray(shell_mesh.triangles_center, dtype=np.float64)
+        closest_pts, distances, tri_ids = prox.on_surface(shell_centers)
+    except Exception as e:
+        if verbose:
+            print(f"  [fuse] proximity query failed: {e}; falling back to brute-force")
+        shell_centers = np.asarray(shell_mesh.triangles_center, dtype=np.float64)
+        rel_verts = np.asarray(reliable_mesh.vertices, dtype=np.float64)
+        tri_verts = rel_verts[reliable_mesh.faces]
+        tri_centers = tri_verts.mean(axis=1)
+        if len(tri_centers) == 0:
+            distances = np.full(len(shell_centers), np.inf)
+            tri_ids = np.zeros(len(shell_centers), dtype=int)
+        else:
+            diff = shell_centers[:, None, :] - tri_centers[None, :, :]
+            dist2 = np.einsum('ijk,ijk->ij', diff, diff)
+            tri_ids = np.argmin(dist2, axis=1)
+            distances = np.sqrt(dist2[np.arange(len(shell_centers)), tri_ids])
+
+    distances = np.asarray(distances, dtype=np.float64)
+    tri_ids = np.asarray(tri_ids, dtype=int)
+
+    shell_normals = np.asarray(shell_mesh.face_normals, dtype=np.float64)
+    rel_normals = np.asarray(reliable_mesh.face_normals, dtype=np.float64)[tri_ids]
+
+    dot = np.einsum('ij,ij->i', shell_normals, rel_normals)
+    cos_angle = np.clip(dot, -1.0, 1.0)
+    angle_deg = np.degrees(np.arccos(cos_angle))
+
+    covered = (distances < distance_thresh) & (angle_deg <= normal_thresh_deg)
+    keep_shell_mask = ~covered
+
+    if not keep_shell_mask.any():
+        if verbose:
+            print("  [fuse] All shell faces are covered by reliable faces; returning reliable submesh")
+        result = reliable_mesh.copy()
+        result = fill_holes_adaptive(result, strategy='edge-count', max_fan_edges=30,
+                                     max_earclip_edges=500, max_surface_fit_edges=5000,
+                                     verbose=verbose)
+        result = repair_normals(result, verbose=verbose)
+        return result
+
+    # 4. 提取保留壳子网格
+    shell_faces = np.asarray(shell_mesh.faces, dtype=np.int64)
+    kept_faces = shell_faces[keep_shell_mask]
+    unique_shell_verts, shell_inverse = np.unique(kept_faces, return_inverse=True)
+    kept_shell_mesh = trimesh.Trimesh(
+        vertices=shell_mesh.vertices[unique_shell_verts],
+        faces=shell_inverse.reshape(-1, 3),
+        process=False,
+    )
+    kept_shell_mesh.remove_unreferenced_vertices()
+    kept_shell_mesh.merge_vertices()
+    kept_shell_mesh = repair_mesh_by_removing_duplicates(kept_shell_mesh)
+
+    if len(kept_shell_mesh.faces) == 0:
+        raise RuntimeError("Kept shell mesh became empty after cleaning")
+
+    # 5. 合并
+    fused_mesh = trimesh.util.concatenate([reliable_mesh, kept_shell_mesh])
+    fused_mesh.merge_vertices()
+    fused_mesh.remove_unreferenced_vertices()
+    fused_mesh = repair_mesh_by_removing_duplicates(fused_mesh)
+
+    if verbose:
+        print(f"  [fuse] merged: {len(fused_mesh.vertices)} vertices, {len(fused_mesh.faces)} faces")
+
+    # 6. 填补开放边界
+    fused_mesh = fill_holes_adaptive(
+        fused_mesh,
+        strategy='edge-count',
+        max_fan_edges=30,
+        max_earclip_edges=500,
+        max_surface_fit_edges=5000,
+        verbose=verbose,
+    )
+    fused_mesh.merge_vertices()
+    fused_mesh.remove_unreferenced_vertices()
+    fused_mesh = repair_mesh_by_removing_duplicates(fused_mesh)
+
+    # 7. 平滑过渡区域
+    if smooth_transition:
+        fixed_mask = np.zeros(len(fused_mesh.vertices), dtype=bool)
+        if len(reliable_mesh.vertices) > 0:
+            try:
+                from scipy.spatial import cKDTree
+                tree = cKDTree(np.asarray(fused_mesh.vertices, dtype=np.float64))
+                dist, idx = tree.query(np.asarray(reliable_mesh.vertices, dtype=np.float64), k=1)
+                fixed_mask[idx] = dist < 1e-7
+            except ImportError:
+                if verbose:
+                    print("  [fuse] scipy not available; skipping fixed mask smoothing")
+                fixed_mask = None
+
+        if fixed_mask is not None:
+            if verbose:
+                n_fixed = int(fixed_mask.sum())
+                print(f"  [fuse] smoothing transition with {n_fixed} fixed vertices")
+
+            def _smooth(mesh, fixed, iterations, alpha):
+                verts = mesh.vertices.copy()
+                neighbors = mesh.vertex_neighbors
+                for _ in range(iterations):
+                    new_verts = verts.copy()
+                    for i in range(len(verts)):
+                        if fixed[i]:
+                            continue
+                        nbrs = neighbors[i]
+                        if len(nbrs) == 0:
+                            continue
+                        avg = verts[nbrs].mean(axis=0)
+                        new_verts[i] = (1.0 - alpha) * verts[i] + alpha * avg
+                    verts = new_verts
+                mesh = mesh.copy()
+                mesh.vertices = verts
+                return mesh
+
+            fused_mesh = _smooth(fused_mesh, fixed_mask, smooth_iterations, smooth_alpha)
+            fused_mesh.merge_vertices()
+            fused_mesh.remove_unreferenced_vertices()
+            fused_mesh = repair_mesh_by_removing_duplicates(fused_mesh)
+
+    # 8. 最终清理与修复
+    fused_mesh = repair_nonmanifold_edges(fused_mesh, max_iterations=5)
+    fused_mesh = remove_small_open_edge_chains(fused_mesh, max_chain_edges=3, verbose=verbose)
+    defects, _, _ = analyze_mesh_defects(fused_mesh)
+    if defects['open_edges'] > 0:
+        fused_mesh = fill_holes_adaptive(
+            fused_mesh,
+            strategy='edge-count',
+            max_fan_edges=20,
+            max_earclip_edges=200,
+            max_surface_fit_edges=1000,
+            verbose=verbose,
+        )
+    fused_mesh = repair_normals(fused_mesh, verbose=verbose)
+    fused_mesh = remove_isolated_components(fused_mesh, min_faces=20, verbose=verbose)
+
+    if verbose:
+        defects, _, _ = analyze_mesh_defects(fused_mesh)
+        print(f"  [fuse] final defects: open_edges={defects['open_edges']}, "
+              f"nonmanifold_edges={defects['nonmanifold_edges']}")
+
+    return fused_mesh

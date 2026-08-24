@@ -23,6 +23,7 @@ from toys3d.geometrics import (
     repair_normals,
     remove_small_open_edge_chains,
     repair_to_watertight,
+    fuse_reliable_faces_with_shell,
 )
 
 
@@ -278,6 +279,20 @@ def main():
     parser.add_argument("--no-fill-holes", action="store_true",
                         help="关闭小孔封闭")
 
+    # 融合模式参数
+    parser.add_argument("--fuse-shell", type=str, default=None,
+                        help="指定水密壳网格文件路径，启用可靠面片+壳融合模式")
+    parser.add_argument("--fuse-distance-thresh", type=float, default=None,
+                        help="融合重叠距离阈值（默认自动取壳平均边长的 0.5 倍）")
+    parser.add_argument("--fuse-normal-thresh", type=float, default=60.0,
+                        help="融合法线一致性角度阈值（默认 60 度）")
+    parser.add_argument("--fuse-smooth-iterations", type=int, default=3,
+                        help="融合接缝平滑迭代次数（默认 3）")
+    parser.add_argument("--fuse-smooth-alpha", type=float, default=0.5,
+                        help="融合接缝平滑步长（默认 0.5）")
+    parser.add_argument("--fuse-no-smooth", action="store_true",
+                        help="关闭融合接缝平滑")
+
     parser.add_argument("--watertight", action="store_true",
                         help="使用体素化 + Marching Cubes 重建水密外壳")
     parser.add_argument("--watertight-resolution", type=int, default=256,
@@ -321,40 +336,59 @@ def main():
         for k, v in compute_mesh_stats(mesh).items():
             print(f"  {k}: {v}")
 
-    if args.watertight:
-        repaired = repair_to_watertight(
+    if args.fuse_shell:
+        print(f"Loading shell: {args.fuse_shell}")
+        shell_mesh = trimesh.load(args.fuse_shell, force="mesh")
+        if not isinstance(shell_mesh, trimesh.Trimesh):
+            shell_mesh = shell_mesh.dump(concatenate=True)
+            print("Multiple shell meshes detected, merged.")
+
+        repaired = fuse_reliable_faces_with_shell(
             mesh,
-            resolution=args.watertight_resolution,
-            voxel_size=args.watertight_voxel_size,
-            closing_iterations=args.watertight_closing_iterations,
-            project_to_input=args.watertight_project_to_input,
-            project_distance=args.watertight_project_distance,
-            smooth_watertight=args.watertight_smooth,
-            smooth_iterations=args.watertight_smooth_iterations,
-            progress=args.watertight_progress,
+            shell_mesh,
+            mask_threshold=0.75,
+            distance_thresh=args.fuse_distance_thresh,
+            normal_thresh_deg=args.fuse_normal_thresh,
+            smooth_transition=not args.fuse_no_smooth,
+            smooth_iterations=args.fuse_smooth_iterations,
+            smooth_alpha=args.fuse_smooth_alpha,
             verbose=args.verbose,
         )
     else:
-        repaired = repair_mesh_iterative(
-            mesh,
-            max_iterations=args.max_iterations,
-            max_hole_edges=args.max_hole_edges,
-            strategy=args.hole_strategy,
-            max_fan_edges=args.max_fan_edges,
-            max_fan_flatness=args.max_fan_flatness,
-            max_earclip_edges=args.max_earclip_edges,
-            max_earclip_flatness=args.max_earclip_flatness,
-            max_surface_fit_edges=args.max_surface_fit_edges,
-            max_surface_fit_flatness=args.max_surface_fit_flatness,
-            edge_count_small_p=args.edge_count_small_p,
-            edge_count_large_p=args.edge_count_large_p,
-            g2=args.g2,
-            remove_duplicate=not args.no_duplicate,
-            repair_nonmanifold=not args.no_nonmanifold,
-            fill_holes=not args.no_fill_holes,
-            normal_repair=not args.no_normal_repair,
-            verbose=args.verbose,
-        )
+        if args.watertight:
+            repaired = repair_to_watertight(
+                mesh,
+                resolution=args.watertight_resolution,
+                voxel_size=args.watertight_voxel_size,
+                closing_iterations=args.watertight_closing_iterations,
+                project_to_input=args.watertight_project_to_input,
+                project_distance=args.watertight_project_distance,
+                smooth_watertight=args.watertight_smooth,
+                smooth_iterations=args.watertight_smooth_iterations,
+                progress=args.watertight_progress,
+                verbose=args.verbose,
+            )
+        else:
+            repaired = repair_mesh_iterative(
+                mesh,
+                max_iterations=args.max_iterations,
+                max_hole_edges=args.max_hole_edges,
+                strategy=args.hole_strategy,
+                max_fan_edges=args.max_fan_edges,
+                max_fan_flatness=args.max_fan_flatness,
+                max_earclip_edges=args.max_earclip_edges,
+                max_earclip_flatness=args.max_earclip_flatness,
+                max_surface_fit_edges=args.max_surface_fit_edges,
+                max_surface_fit_flatness=args.max_surface_fit_flatness,
+                edge_count_small_p=args.edge_count_small_p,
+                edge_count_large_p=args.edge_count_large_p,
+                g2=args.g2,
+                remove_duplicate=not args.no_duplicate,
+                repair_nonmanifold=not args.no_nonmanifold,
+                fill_holes=not args.no_fill_holes,
+                normal_repair=not args.no_normal_repair,
+                verbose=args.verbose,
+            )
 
     if args.verbose:
         print("\n[Output mesh stats]")
