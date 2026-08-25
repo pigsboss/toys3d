@@ -387,6 +387,7 @@ def _print_projected_boundary_diagnostics(
     vertex_to_tri,
     vertex_to_dist,
     proxy_mesh,
+    source_mesh,
     max_report_loops=None,
     max_report_vertices=20,
 ):
@@ -410,6 +411,7 @@ def _print_projected_boundary_diagnostics(
     for loop_idx, loop in enumerate(report_loops):
         ids = np.array(loop, dtype=np.int64)
         pts = np.array([vertex_to_projected[int(v)] for v in ids], dtype=np.float64)
+        original_pts = source_mesh.vertices[ids]
 
         if len(pts) < 3:
             print(f"  [loop {loop_idx}] skipped: only {len(pts)} projected points")
@@ -451,6 +453,7 @@ def _print_projected_boundary_diagnostics(
 
         print(f"  [loop {loop_idx}]")
         print(f"    boundary_edges={len(ids)}")
+        print(f"    input_hole_area={polygon_area_from_3d_ccw(original_pts):.6f}")
         print(f"    projected_area={polygon_area_from_3d_ccw(pts):.6f}")
         print(f"    projection_dist: "
               f"mean={np.mean(dists):.6f}, max={np.max(dists):.6f}")
@@ -531,6 +534,7 @@ def add_boundary_projection_to_scene(scene, boundary_mesh, proxy_mesh,
             vertex_to_tri,
             vertex_to_dist,
             proxy_mesh,
+            source_mesh=boundary_mesh,
             max_report_loops=max_report_loops,
             max_report_vertices=max_report_vertices,
         )
