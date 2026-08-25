@@ -963,6 +963,11 @@ def main():
     parser.add_argument("--no-proxy-double-sided", dest='proxy_double_sided',
                         action='store_false',
                         help="关闭代理网格双面渲染")
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return
+
     args = parser.parse_args()
 
     args.wireframe_color = _parse_color_string(args.wireframe_color)
