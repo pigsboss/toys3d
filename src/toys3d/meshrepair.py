@@ -299,19 +299,22 @@ def main():
     parser.add_argument("--weld-min-hole-edges", type=int, default=3,
                         help="焊接孔洞的最小边数，默认 3")
 
-    # 融合模式参数
-    parser.add_argument("--fuse-shell", type=str, default=None,
-                        help="指定水密壳网格文件路径，启用可靠面片+壳融合模式")
-    parser.add_argument("--fuse-distance-thresh", type=float, default=None,
-                        help="融合重叠距离阈值（默认自动取壳平均边长的 0.5 倍）")
-    parser.add_argument("--fuse-normal-thresh", type=float, default=60.0,
-                        help="融合法线一致性角度阈值（默认 60 度）")
-    parser.add_argument("--fuse-smooth-iterations", type=int, default=3,
-                        help="融合接缝平滑迭代次数（默认 3）")
-    parser.add_argument("--fuse-smooth-alpha", type=float, default=0.5,
-                        help="融合接缝平滑步长（默认 0.5）")
-    parser.add_argument("--fuse-no-smooth", action="store_true",
-                        help="关闭融合接缝平滑")
+    # 代理壳修补模式参数
+    parser.add_argument("--proxy-shell", type=str, default=None,
+                        help="指定水密代理壳网格文件路径（如体素壳），"
+                             "启用可靠面片提取 + 代理支撑孔洞修补模式")
+    parser.add_argument("--proxy-face-center-threshold", type=int, default=5,
+                        help="投影多边形内代理面片中心数量阈值，"
+                             "达到该数量才使用代理补丁，否则平面修补（默认 5）")
+    parser.add_argument("--proxy-max-projection-distance", type=float, default=None,
+                        help="孔洞边界投影到代理壳的最大允许距离，"
+                             "超过则放弃代理补丁，默认不限制")
+    parser.add_argument("--proxy-smooth-iterations", type=int, default=3,
+                        help="可靠子网格与补丁接缝平滑迭代次数（默认 3）")
+    parser.add_argument("--proxy-smooth-alpha", type=float, default=0.5,
+                        help="可靠子网格与补丁接缝平滑步长（默认 0.5）")
+    parser.add_argument("--proxy-no-smooth", action="store_true",
+                        help="关闭可靠子网格与补丁接缝平滑")
 
     parser.add_argument("--watertight", action="store_true",
                         help="使用体素化 + Marching Cubes 重建水密外壳")
@@ -381,9 +384,9 @@ def main():
         if args.verbose:
             print("[Pre-clean] weld done")
 
-    if args.fuse_shell:
-        print(f"Loading shell: {args.fuse_shell}")
-        shell_mesh = trimesh.load(args.fuse_shell, force="mesh")
+    if args.proxy_shell:
+        print(f"Loading shell: {args.proxy_shell}")
+        shell_mesh = trimesh.load(args.proxy_shell, force="mesh")
         if not isinstance(shell_mesh, trimesh.Trimesh):
             shell_mesh = shell_mesh.dump(concatenate=True)
             print("Multiple shell meshes detected, merged.")
@@ -392,11 +395,11 @@ def main():
             mesh,
             shell_mesh,
             mask_threshold=0.75,
-            distance_thresh=args.fuse_distance_thresh,
-            normal_thresh_deg=args.fuse_normal_thresh,
-            smooth_transition=not args.fuse_no_smooth,
-            smooth_iterations=args.fuse_smooth_iterations,
-            smooth_alpha=args.fuse_smooth_alpha,
+            proxy_face_center_threshold=args.proxy_face_center_threshold,
+            max_projection_distance=args.proxy_max_projection_distance,
+            smooth_transition=not args.proxy_no_smooth,
+            smooth_iterations=args.proxy_smooth_iterations,
+            smooth_alpha=args.proxy_smooth_alpha,
             verbose=args.verbose,
         )
     else:
