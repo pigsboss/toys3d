@@ -191,6 +191,14 @@ def make_double_sided(mesh, backface_color=None):
     return vis
 
 
+def set_face_alpha(mesh, alpha):
+    """将网格所有面片颜色的 alpha 通道设置为指定透明度。"""
+    if hasattr(mesh.visual, 'face_colors') and \
+            mesh.visual.face_colors.shape[0] == len(mesh.faces):
+        mesh.visual.face_colors[:, 3] = int(np.clip(alpha, 0.0, 1.0) * 255)
+    return mesh
+
+
 def add_wireframe_to_scene(scene, mesh, color=None, radius=None):
     """
     将网格的边以圆柱线段形式加入场景，用于观察三角剖分。
@@ -353,10 +361,74 @@ def add_hole_boundaries_to_scene(scene, mesh, radius=None,
             scene.add_geometry(seg)
 
 
-def add_proxy_overlay_to_scene(scene, args):
-    """加载代理网格并以半透明方式叠加到场景。"""
-    if not args.overlay_proxy:
+def add_boundary_projection_to_scene(scene, boundary_mesh, proxy_mesh,
+                                     radius=None, verbose=False):
+    """
+    将 boundary_mesh 的闭合孔洞边界环投影到 proxy_mesh 表面，
+    并在场景中绘制投影线段。
+    """
+    loops = extract_boundary_loops(boundary_mesh)
+    if not loops:
+        if verbose:
+            print("  No boundary loops to project.")
         return
+
+    try:
+        from trimesh.proximity import closest_point
+
+        # 收集所有边界环上的唯一顶点
+        all_boundary_verts = np.unique(
+            np.concatenate([np.array(loop, dtype=np.int64) for loop in loops])
+        )
+        points = boundary_mesh.vertices[all_boundary_verts]
+
+        closest, distances, _ = closest_point(proxy_mesh, points)
+        projected_points = np.asarray(closest, dtype=np.float64)
+    except Exception as e:
+        if verbose:
+            print(f"  Boundary projection failed: {e}")
+        return
+
+    # 建立原始顶点索引到投影点的映射
+    vertex_to_projected = {
+        int(v): projected_points[i]
+        for i, v in enumerate(all_boundary_verts)
+    }
+
+    if radius is None or radius <= 0:
+        if len(proxy_mesh.vertices) == 0:
+            radius = 1e-6
+        else:
+            vmin = proxy_mesh.vertices.min(axis=0)
+            vmax = proxy_mesh.vertices.max(axis=0)
+            diag = float(np.linalg.norm(vmax - vmin))
+            radius = max(diag * 0.001, 1e-6)
+
+    color = np.array([0, 255, 255, 255], dtype=np.uint8)  # 青色
+
+    for loop in loops:
+        pts = [vertex_to_projected[int(v)] for v in loop]
+        if len(pts) < 2:
+            continue
+
+        pts.append(pts[0])  # 闭合环首尾相连
+        for i in range(len(pts) - 1):
+            seg = trimesh.creation.cylinder(
+                radius=radius,
+                segment=[pts[i], pts[i + 1]],
+                sections=4,
+            )
+            seg.visual.face_colors = color
+            scene.add_geometry(seg)
+
+    if verbose:
+        print(f"  Projected {len(loops)} boundary loops onto proxy mesh.")
+
+
+def load_proxy_mesh(args):
+    """根据参数加载代理网格，返回代理网格或 None。"""
+    if not args.overlay_proxy:
+        return None
 
     proxy = trimesh.load(args.overlay_proxy, force="mesh")
     if isinstance(proxy, trimesh.Scene):
@@ -364,6 +436,14 @@ def add_proxy_overlay_to_scene(scene, args):
 
     if len(proxy.faces) == 0:
         print("[WARNING] Proxy mesh is empty; skipping overlay")
+        return None
+
+    return proxy
+
+
+def add_proxy_overlay_to_scene(scene, args, proxy):
+    """将代理网格以半透明方式叠加到场景。"""
+    if proxy is None:
         return
 
     # 解析代理颜色
@@ -482,6 +562,9 @@ def inspect_mesh(mesh, args):
         return scene
 
     if args.show or args.output:
+        # 提前加载代理网格，供叠加显示、投影和透明度控制使用
+        proxy_mesh = load_proxy_mesh(args) if args.overlay_proxy else None
+
         if args.keep_reliable_only:
             print_separator("Reliable-Only Extracted Mesh")
             print(f"  threshold: {args.reliable_threshold}")
@@ -523,7 +606,7 @@ def inspect_mesh(mesh, args):
                 reliable_mesh.export(args.output)
                 print(f"\nReliable-only mesh saved to: {args.output}")
 
-            # 构造用于显示的双面网格，避免背面剔除导致透明
+            # 构造用于显示的双面网格，并设置输入网格透明度
             if args.double_sided:
                 display_mesh = make_double_sided(
                     reliable_mesh,
@@ -531,6 +614,9 @@ def inspect_mesh(mesh, args):
                 )
             else:
                 display_mesh = reliable_mesh
+
+            if args.input_alpha < 1.0:
+                set_face_alpha(display_mesh, args.input_alpha)
 
             scene = trimesh.Scene(display_mesh)
 
@@ -552,8 +638,18 @@ def inspect_mesh(mesh, args):
                     verbose=True,
                 )
 
-            if scene is not None:
-                add_proxy_overlay_to_scene(scene, args)
+            # 孔洞边界投影到代理网格
+            if args.boundary_projection and proxy_mesh is not None:
+                add_boundary_projection_to_scene(
+                    scene, reliable_mesh, proxy_mesh,
+                    radius=args.boundary_projection_radius,
+                    verbose=True,
+                )
+
+            # 最后叠加代理网格
+            if proxy_mesh is not None:
+                add_proxy_overlay_to_scene(scene, args, proxy_mesh)
+
             return scene
 
         if args.highlight_reliable:
@@ -576,6 +672,9 @@ def inspect_mesh(mesh, args):
         # 默认双面渲染：薄壳从任何一侧观察都可见
         if args.double_sided:
             vis = make_double_sided(vis, args.backface_color)
+
+        if args.input_alpha < 1.0:
+            set_face_alpha(vis, args.input_alpha)
 
         scene = trimesh.Scene(vis)
 
@@ -605,8 +704,16 @@ def inspect_mesh(mesh, args):
                 verbose=True,
             )
 
-    if scene is not None:
-        add_proxy_overlay_to_scene(scene, args)
+        # 孔洞边界投影到代理网格
+        if args.boundary_projection and proxy_mesh is not None:
+            add_boundary_projection_to_scene(
+                scene, mesh, proxy_mesh,
+                radius=args.boundary_projection_radius,
+                verbose=True,
+            )
+
+    if scene is not None and proxy_mesh is not None:
+        add_proxy_overlay_to_scene(scene, args, proxy_mesh)
     return scene
 
 
@@ -684,6 +791,15 @@ def main():
                         help="高亮孔洞的最小面积（默认 0，不过滤）")
     parser.add_argument("--overlay-proxy", type=str, default=None,
                         help="同时显示输入的代理网格文件（例如体素壳），路径为 STL/PLY/OBJ")
+    parser.add_argument("--input-alpha", type=float, default=1.0,
+                        help="输入网格（或可靠子网格）不透明度，范围 0~1，"
+                             "默认 1.0。与 --overlay-proxy 配合使用时，"
+                             "设置为 0.3~0.6 效果较好")
+    parser.add_argument("--boundary-projection", action="store_true",
+                        help="将输入网格（或可靠子网格）的孔洞边界投影到代理网格表面显示。"
+                             "仅在 --overlay-proxy 且 --highlight-holes 或 --keep-reliable-only 时有效")
+    parser.add_argument("--boundary-projection-radius", type=float, default=None,
+                        help="边界投影线圆柱半径（默认使用与孔洞边界相同的半径）")
     parser.add_argument("--proxy-alpha", type=float, default=0.45,
                         help="代理网格透明度，0=全透明，1=不透明，默认 0.45")
     parser.add_argument("--proxy-color", type=str, default=None,
