@@ -26,6 +26,7 @@ from toys3d.geometrics import (
     polygon_area_from_3d_ccw,
     compute_reliable_face_mask,
     repair_mesh_by_removing_duplicates,
+    project_vertices_to_shell,
 )
 
 
@@ -374,16 +375,15 @@ def add_boundary_projection_to_scene(scene, boundary_mesh, proxy_mesh,
         return
 
     try:
-        from trimesh.proximity import closest_point
-
         # 收集所有边界环上的唯一顶点
         all_boundary_verts = np.unique(
             np.concatenate([np.array(loop, dtype=np.int64) for loop in loops])
         )
         points = boundary_mesh.vertices[all_boundary_verts]
 
-        closest, distances, _ = closest_point(proxy_mesh, points)
-        projected_points = np.asarray(closest, dtype=np.float64)
+        projected_points, distances, triangle_indices = project_vertices_to_shell(
+            points, proxy_mesh
+        )
     except Exception as e:
         if verbose:
             print(f"  Boundary projection failed: {e}")

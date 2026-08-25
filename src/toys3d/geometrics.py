@@ -1424,6 +1424,63 @@ def compute_hole_area_stats(mesh):
     return stats
 
 
+def project_vertices_to_shell(vertices, shell_mesh):
+    """
+    将输入点集投影到 shell_mesh 的三角形表面。
+
+    返回的是表面上距离输入点最近的点（可能位于三角形内部或边上），
+    以及该点所在的三角形索引。这样可以避免仅仅查询顶点最近点而误选
+    背面或错误一侧的问题。
+
+    Parameters
+    ----------
+    vertices : (N, 3) float
+        待投影点集。
+    shell_mesh : trimesh.Trimesh
+        代理网格。
+
+    Returns
+    -------
+    closest_points : (N, 3) float
+        表面上距离输入点最近的点。
+    distances : (N,) float
+        最近点与输入点之间的距离。
+    triangle_indices : (N,) int
+        最近点所在的三角形索引。
+    """
+    if not isinstance(shell_mesh, trimesh.Trimesh):
+        raise TypeError("shell_mesh must be trimesh.Trimesh")
+
+    vertices = np.asarray(vertices, dtype=np.float64)
+    if len(vertices) == 0:
+        return (
+            np.empty((0, 3), dtype=np.float64),
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.int64),
+        )
+
+    try:
+        from trimesh.proximity import ProximityQuery
+        prox = ProximityQuery(shell_mesh)
+        closest_points, distances, triangle_indices = prox.on_surface(vertices)
+        return (
+            np.asarray(closest_points, dtype=np.float64),
+            np.asarray(distances, dtype=np.float64),
+            np.asarray(triangle_indices, dtype=np.int64),
+        )
+    except Exception:
+        # 回退到 closest_point，它同样返回表面最近点和三角形索引
+        from trimesh.proximity import closest_point
+        closest_points, distances, triangle_indices = closest_point(
+            shell_mesh, vertices
+        )
+        return (
+            np.asarray(closest_points, dtype=np.float64),
+            np.asarray(distances, dtype=np.float64),
+            np.asarray(triangle_indices, dtype=np.int64),
+        )
+
+
 def compute_reliable_face_mask(mesh,
                                k_defect=3,
                                min_area_ratio=0.01,
