@@ -27,6 +27,7 @@ from toys3d.geometrics import (
     compute_reliable_face_mask,
     repair_mesh_by_removing_duplicates,
     project_vertices_to_shell,
+    weld_small_holes,
 )
 
 
@@ -451,10 +452,21 @@ def _print_projected_boundary_diagnostics(
 
         unique_tri_ids = sorted(set(tri_ids))
 
+        input_hole_area = polygon_area_from_3d_ccw(original_pts)
+        projected_area = polygon_area_from_3d_ccw(pts)
+
+        if input_hole_area < 1e-12:
+            status = "PSEUDO_HOLE"
+        elif projected_area < 1e-12:
+            status = "PROJECTION_DEGENERATE"
+        else:
+            status = "REAL_HOLE"
+
         print(f"  [loop {loop_idx}]")
+        print(f"    status={status}")
         print(f"    boundary_edges={len(ids)}")
-        print(f"    input_hole_area={polygon_area_from_3d_ccw(original_pts):.6f}")
-        print(f"    projected_area={polygon_area_from_3d_ccw(pts):.6f}")
+        print(f"    input_hole_area={input_hole_area:.6f}")
+        print(f"    projected_area={projected_area:.6f}")
         print(f"    projection_dist: "
               f"mean={np.mean(dists):.6f}, max={np.max(dists):.6f}")
         print(f"    projected_boundary_triangles={unique_tri_ids}")
@@ -614,6 +626,16 @@ def inspect_mesh(mesh, args):
     """
     主检查函数：输出统计信息并可选返回可视化场景。
     """
+    if args.weld_small_holes:
+        print_separator("Weld Small Holes")
+        mesh = weld_small_holes(
+            mesh,
+            threshold=args.weld_hole_threshold,
+            quantile=args.weld_hole_quantile,
+            min_edges=args.weld_min_hole_edges,
+            verbose=True,
+        )
+
     stats = compute_mesh_stats(mesh)
     defect_stats, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
     area_stats = compute_face_area_stats(mesh)
@@ -725,6 +747,16 @@ def inspect_mesh(mesh, args):
             reliable_mesh.remove_unreferenced_vertices()
             reliable_mesh.merge_vertices()
             reliable_mesh = repair_mesh_by_removing_duplicates(reliable_mesh)
+
+            if args.weld_small_holes:
+                print_separator("Weld Small Holes (Reliable Mesh)")
+                reliable_mesh = weld_small_holes(
+                    reliable_mesh,
+                    threshold=args.weld_hole_threshold,
+                    quantile=args.weld_hole_quantile,
+                    min_edges=args.weld_min_hole_edges,
+                    verbose=True,
+                )
 
             # 打印提取后的简要统计
             extracted_stats = compute_mesh_stats(reliable_mesh)
@@ -928,6 +960,14 @@ def main():
                         help="高亮孔洞的最小边界边数（默认 3）")
     parser.add_argument("--min-hole-area", type=float, default=0.0,
                         help="高亮孔洞的最小面积（默认 0，不过滤）")
+    parser.add_argument("--weld-small-holes", action="store_true",
+                        help="自动焊接面积小于阈值的小孔洞，适用于扫描去重后的伪孔洞")
+    parser.add_argument("--weld-hole-threshold", type=float, default=None,
+                        help="焊接孔洞的绝对面积阈值；默认使用面片面积百分位")
+    parser.add_argument("--weld-hole-quantile", type=float, default=5.0,
+                        help="用于计算焊接阈值的面片面积百分位，默认 5")
+    parser.add_argument("--weld-min-hole-edges", type=int, default=3,
+                        help="焊接孔洞的最小边数，默认 3")
     parser.add_argument("--overlay-proxy", type=str, default=None,
                         help="同时显示输入的代理网格文件（例如体素壳），路径为 STL/PLY/OBJ")
     parser.add_argument("--input-alpha", type=float, default=1.0,

@@ -1424,6 +1424,86 @@ def compute_hole_area_stats(mesh):
     return stats
 
 
+def weld_small_holes(mesh,
+                     threshold=None,
+                     quantile=5.0,
+                     min_edges=3,
+                     verbose=False):
+    """
+    焊接面积小于阈值的小孔洞。
+
+    对于面积很小的开放边界环，将环上所有顶点合并到环重心，
+    再合并重复顶点、删除退化面片。适合扫描模型去重后残留的微裂缝。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    threshold : float or None
+        孔洞面积阈值。若为 None，则使用 quantile 根据面片面积计算。
+    quantile : float
+        面片面积百分位，默认 5，即 p5。
+    min_edges : int
+        小于此边数的环直接忽略。
+    verbose : bool
+    """
+    if len(mesh.faces) == 0:
+        return mesh.copy()
+
+    loops = extract_boundary_loops(mesh)
+    if not loops:
+        return mesh.copy()
+
+    if threshold is None:
+        face_areas = np.asarray(mesh.area_faces, dtype=np.float64)
+        if len(face_areas) == 0:
+            return mesh.copy()
+        threshold = float(np.percentile(face_areas, quantile))
+
+    if verbose:
+        print(f"  weld threshold: {threshold:.6f}")
+
+    small_loops = []
+    for loop in loops:
+        if len(loop) < min_edges:
+            continue
+        pts = mesh.vertices[np.asarray(loop, dtype=np.int64)]
+        area = polygon_area_from_3d_ccw(pts)
+        if area <= threshold:
+            small_loops.append((area, loop))
+
+    if not small_loops:
+        if verbose:
+            print("  no small holes to weld")
+        return mesh.copy()
+
+    if verbose:
+        print(f"  welding {len(small_loops)} small holes")
+
+    new_vertices = mesh.vertices.copy()
+    faces = mesh.faces.copy()
+
+    for _area, loop in small_loops:
+        loop = np.asarray(loop, dtype=np.int64)
+        centroid = new_vertices[loop].mean(axis=0)
+        new_vertices[loop] = centroid
+
+    welded = trimesh.Trimesh(
+        vertices=new_vertices,
+        faces=faces,
+        process=False,
+    )
+    welded.merge_vertices()
+    welded.remove_unreferenced_vertices()
+    welded = repair_mesh_by_removing_duplicates(welded)
+
+    if verbose:
+        defects, _, _ = analyze_mesh_defects(welded)
+        print(f"  after welding: open_edges={defects['open_edges']}, "
+              f"nonmanifold_edges={defects['nonmanifold_edges']}")
+
+    return welded
+
+
 def project_vertices_to_shell(vertices, shell_mesh):
     """
     将输入点集投影到 shell_mesh 的三角形表面。
