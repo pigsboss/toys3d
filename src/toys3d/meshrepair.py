@@ -25,6 +25,7 @@ from toys3d.geometrics import (
     remove_pseudo_holes,
     repair_to_watertight,
     fuse_reliable_faces_with_shell,
+    weld_small_holes,
 )
 
 
@@ -288,6 +289,16 @@ def main():
     parser.add_argument("--pseudo-hole-iterations", type=int, default=5,
                         help="伪孔洞清理迭代次数（默认 5）")
 
+    # 焊接小孔洞参数
+    parser.add_argument("--weld-small-holes", action="store_true",
+                        help="焊接面积小于阈值的小孔洞，适用于扫描去重后的伪孔洞")
+    parser.add_argument("--weld-hole-threshold", type=float, default=None,
+                        help="焊接孔洞的绝对面积阈值；默认使用面片面积百分位")
+    parser.add_argument("--weld-hole-quantile", type=float, default=5.0,
+                        help="用于计算焊接阈值的面片面积百分位，默认 5")
+    parser.add_argument("--weld-min-hole-edges", type=int, default=3,
+                        help="焊接孔洞的最小边数，默认 3")
+
     # 融合模式参数
     parser.add_argument("--fuse-shell", type=str, default=None,
                         help="指定水密壳网格文件路径，启用可靠面片+壳融合模式")
@@ -356,6 +367,19 @@ def main():
         )
         if args.verbose:
             print("[Pre-clean] done")
+
+    if args.weld_small_holes:
+        if args.verbose:
+            print("\n[Pre-clean] welding small holes...")
+        mesh = weld_small_holes(
+            mesh,
+            threshold=args.weld_hole_threshold,
+            quantile=args.weld_hole_quantile,
+            min_edges=args.weld_min_hole_edges,
+            verbose=args.verbose,
+        )
+        if args.verbose:
+            print("[Pre-clean] weld done")
 
     if args.fuse_shell:
         print(f"Loading shell: {args.fuse_shell}")
