@@ -1528,9 +1528,12 @@ def _point_in_polygon_2d(pt, poly):
 
 
 def _count_proxy_face_centers_inside_projected_polygon(
-        projected_points, proxy_mesh):
+        projected_points, proxy_mesh,
+        center_tree=None, centers=None, verbose=False):
     """
-    统计代理网格中面片中心落在 projection_points 构成的投影多边形内的数量。
+    统计代理网格中面片中心落在 projected_points 构成的投影多边形内的数量。
+
+    使用 cKDTree 球查询预筛选候选点，避免遍历全部面片中心。
 
     Parameters
     ----------
@@ -1538,16 +1541,26 @@ def _count_proxy_face_centers_inside_projected_polygon(
         源孔洞边界环顶点在代理网格表面的投影点。
     proxy_mesh : trimesh.Trimesh
         代理网格。
+    center_tree : scipy.spatial.cKDTree or None
+        预先构建的代理面片中心 cKDTree。若为 None，将在此函数内构建。
+    centers : (M, 3) float or None
+        代理面片中心坐标数组。若为 None，将在此函数内计算。
+    verbose : bool
+        是否打印耗时信息。
 
     Returns
     -------
     count : int
         位于投影多边形内部的代理面片中心数量。
     """
+    import time
+
+    t0 = time.time()
+
     if len(projected_points) < 3 or len(proxy_mesh.faces) == 0:
         return 0
 
-    # 用 SVD 将所有投影点拟合到平面，并投影到 2D
+    # 拟合平面，将投影点变换到 2D
     pts = np.asarray(projected_points, dtype=np.float64)
     centroid = pts.mean(axis=0)
     _, _, vh = np.linalg.svd(pts - centroid)
@@ -1558,17 +1571,45 @@ def _count_proxy_face_centers_inside_projected_polygon(
         (pts - centroid) @ v,
     ])
 
-    # 代理面片中心投影到同一平面
-    centers = np.asarray(proxy_mesh.triangles_center, dtype=np.float64)
-    centers2d = np.column_stack([
-        (centers - centroid) @ u,
-        (centers - centroid) @ v,
+    # 代理面片中心（若未传入则计算）
+    if centers is None:
+        centers = np.asarray(proxy_mesh.triangles_center, dtype=np.float64)
+
+    if verbose:
+        print(f"      [count] SVD + center extraction: {time.time() - t0:.4f}s")
+
+    # 使用球查询快速筛选候选点
+    radius = float(np.linalg.norm(poly2d - poly2d.mean(axis=0), axis=1).max()) + 1e-12
+    # 注意：这里使用 3D 球查询，质心为原始投影点质心（3D）
+    if center_tree is None:
+        from scipy.spatial import cKDTree
+        center_tree = cKDTree(centers)
+
+    t1 = time.time()
+    candidate_indices = center_tree.query_ball_point(centroid, r=radius)
+    if verbose:
+        print(f"      [count] KDTree query: {time.time() - t1:.4f}s "
+              f"({len(candidate_indices)} candidates)")
+
+    if not candidate_indices:
+        return 0
+
+    # 只对候选点投影到 2D 并测试
+    cand_pts = centers[candidate_indices]
+    cand2d = np.column_stack([
+        (cand_pts - centroid) @ u,
+        (cand_pts - centroid) @ v,
     ])
 
+    t2 = time.time()
     count = 0
-    for c2d in centers2d:
+    for c2d in cand2d:
         if _point_in_polygon_2d(c2d, poly2d):
             count += 1
+    if verbose:
+        print(f"      [count] polygon test for candidates: {time.time() - t2:.4f}s")
+        print(f"      [count] total: {time.time() - t0:.4f}s")
+
     return count
 
 
@@ -1600,6 +1641,10 @@ def fill_holes_with_proxy(mesh,
         允许的最大投影距离，超过则放弃代理补丁，直接平面修补。
     verbose : bool
     """
+    import time
+
+    t_start = time.time()
+
     # 1. 焊接异常小孔洞
     welded = weld_small_holes(mesh, quantile=5.0, min_edges=3, verbose=verbose)
 
@@ -1607,6 +1652,14 @@ def fill_holes_with_proxy(mesh,
     loops = extract_boundary_loops(welded)
     if not loops:
         return welded
+
+    # 预构建代理面片中心 KD 树（仅一次）
+    center_tree = None
+    proxy_centers = None
+    if proxy_mesh is not None and len(proxy_mesh.faces) > 0:
+        from scipy.spatial import cKDTree
+        proxy_centers = np.asarray(proxy_mesh.triangles_center, dtype=np.float64)
+        center_tree = cKDTree(proxy_centers)
 
     # 2. 逐环处理
     new_faces = []
@@ -1618,6 +1671,7 @@ def fill_holes_with_proxy(mesh,
         print(f"  [proxy patch] processing {len(loops)} boundary loops")
 
     for loop_idx, loop in enumerate(loops):
+        loop_t0 = time.time()
         if len(loop) < 3:
             continue
 
@@ -1650,7 +1704,10 @@ def fill_holes_with_proxy(mesh,
             if use_proxy:
                 # 统计投影多边形内代理面片中心数量
                 center_count = _count_proxy_face_centers_inside_projected_polygon(
-                    projection_points, proxy_mesh
+                    projection_points, proxy_mesh,
+                    center_tree=center_tree,
+                    centers=proxy_centers,
+                    verbose=verbose,
                 )
                 if verbose:
                     print(f"    loop {loop_idx}: edges={len(loop)}, "
@@ -1720,6 +1777,9 @@ def fill_holes_with_proxy(mesh,
             new_faces.extend(tris)
             plane_fill_count += 1
 
+        if verbose:
+            print(f"    [loop {loop_idx}] total time: {time.time() - loop_t0:.4f}s")
+
     # 3. 合并源网格、平面补丁、代理补丁
     # 先构造包含平面补丁的基础网格
     base_faces = np.asarray(welded.faces, dtype=np.int64)
@@ -1752,6 +1812,7 @@ def fill_holes_with_proxy(mesh,
         defects, _, _ = analyze_mesh_defects(merged)
         print(f"  [proxy patch] final defects: open_edges={defects['open_edges']}, "
               f"nonmanifold_edges={defects['nonmanifold_edges']}")
+        print(f"  [proxy patch] total time: {time.time() - t_start:.4f}s")
 
     return merged
 
