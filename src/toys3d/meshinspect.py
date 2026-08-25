@@ -362,8 +362,116 @@ def add_hole_boundaries_to_scene(scene, mesh, radius=None,
             scene.add_geometry(seg)
 
 
+def _point_in_polygon_2d(pt, poly):
+    """二维射线法判断点是否在多边形内部。"""
+    x, y = pt
+    inside = False
+    n = len(poly)
+    j = n - 1
+
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / ((yj - yi) + 1e-30) + xi
+        ):
+            inside = not inside
+        j = i
+
+    return inside
+
+
+def _print_projected_boundary_diagnostics(
+    loops,
+    vertex_to_projected,
+    vertex_to_tri,
+    vertex_to_dist,
+    proxy_mesh,
+    max_report_loops=None,
+    max_report_vertices=20,
+):
+    """
+    打印投影孔洞边界包围的代理网格顶点信息。
+    """
+    from scipy.spatial import cKDTree
+
+    proxy_vertices = np.asarray(proxy_mesh.vertices, dtype=np.float64)
+    if len(proxy_vertices) == 0:
+        return
+
+    tree = cKDTree(proxy_vertices)
+
+    if max_report_loops is None or max_report_loops <= 0:
+        max_report_loops = len(loops)
+
+    report_loops = loops[:max_report_loops]
+    print(f"  Projected boundary diagnostics for {len(report_loops)} loops:")
+
+    for loop_idx, loop in enumerate(report_loops):
+        ids = np.array(loop, dtype=np.int64)
+        pts = np.array([vertex_to_projected[int(v)] for v in ids], dtype=np.float64)
+
+        if len(pts) < 3:
+            print(f"  [loop {loop_idx}] skipped: only {len(pts)} projected points")
+            continue
+
+        tri_ids = [int(vertex_to_tri[int(v)]) for v in ids]
+        dists = [float(vertex_to_dist[int(v)]) for v in ids]
+
+        centroid = pts.mean(axis=0)
+        _, _, vh = np.linalg.svd(pts - centroid)
+        u = vh[0]
+        v = vh[1]
+
+        poly2d = np.column_stack([
+            (pts - centroid) @ u,
+            (pts - centroid) @ v,
+        ])
+
+        radius = float(np.linalg.norm(pts - centroid, axis=1).max()) + 1e-12
+        candidate_indices = tree.query_ball_point(centroid, r=radius)
+
+        if not candidate_indices:
+            inside_indices = np.array([], dtype=np.int64)
+        else:
+            cand_pts = proxy_vertices[candidate_indices]
+            cand2d = np.column_stack([
+                (cand_pts - centroid) @ u,
+                (cand_pts - centroid) @ v,
+            ])
+
+            inside_mask = [
+                _point_in_polygon_2d(tuple(p), poly2d)
+                for p in cand2d
+            ]
+
+            inside_indices = np.asarray(candidate_indices, dtype=np.int64)[inside_mask]
+
+        unique_tri_ids = sorted(set(tri_ids))
+
+        print(f"  [loop {loop_idx}]")
+        print(f"    boundary_edges={len(ids)}")
+        print(f"    projected_area={polygon_area_from_3d_ccw(pts):.6f}")
+        print(f"    projection_dist: "
+              f"mean={np.mean(dists):.6f}, max={np.max(dists):.6f}")
+        print(f"    projected_boundary_triangles={unique_tri_ids}")
+        print(f"    enclosed_proxy_vertices={len(inside_indices)}")
+
+        if len(inside_indices) > 0:
+            shown = inside_indices[:max_report_vertices]
+            print(f"    enclosed_vertex_indices={shown.tolist()}")
+
+            if len(inside_indices) > max_report_vertices:
+                print(
+                    f"    ... {len(inside_indices) - max_report_vertices} more"
+                )
+
+
 def add_boundary_projection_to_scene(scene, boundary_mesh, proxy_mesh,
-                                     radius=None, verbose=False):
+                                     radius=None, verbose=False,
+                                     print_enclosed_vertices=False,
+                                     max_report_loops=None,
+                                     max_report_vertices=20):
     """
     将 boundary_mesh 的闭合孔洞边界环投影到 proxy_mesh 表面，
     并在场景中绘制投影线段。
@@ -395,6 +503,16 @@ def add_boundary_projection_to_scene(scene, boundary_mesh, proxy_mesh,
         for i, v in enumerate(all_boundary_verts)
     }
 
+    vertex_to_tri = {
+        int(v): triangle_indices[i]
+        for i, v in enumerate(all_boundary_verts)
+    }
+
+    vertex_to_dist = {
+        int(v): distances[i]
+        for i, v in enumerate(all_boundary_verts)
+    }
+
     if radius is None or radius <= 0:
         if len(proxy_mesh.vertices) == 0:
             radius = 1e-6
@@ -405,6 +523,17 @@ def add_boundary_projection_to_scene(scene, boundary_mesh, proxy_mesh,
             radius = max(diag * 0.001, 1e-6)
 
     color = np.array([0, 255, 255, 255], dtype=np.uint8)  # 青色
+
+    if print_enclosed_vertices:
+        _print_projected_boundary_diagnostics(
+            loops,
+            vertex_to_projected,
+            vertex_to_tri,
+            vertex_to_dist,
+            proxy_mesh,
+            max_report_loops=max_report_loops,
+            max_report_vertices=max_report_vertices,
+        )
 
     for loop in loops:
         pts = [vertex_to_projected[int(v)] for v in loop]
@@ -644,6 +773,9 @@ def inspect_mesh(mesh, args):
                     scene, reliable_mesh, proxy_mesh,
                     radius=args.boundary_projection_radius,
                     verbose=True,
+                    print_enclosed_vertices=args.print_shell_enclosed_vertices,
+                    max_report_loops=args.max_report_boundary_loops,
+                    max_report_vertices=args.max_report_shell_vertices,
                 )
 
             # 最后叠加代理网格
@@ -710,6 +842,9 @@ def inspect_mesh(mesh, args):
                 scene, mesh, proxy_mesh,
                 radius=args.boundary_projection_radius,
                 verbose=True,
+                print_enclosed_vertices=args.print_shell_enclosed_vertices,
+                max_report_loops=args.max_report_boundary_loops,
+                max_report_vertices=args.max_report_shell_vertices,
             )
 
     if scene is not None and proxy_mesh is not None:
@@ -800,6 +935,23 @@ def main():
                              "仅在 --overlay-proxy 且 --highlight-holes 或 --keep-reliable-only 时有效")
     parser.add_argument("--boundary-projection-radius", type=float, default=None,
                         help="边界投影线圆柱半径（默认使用与孔洞边界相同的半径）")
+    parser.add_argument(
+        "--print-shell-enclosed-vertices",
+        action="store_true",
+        help="在 --boundary-projection 模式下，打印投影孔洞多边形及被包围的代理网格顶点信息"
+    )
+    parser.add_argument(
+        "--max-report-boundary-loops",
+        type=int,
+        default=None,
+        help="最多打印多少个孔洞边界的投影诊断信息；默认全部"
+    )
+    parser.add_argument(
+        "--max-report-shell-vertices",
+        type=int,
+        default=20,
+        help="每个孔洞最多列出多少个被包围的代理网格顶点索引；默认 20"
+    )
     parser.add_argument("--proxy-alpha", type=float, default=0.45,
                         help="代理网格透明度，0=全透明，1=不透明，默认 0.45")
     parser.add_argument("--proxy-color", type=str, default=None,
