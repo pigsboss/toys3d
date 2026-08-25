@@ -71,6 +71,39 @@ def analyze_mesh_defects(mesh):
     return defect_stats, open_face_mask, nonmanifold_face_mask
 
 
+def build_face_adjacency(mesh):
+    """
+    构建每个面片的邻接面片索引列表。
+
+    返回的列表长度等于面片数量，每个元素是 np.ndarray，
+    表示与当前面片共享至少一条边的其它面片索引。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+    n_faces = len(faces)
+
+    if n_faces == 0:
+        return [np.array([], dtype=np.int64) for _ in range(n_faces)]
+
+    adjacency = [set() for _ in range(n_faces)]
+    edge_to_faces = {}
+
+    for fi, face in enumerate(faces):
+        v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+        for a, b in ((v1, v2), (v2, v3), (v3, v1)):
+            key = (a, b) if a < b else (b, a)
+            edge_to_faces.setdefault(key, []).append(fi)
+
+    for face_indices in edge_to_faces.values():
+        if len(face_indices) < 2:
+            continue
+        for i in face_indices:
+            for j in face_indices:
+                if i != j:
+                    adjacency[i].add(j)
+
+    return [np.array(sorted(s), dtype=np.int64) for s in adjacency]
+
+
 def repair_mesh_by_removing_duplicates(mesh):
     """Remove duplicate and degenerate faces."""
     if len(mesh.faces) == 0:
