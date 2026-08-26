@@ -303,12 +303,15 @@ def main():
     parser.add_argument("--proxy-shell", type=str, default=None,
                         help="指定水密代理壳网格文件路径（如体素壳），"
                              "启用可靠面片提取 + 代理支撑孔洞修补模式")
-    parser.add_argument("--proxy-face-center-threshold", type=int, default=5,
+    parser.add_argument("--proxy-face-center-threshold", type=int, default=20,
                         help="投影多边形内代理面片中心数量阈值，"
-                             "达到该数量才使用代理补丁，否则平面修补（默认 5）")
+                             "达到该数量才使用代理补丁，否则平面修补（默认 20）")
     parser.add_argument("--proxy-max-projection-distance", type=float, default=None,
                         help="孔洞边界投影到代理壳的最大允许距离，"
                              "超过则放弃代理补丁，默认不限制")
+    parser.add_argument("--proxy-min-loop-edges", type=int, default=12,
+                        help="使用代理补丁的最小边界边数，"
+                             "小于此值一律平面修补（默认 12）")
     parser.add_argument("--proxy-smooth-iterations", type=int, default=3,
                         help="可靠子网格与补丁接缝平滑迭代次数（默认 3）")
     parser.add_argument("--proxy-smooth-alpha", type=float, default=0.5,
@@ -397,6 +400,7 @@ def main():
             mask_threshold=0.75,
             proxy_face_center_threshold=args.proxy_face_center_threshold,
             max_projection_distance=args.proxy_max_projection_distance,
+            min_proxy_loop_edges=args.proxy_min_loop_edges,
             smooth_transition=not args.proxy_no_smooth,
             smooth_iterations=args.proxy_smooth_iterations,
             smooth_alpha=args.proxy_smooth_alpha,
@@ -437,6 +441,12 @@ def main():
                 normal_repair=not args.no_normal_repair,
                 verbose=args.verbose,
             )
+
+    defects, _, _ = analyze_mesh_defects(repaired)
+    if defects['open_edges'] > 0 or defects['nonmanifold_edges'] > 0:
+        print(f"\n[WARNING] Output is NOT watertight: "
+              f"open_edges={defects['open_edges']}, "
+              f"nonmanifold_edges={defects['nonmanifold_edges']}")
 
     if args.verbose:
         print("\n[Output mesh stats]")
