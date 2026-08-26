@@ -1552,13 +1552,15 @@ def _count_proxy_face_centers_inside_projected_polygon(
     -------
     count : int
         位于投影多边形内部的代理面片中心数量。
+    inside_indices : np.ndarray
+        代理网格中落在投影多边形内部的面片索引数组。
     """
     import time
 
     t0 = time.time()
 
     if len(projected_points) < 3 or len(proxy_mesh.faces) == 0:
-        return 0
+        return 0, np.empty(0, dtype=np.int64)
 
     # 拟合平面，将投影点变换到 2D
     pts = np.asarray(projected_points, dtype=np.float64)
@@ -1592,7 +1594,7 @@ def _count_proxy_face_centers_inside_projected_polygon(
               f"({len(candidate_indices)} candidates)")
 
     if not candidate_indices:
-        return 0
+        return 0, np.empty(0, dtype=np.int64)
 
     # 只对候选点投影到 2D 并测试
     cand_pts = centers[candidate_indices]
@@ -1602,15 +1604,18 @@ def _count_proxy_face_centers_inside_projected_polygon(
     ])
 
     t2 = time.time()
-    count = 0
-    for c2d in cand2d:
-        if _point_in_polygon_2d(c2d, poly2d):
-            count += 1
+    inside_mask = [
+        _point_in_polygon_2d(c2d, poly2d)
+        for c2d in cand2d
+    ]
+    inside_indices = np.asarray(candidate_indices, dtype=np.int64)[inside_mask]
+    count = len(inside_indices)
+
     if verbose:
         print(f"      [count] polygon test for candidates: {time.time() - t2:.4f}s")
         print(f"      [count] total: {time.time() - t0:.4f}s")
 
-    return count
+    return count, inside_indices
 
 
 def fill_holes_with_proxy(mesh,
@@ -1702,8 +1707,8 @@ def fill_holes_with_proxy(mesh,
                 use_proxy = True
 
             if use_proxy:
-                # 统计投影多边形内代理面片中心数量
-                center_count = _count_proxy_face_centers_inside_projected_polygon(
+                # 统计投影多边形内代理面片中心数量，并获取内部面片索引
+                center_count, inside_indices = _count_proxy_face_centers_inside_projected_polygon(
                     projection_points, proxy_mesh,
                     center_tree=center_tree,
                     centers=proxy_centers,
@@ -1721,35 +1726,12 @@ def fill_holes_with_proxy(mesh,
             if verbose:
                 print(f"      -> proxy patch fill")
 
-            # 计算投影多边形 2D 参数
-            pts = np.asarray(projection_points, dtype=np.float64)
-            centroid = pts.mean(axis=0)
-            _, _, vh = np.linalg.svd(pts - centroid)
-            u = vh[0]
-            v = vh[1]
-            poly2d = np.column_stack([
-                (pts - centroid) @ u,
-                (pts - centroid) @ v,
-            ])
-
-            # 代理面片中心 2D 坐标
-            centers = np.asarray(proxy_mesh.triangles_center, dtype=np.float64)
-            centers2d = np.column_stack([
-                (centers - centroid) @ u,
-                (centers - centroid) @ v,
-            ])
-
-            inside_mask = np.array([
-                _point_in_polygon_2d(c2d, poly2d)
-                for c2d in centers2d
-            ])
-
             # 种子三角形：投影点所在三角形
             seed_tri_indices = np.unique(np.asarray(tri_ids, dtype=np.int64))
 
-            # 最终选中三角形：内部面片 + 种子三角形
+            # 直接使用计数阶段返回的内部面片索引，避免重新遍历
             selected_face_mask = np.zeros(len(proxy_mesh.faces), dtype=bool)
-            selected_face_mask[inside_mask] = True
+            selected_face_mask[inside_indices] = True
             selected_face_mask[seed_tri_indices] = True
 
             if selected_face_mask.any():
