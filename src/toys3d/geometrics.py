@@ -32,26 +32,37 @@ def compute_mesh_stats(mesh):
 
 
 def analyze_mesh_defects(mesh):
-    edge_face_count = {}
-    face_adj_edges = mesh.face_adjacency_edges
+    """
+    分析网格缺陷，返回统计信息以及开放面片和非流形面片的布尔掩码。
+    """
+    # 1. 构建边 -> 相邻面片索引的映射
+    edge_to_faces = {}
+    faces = np.asarray(mesh.faces, dtype=np.int64)
 
-    for face_adj_idx, (v0, v1) in enumerate(face_adj_edges):
-        ekey = (int(v0), int(v1)) if v0 < v1 else (int(v1), int(v0))
-        edge_face_count.setdefault(ekey, []).append(face_adj_idx)
+    for fid, face in enumerate(faces):
+        for i in range(3):
+            v0 = int(face[i])
+            v1 = int(face[(i + 1) % 3])
+            ekey = (v0, v1) if v0 < v1 else (v1, v0)
+            edge_to_faces.setdefault(ekey, []).append(fid)
 
+    # 2. 根据每条边相邻面片数量判断缺陷类型
     open_edges = set()
     nonmanifold_edges = set()
     open_faces = set()
     nonmanifold_faces = set()
 
-    for ekey, adj_list in edge_face_count.items():
-        if len(adj_list) == 1:
+    for ekey, face_list in edge_to_faces.items():
+        if len(face_list) == 1:
+            # 只属于一个面片的边 -> 开放边
             open_edges.add(ekey)
-            open_faces.update(adj_list)
-        elif len(adj_list) > 2:
+            open_faces.add(face_list[0])
+        elif len(face_list) >= 3:
+            # 共享超过两个面片的边 -> 非流形边
             nonmanifold_edges.add(ekey)
-            nonmanifold_faces.update(adj_list)
+            nonmanifold_faces.update(face_list)
 
+    # 3. 输出统计
     defect_stats = {
         'open_edges': len(open_edges),
         'nonmanifold_edges': len(nonmanifold_edges),
@@ -59,12 +70,15 @@ def analyze_mesh_defects(mesh):
         'nonmanifold_faces': len(nonmanifold_faces),
     }
 
+    # 4. 生成面片布尔掩码
     open_face_mask = np.zeros(len(mesh.faces), dtype=bool)
     nonmanifold_face_mask = np.zeros(len(mesh.faces), dtype=bool)
-    if open_faces:
-        open_face_mask[list(open_faces)] = True
-    if nonmanifold_faces:
-        nonmanifold_face_mask[list(nonmanifold_faces)] = True
+
+    for f in open_faces:
+        open_face_mask[f] = True
+
+    for f in nonmanifold_faces:
+        nonmanifold_face_mask[f] = True
 
     return defect_stats, open_face_mask, nonmanifold_face_mask
 
