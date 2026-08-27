@@ -1840,6 +1840,205 @@ def _count_proxy_face_centers_inside_projected_polygon(
     return count, inside_indices
 
 
+def _build_face_adjacency_dict(proxy_mesh):
+    """构建代理网格的面片邻接字典。"""
+    adj = {}
+    for f0, f1 in proxy_mesh.face_adjacency:
+        f0, f1 = int(f0), int(f1)
+        adj.setdefault(f0, set()).add(f1)
+        adj.setdefault(f1, set()).add(f0)
+    return adj
+
+
+def _find_face_path(adj, start, goal, max_depth=200):
+    """在面片邻接图中寻找 start 到 goal 的局部最短路径。"""
+    from collections import deque
+
+    if start == goal:
+        return [start]
+
+    parent = {start: None}
+    depth = {start: 0}
+    q = deque([start])
+
+    while q:
+        cur = q.popleft()
+        if depth[cur] >= max_depth:
+            continue
+        for nb in adj.get(cur, ()):
+            if nb in depth:
+                continue
+            depth[nb] = depth[cur] + 1
+            parent[nb] = cur
+            if nb == goal:
+                path = [goal]
+                while path[-1] != start:
+                    path.append(parent[path[-1]])
+                return path[::-1]
+            q.append(nb)
+
+    return None
+
+
+def _extract_proxy_interior_faces(proxy_mesh, proj_pts, proj_tris,
+                                  max_path_depth=200):
+    """
+    返回投影边界内部的代理网格面片集合与相关顶点索引。
+
+    Parameters
+    ----------
+    proxy_mesh : trimesh.Trimesh
+    proj_pts : (N, 3) float
+        源孔洞边界在代理网格表面上的投影点。
+    proj_tris : (N,) int64
+        每个投影点所在的代理网格三角形索引。
+
+    Returns
+    -------
+    inside_faces : set[int]
+        投影边界内部的代理网格面片索引集合。
+    inside_vertices : np.ndarray
+        这些内部面片使用到的代理网格顶点索引。
+    """
+    proj_pts = np.asarray(proj_pts, dtype=np.float64)
+    proj_tris = np.asarray(proj_tris, dtype=np.int64)
+
+    if len(proj_tris) < 3:
+        return set(), np.array([], dtype=np.int64)
+
+    adj = _build_face_adjacency_dict(proxy_mesh)
+
+    # 1. 以投影点所在三角形为种子，沿面片邻接图连接相邻投影点，
+    #    得到闭合的拓扑分界线。
+    barrier = {int(t) for t in proj_tris if t >= 0}
+    n = len(proj_tris)
+
+    for i in range(n):
+        a = int(proj_tris[i])
+        b = int(proj_tris[(i + 1) % n])
+        if a < 0 or b < 0:
+            continue
+        path = _find_face_path(adj, a, b, max_depth=max_path_depth)
+        if path is not None:
+            barrier.update(path)
+
+    if not barrier:
+        return set(), np.array([], dtype=np.int64)
+
+    # 2. 用投影点质心在代理网格上的最近三角形作为内部种子。
+    centroid = np.mean(proj_pts, axis=0)
+    seed_points, _, seed_tri = project_vertices_to_shell(
+        np.array([centroid]), proxy_mesh
+    )
+    seed = int(seed_tri[0]) if len(seed_tri) > 0 and seed_tri[0] >= 0 else None
+
+    if seed is None:
+        return set(), np.array([], dtype=np.int64)
+
+    # 如果种子刚好落在分界线上，尝试用相邻非分界面片。
+    if seed in barrier:
+        replaced = False
+        for nb in adj.get(seed, ()):
+            if nb not in barrier:
+                seed = nb
+                replaced = True
+                break
+        if not replaced:
+            return set(), np.array([], dtype=np.int64)
+
+    # 3. 避开分界线，从种子泛洪。
+    visited = {seed}
+    stack = [seed]
+    while stack:
+        cur = stack.pop()
+        for nb in adj.get(cur, ()):
+            if nb in visited or nb in barrier:
+                continue
+            visited.add(nb)
+            stack.append(nb)
+
+    # 4. 收集内部面片和内部顶点。
+    vertex_set = set()
+    for f in visited:
+        vertex_set.update(int(v) for v in proxy_mesh.faces[f])
+
+    inside_vertices = np.array(sorted(vertex_set), dtype=np.int64)
+    return visited, inside_vertices
+
+
+def _triangulate_polygon_with_interior_points(boundary_pts, interior_pts):
+    """
+    将源孔洞边界和内部代理顶点一起重新三角化。
+
+    boundary_pts 为源孔洞边界 3D 顶点序列，interior_pts 为代理网格内部
+    3D 顶点。函数将全部点投影到局部最佳拟合平面，在 2D 中对边界多边形
+    做初始 ear clipping，然后逐个插入内部点，从而保持源边界不变。
+
+    Returns
+    -------
+    faces : list[tuple[int, int, int]]
+        局部索引，0..len(boundary_pts)-1 对应源边界顶点，
+        其后的索引对应 interior_pts。
+    """
+    boundary_pts = np.asarray(boundary_pts, dtype=np.float64)
+    interior_pts = np.asarray(interior_pts, dtype=np.float64).reshape(-1, 3)
+
+    if len(boundary_pts) < 3:
+        return []
+
+    n_boundary = len(boundary_pts)
+    if len(interior_pts) > 0:
+        all_pts = np.vstack([boundary_pts, interior_pts])
+    else:
+        all_pts = boundary_pts
+
+    # 局部参数平面：使用所有点拟合，降低弯曲表面下的退化风险。
+    centroid = boundary_pts.mean(axis=0)
+    centered = all_pts - centroid
+    _, _, vh = np.linalg.svd(centered)
+    u = vh[0]
+    v = vh[1]
+
+    coords2d = np.column_stack([
+        centered @ u,
+        centered @ v,
+    ])
+    coords3d = np.column_stack([coords2d, np.zeros(len(coords2d))])
+
+    # 先只对源边界做 ear clipping，保证外边界正确。
+    boundary_idx = np.arange(n_boundary, dtype=np.int64).tolist()
+    triangles = _triangulate_hole_loop(coords3d, boundary_idx)
+    if not triangles:
+        return []
+
+    triangles = [tuple(int(x) for x in tri) for tri in triangles]
+
+    # 逐个插入内部点：定位当前包含它的三角形并一分为三。
+    for ip in range(n_boundary, len(all_pts)):
+        p2 = coords2d[ip]
+        found = None
+        for ti, tri in enumerate(triangles):
+            a, b, c = tri
+            if _point_in_triangle_2d(
+                p2,
+                coords2d[a],
+                coords2d[b],
+                coords2d[c],
+            ):
+                found = ti
+                break
+
+        if found is None:
+            continue
+
+        a, b, c = triangles[found]
+        triangles[found] = (a, b, ip)
+        triangles.append((b, c, ip))
+        triangles.append((c, a, ip))
+
+    return triangles
+
+
 def fill_holes_with_proxy(mesh,
                           proxy_mesh,
                           proxy_face_center_threshold=20,
@@ -1848,17 +2047,15 @@ def fill_holes_with_proxy(mesh,
                           patch_area_ratio_range=(0.25, 8.0),
                           verbose=False):
     """
-    使用代理网格支撑填补源网格上的孔洞（拉链缝合版）。
+    使用代理网格支撑填补源网格上的孔洞（拓扑分界 + 重新三角化版）。
 
     策略：
     1. 异常小孔洞先通过 weld_small_holes 焊接。
-    2. 所有边界环顶点一次性批量投影到代理网格。
-    3. 小孔（边数 < min_proxy_loop_edges，或投影多边形内代理面片中心数
-       < proxy_face_center_threshold）：平面三角化填补。
-    4. 大孔：裁剪代理补丁（要求拓扑圆盘、面积比合法），经弧长重采样
-       对齐边界后用三角形条带（拉链）缝合到源边界。
+    2. 所有边界环顶点一次性批量投影到代理网格，得到投影点与三角形索引。
+    3. 根据投影三角形构造代理网格上的拓扑分界线，从内部种子泛洪
+       得到内部面片/内部顶点。
+    4. 对“源孔洞边界顶点 + 内部代理顶点”进行带约束的重新三角化。
     5. 收尾：残存小孔再次焊接 + fill_holes_adaptive，法线修复。
-       不重复调用代理补丁。
 
     Parameters
     ----------
@@ -1868,9 +2065,9 @@ def fill_holes_with_proxy(mesh,
         默认 20。
     max_projection_distance : float or None
     min_proxy_loop_edges : int
-        使用代理补丁的最小边界边数，默认 12。
+        使用代理支撑的最小边界边数，默认 12。
     patch_area_ratio_range : (float, float)
-        补丁面积 / 源孔面积 的合法区间，默认 (0.25, 8.0)。
+        保留兼容参数，不再用于裁剪补丁。
     verbose : bool
     """
     import time
@@ -1887,29 +2084,24 @@ def fill_holes_with_proxy(mesh,
 
     have_proxy = proxy_mesh is not None and len(proxy_mesh.faces) > 0
 
-    center_tree = None
-    proxy_centers = None
     proj_map = None
     if have_proxy:
-        from scipy.spatial import cKDTree
-        proxy_centers = np.asarray(proxy_mesh.triangles_center,
-                                   dtype=np.float64)
-        center_tree = cKDTree(proxy_centers)
-
-        # 批量投影：所有环顶点一次查询
+        # 批量投影：一次得到代理表面最近点、距离以及所在三角形索引。
         try:
             all_verts = np.unique(np.concatenate(
                 [np.asarray(l, dtype=np.int64) for l in loops]))
             all_points = welded.vertices[all_verts]
-            try:
-                from trimesh.proximity import ProximityQuery
-                prox = ProximityQuery(proxy_mesh)
-                proj_points, proj_dist, _ = prox.on_surface(all_points)
-            except Exception:
-                proj_points, proj_dist, _ = project_vertices_to_shell(
-                    all_points, proxy_mesh)
-            proj_map = {int(v): (proj_points[i], float(proj_dist[i]))
-                        for i, v in enumerate(all_verts)}
+            proj_points, proj_dist, proj_tri = project_vertices_to_shell(
+                all_points, proxy_mesh
+            )
+            proj_map = {
+                int(v): (
+                    proj_points[i],
+                    float(proj_dist[i]),
+                    int(proj_tri[i]),
+                )
+                for i, v in enumerate(all_verts)
+            }
         except Exception as e:
             if verbose:
                 print(f"  [proxy patch] batch projection failed: {e}")
@@ -1939,14 +2131,19 @@ def fill_holes_with_proxy(mesh,
         loop_verts = welded.vertices[np.asarray(loop)]
         hole_area = polygon_area_from_3d_ccw(loop_verts)
 
-        # 判断是否可用代理补丁
+        # 判断是否可用代理支撑
         use_proxy = False
-        inside_indices = None
+        inside_faces = None
+        inside_vertices = None
+
         if have_proxy and proj_map is not None and \
                 len(loop) >= min_proxy_loop_edges:
             try:
-                proj_pts = np.array([proj_map[v][0] for v in loop])
-                dists = np.array([proj_map[v][1] for v in loop])
+                proj_items = [proj_map[v] for v in loop]
+                proj_pts = np.array([item[0] for item in proj_items])
+                dists = np.array([item[1] for item in proj_items])
+                proj_tris = np.array([item[2] for item in proj_items],
+                                     dtype=np.int64)
             except KeyError:
                 proj_pts = None
 
@@ -1956,55 +2153,54 @@ def fill_holes_with_proxy(mesh,
                 proj_pts = None
 
             if proj_pts is not None:
-                center_count, inside_indices = \
-                    _count_proxy_face_centers_inside_projected_polygon(
-                        proj_pts, proxy_mesh,
-                        center_tree=center_tree,
-                        centers=proxy_centers,
+                inside_faces, inside_vertices = \
+                    _extract_proxy_interior_faces(
+                        proxy_mesh, proj_pts, proj_tris
                     )
+                proxy_inside_count = len(inside_faces)
+
                 if verbose:
                     print(f"    loop {loop_idx}: edges={len(loop)}, "
-                          f"proxy_center_count={center_count}")
-                if center_count >= proxy_face_center_threshold:
+                          f"proxy_inside_faces={proxy_inside_count}")
+
+                if proxy_inside_count >= proxy_face_center_threshold:
                     use_proxy = True
 
         stitched = False
         if use_proxy:
             if verbose:
-                print("      -> proxy patch fill (zipper)")
+                print("      -> proxy re-triangulation (topological interior)")
 
-            sel = np.zeros(len(proxy_mesh.faces), dtype=bool)
-            sel[inside_indices] = True
-            pf = np.asarray(proxy_mesh.faces, dtype=np.int64)[sel]
-            uv, inv = np.unique(pf.ravel(), return_inverse=True)
-            patch = trimesh.Trimesh(
-                vertices=proxy_mesh.vertices[uv],
-                faces=inv.reshape(-1, 3),
-                process=False,
+            inside_pts = proxy_mesh.vertices[inside_vertices]
+            source_pts = work_verts[np.asarray(loop, dtype=np.int64)]
+
+            local_tris = _triangulate_polygon_with_interior_points(
+                source_pts, inside_pts
             )
-            patch.remove_unreferenced_vertices()
 
-            # 合法性检查：保留最大分量、单一边界环、面积比合法
-            ok = len(patch.faces) > 0
-            if ok:
-                comps = patch.split(only_watertight=False)
-                if len(comps) > 1:
-                    patch = comps[int(np.argmax([c.area for c in comps]))]
-                if len(extract_boundary_loops(patch)) != 1:
-                    ok = False
-                else:
-                    ratio = patch.area / max(hole_area, 1e-12)
-                    if not (patch_area_ratio_range[0] <= ratio
-                            <= patch_area_ratio_range[1]):
-                        ok = False
-            if ok:
-                res = _stitch_patch_into_mesh(
-                    work_verts, work_faces, vert2faces, loop, patch)
-                if res is not None:
-                    work_verts, work_faces, vert2faces = res
-                    proxy_fill_count += 1
-                    stitched = True
-            if not stitched:
+            if local_tris:
+                n_source = len(source_pts)
+                interior_start = len(work_verts)
+                work_verts = np.vstack([work_verts, inside_pts])
+
+                for tri in local_tris:
+                    mapped = []
+                    for local_idx in tri:
+                        if local_idx < n_source:
+                            mapped.append(int(loop[local_idx]))
+                        else:
+                            mapped.append(
+                                int(interior_start + (local_idx - n_source))
+                            )
+                    nf = tuple(mapped)
+                    nfi = len(work_faces)
+                    work_faces.append(nf)
+                    for v in nf:
+                        vert2faces.setdefault(v, set()).add(nfi)
+
+                proxy_fill_count += 1
+                stitched = True
+            else:
                 fallback_plane_count += 1
 
         if not stitched:
@@ -2022,7 +2218,7 @@ def fill_holes_with_proxy(mesh,
             print(f"    [loop {loop_idx}] total time: "
                   f"{time.time() - loop_t0:.4f}s")
 
-    # 2. 组装最终网格（不 merge_vertices：拉链接缝是拓扑对齐的）
+    # 2. 组装最终网格（不 merge_vertices：重新三角化后的面片共享边界）
     final_faces = [f for f in work_faces if f is not None]
     merged = trimesh.Trimesh(
         vertices=work_verts,
@@ -2269,7 +2465,7 @@ def fuse_reliable_faces_with_shell(
     流程：
     1. 提取可靠面片子网格；
     2. 破坏性清理前置（非流形边删除、短开放链删除），先于填补执行；
-    3. 单次代理支撑填补（拉链缝合），不再二次调用；
+    3. 单次代理支撑填补（拓扑分界 + 重新三角化），不再二次调用；
     4. 可选接缝平滑（向量化拉普拉斯，固定可靠子网格顶点）；
     5. 法线修复与孤立小组件移除；最终只报告缺陷，不再删面。
     """
@@ -2314,7 +2510,7 @@ def fuse_reliable_faces_with_shell(
     reliable_mesh.remove_unreferenced_vertices()
     reliable_mesh = repair_mesh_by_removing_duplicates(reliable_mesh)
 
-    # 4. 单次代理支撑填补（拉链缝合）
+    # 4. 单次代理支撑填补（拓扑分界 + 重新三角化）
     fused_mesh = fill_holes_with_proxy(
         reliable_mesh,
         proxy_mesh=shell_mesh,
