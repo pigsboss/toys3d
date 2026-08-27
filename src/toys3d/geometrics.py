@@ -246,6 +246,12 @@ def project_vertices_to_shell(points, mesh):
 
 
 def weld_small_holes(mesh, threshold=None, quantile=5.0, min_edges=3, verbose=False):
+    """
+    焊接面积小于阈值的小孔洞。
+
+    通过一次性构建“旧顶点 -> 新顶点”查表，并用 NumPy 向量化替换面片索引，
+    避免对每个小孔洞都全量扫描百万级面片。
+    """
     m = mesh.copy()
     loops = extract_boundary_loops(m)
     if not loops:
@@ -265,24 +271,45 @@ def weld_small_holes(mesh, threshold=None, quantile=5.0, min_edges=3, verbose=Fa
         print(f"  weld threshold: {threshold:.6f}")
         print(f"  welding {len(weld_loops)} small holes")
 
+    # 1. 为每个待焊接环创建一个质心新顶点，并记录旧顶点映射
+    old_to_new = {}
+    extra_vertices = list(m.vertices)
+
     for loop in weld_loops:
         ids = np.asarray(loop, dtype=np.int64)
         centroid = np.mean(m.vertices[ids], axis=0)
-        new_idx = len(m.vertices)
-        m.vertices = np.vstack([m.vertices, centroid])
-        replace_map = {int(v): new_idx for v in ids}
-        faces = np.asarray(m.faces, dtype=np.int64)
-        new_faces = []
-        for face in faces:
-            nf = [replace_map.get(int(v), int(v)) for v in face]
-            if len(set(nf)) >= 3:
-                new_faces.append(nf)
-        m = trimesh.Trimesh(vertices=m.vertices,
-                            faces=np.asarray(new_faces, dtype=np.int64),
-                            process=False)
-        m.remove_unreferenced_vertices()
-        m.merge_vertices()
-    return repair_mesh_by_removing_duplicates(m)
+
+        new_idx = len(extra_vertices)
+        extra_vertices.append(centroid)
+
+        for v in ids:
+            old_to_new[int(v)] = new_idx
+
+    # 2. 构建旧顶点索引到新顶点索引的查询表
+    n_old = len(m.vertices)
+    lookup = np.arange(n_old, dtype=np.int64)
+    for old_v, new_v in old_to_new.items():
+        lookup[old_v] = new_v
+
+    # 3. 新顶点数组
+    new_vertices = np.asarray(extra_vertices, dtype=np.float64)
+
+    # 4. 向量化替换所有面片的顶点索引
+    faces = np.asarray(m.faces, dtype=np.int64)
+    flat_faces = faces.ravel()
+    new_flat = lookup[flat_faces]
+    new_faces = new_flat.reshape(-1, 3)
+
+    # 5. 删除替换后产生的退化面片
+    valid = ~((new_faces[:, 0] == new_faces[:, 1]) |
+              (new_faces[:, 1] == new_faces[:, 2]) |
+              (new_faces[:, 2] == new_faces[:, 0]))
+    new_faces = new_faces[valid]
+
+    m2 = trimesh.Trimesh(vertices=new_vertices, faces=new_faces, process=False)
+    m2.remove_unreferenced_vertices()
+    m2.merge_vertices()   # 合并重复质心顶点
+    return repair_mesh_by_removing_duplicates(m2)
 
 
 def repair_nonmanifold_edges(mesh, max_iterations=10, verbose=False):
