@@ -414,29 +414,42 @@ def repair_normals(mesh, verbose=False):
 
 
 def remove_small_open_edge_chains(mesh, max_chain_edges=2, verbose=False):
+    """
+    删除短开放边链（伪孔洞）。
+
+    先一次性构建无向边到面片索引，避免对每个短环都全量扫描面片。
+    """
     m = mesh.copy()
     loops = extract_boundary_loops(m)
+    if not loops:
+        return m
+
+    # 1. 建立边 -> 面片索引，只遍历一次面片
+    edge_to_faces = {}
+    for fid, face in enumerate(m.faces):
+        for i in range(3):
+            e0 = int(face[i])
+            e1 = int(face[(i + 1) % 3])
+            key = (e0, e1) if e0 < e1 else (e1, e0)
+            edge_to_faces.setdefault(key, []).append(fid)
+
+    # 2. 根据短环边直接查找相邻面片
     faces_to_remove = set()
     for loop in loops:
         if len(loop) <= max_chain_edges + 1:
-            loop_edges = set()
             for i in range(len(loop)):
-                e0 = loop[i]
-                e1 = loop[(i + 1) % len(loop)]
-                loop_edges.add(tuple(sorted((int(e0), int(e1)))))
-            for fid, face in enumerate(m.faces):
-                face_edges = set()
-                for i in range(3):
-                    e0 = int(face[i])
-                    e1 = int(face[(i + 1) % 3])
-                    face_edges.add(tuple(sorted((e0, e1))))
-                if face_edges & loop_edges:
-                    faces_to_remove.add(fid)
+                e0 = int(loop[i])
+                e1 = int(loop[(i + 1) % len(loop)])
+                key = (e0, e1) if e0 < e1 else (e1, e0)
+                faces_to_remove.update(edge_to_faces.get(key, []))
+
+    # 3. 删除这些面片
     if faces_to_remove:
         mask = np.ones(len(m.faces), dtype=bool)
         mask[list(faces_to_remove)] = False
         m.update_faces(mask)
         m.remove_unreferenced_vertices()
+
     return m
 
 
