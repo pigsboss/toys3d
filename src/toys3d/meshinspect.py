@@ -1022,7 +1022,7 @@ def main():
     if args.proxy_color is not None:
         args.proxy_color = _parse_color_string_flexible(args.proxy_color)
 
-    print(f"Loading: {args.input_file}")
+    print(f"Hey! Loading {args.input_file}")
     mesh = trimesh.load(args.input_file, force="mesh")
     if not isinstance(mesh, trimesh.Trimesh):
         mesh = mesh.dump(concatenate=True)

@@ -351,7 +351,7 @@ def main():
         print("[WARNING] --g2 is reserved but not yet implemented; "
               "will raise NotImplementedError if a surface-fit hole is encountered.")
 
-    print(f"Loading: {args.input_file}")
+    print(f"Hey! Loading {args.input_file}")
     mesh = trimesh.load(args.input_file, force="mesh")
     if not isinstance(mesh, trimesh.Trimesh):
         mesh = mesh.dump(concatenate=True)
@@ -388,7 +388,7 @@ def main():
             print("[Pre-clean] weld done")
 
     if args.proxy_shell:
-        print(f"Loading shell: {args.proxy_shell}")
+        print(f"Hey! Loading shell: {args.proxy_shell}")
         shell_mesh = trimesh.load(args.proxy_shell, force="mesh")
         if not isinstance(shell_mesh, trimesh.Trimesh):
             shell_mesh = shell_mesh.dump(concatenate=True)
