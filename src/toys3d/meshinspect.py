@@ -679,7 +679,14 @@ def inspect_mesh(mesh, args):
         )
 
     stats = compute_mesh_stats(mesh)
-    defect_stats, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+    (
+        defect_stats,
+        open_face_mask,
+        nonmanifold_face_mask,
+        open_edge_per_face,
+        manifold_edge_per_face,
+        nonmanifold_edge_per_face,
+    ) = analyze_mesh_defects(mesh, return_face_edge_counts=True)
     area_stats = compute_face_area_stats(mesh)
     bbox_stats = compute_bounding_box_stats(mesh)
     volume = compute_volume_if_closed(mesh)
@@ -724,6 +731,43 @@ def inspect_mesh(mesh, args):
     print(f"  open-only faces:                 {open_only_mask.sum()}")
     print(f"  nonmanifold-only faces:          {nonmanifold_only_mask.sum()}")
     print(f"  both open & nonmanifold faces:   {both_mask.sum()}")
+
+    print_separator("Open Face Diagnostics")
+
+    open_face_areas = mesh.area_faces[open_face_mask]
+    if len(open_face_areas) == 0:
+        print("  no open faces")
+    else:
+        print(f"  open face count: {len(open_face_areas)}")
+
+        print("  face area percentiles:")
+        for p in [1, 5, 10, 25, 50, 75, 90, 95, 99]:
+            print(f"    p{p}: {np.percentile(open_face_areas, p):.6f}")
+        print(f"    mean: {open_face_areas.mean():.6f}")
+        print(f"    min:  {open_face_areas.min():.6f}")
+        print(f"    max:  {open_face_areas.max():.6f}")
+
+        # 开放边数量分布（每个开放面片有几条边是开放边）
+        open_edge_hist = np.bincount(open_edge_per_face[open_face_mask])
+        print("  open-edge count per open face:")
+        for k, cnt in enumerate(open_edge_hist):
+            if cnt > 0:
+                print(f"    {k} open edge(s): {cnt} faces")
+
+        # 流形边数量分布
+        manifold_edge_hist = np.bincount(manifold_edge_per_face[open_face_mask])
+        print("  manifold-edge count per open face:")
+        for k, cnt in enumerate(manifold_edge_hist):
+            if cnt > 0:
+                print(f"    {k} manifold edge(s): {cnt} faces")
+
+        # 非流形边数量分布
+        nonmanifold_edge_hist = np.bincount(nonmanifold_edge_per_face[open_face_mask])
+        if nonmanifold_edge_hist.size > 1:
+            print("  nonmanifold-edge count per open face:")
+            for k, cnt in enumerate(nonmanifold_edge_hist):
+                if cnt > 0:
+                    print(f"    {k} nonmanifold edge(s): {cnt} faces")
 
     print_separator("Topological Reliability Distribution")
     max_display = 5

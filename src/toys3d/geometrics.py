@@ -31,11 +31,22 @@ def compute_mesh_stats(mesh):
     return stats
 
 
-def analyze_mesh_defects(mesh):
+def analyze_mesh_defects(mesh, return_face_edge_counts=False):
     """
     分析网格缺陷，返回统计信息以及开放面片和非流形面片的布尔掩码。
+
+    如果 return_face_edge_counts=True，额外返回：
+        open_edge_per_face : 每个面片的开放边数
+        manifold_edge_per_face : 每个面片的流形边数
+        nonmanifold_edge_per_face : 每个面片的非流形边数
     """
-    # 1. 构建边 -> 相邻面片索引的映射
+    n_faces = len(mesh.faces)
+    if return_face_edge_counts:
+        open_edge_per_face = np.zeros(n_faces, dtype=np.uint8)
+        manifold_edge_per_face = np.zeros(n_faces, dtype=np.uint8)
+        nonmanifold_edge_per_face = np.zeros(n_faces, dtype=np.uint8)
+
+    # 构建边 -> 相邻面片索引的映射（原代码保持不变）
     edge_to_faces = {}
     faces = np.asarray(mesh.faces, dtype=np.int64)
 
@@ -46,7 +57,6 @@ def analyze_mesh_defects(mesh):
             ekey = (v0, v1) if v0 < v1 else (v1, v0)
             edge_to_faces.setdefault(ekey, []).append(fid)
 
-    # 2. 根据每条边相邻面片数量判断缺陷类型
     open_edges = set()
     nonmanifold_edges = set()
     open_faces = set()
@@ -54,15 +64,22 @@ def analyze_mesh_defects(mesh):
 
     for ekey, face_list in edge_to_faces.items():
         if len(face_list) == 1:
-            # 只属于一个面片的边 -> 开放边
             open_edges.add(ekey)
             open_faces.add(face_list[0])
-        elif len(face_list) >= 3:
-            # 共享超过两个面片的边 -> 非流形边
+            if return_face_edge_counts:
+                open_edge_per_face[face_list[0]] += 1
+        elif len(face_list) == 2:
+            # 流形边：正常共享边
+            if return_face_edge_counts:
+                manifold_edge_per_face[face_list[0]] += 1
+                manifold_edge_per_face[face_list[1]] += 1
+        else:
             nonmanifold_edges.add(ekey)
             nonmanifold_faces.update(face_list)
+            if return_face_edge_counts:
+                for f in face_list:
+                    nonmanifold_edge_per_face[f] += 1
 
-    # 3. 输出统计
     defect_stats = {
         'open_edges': len(open_edges),
         'nonmanifold_edges': len(nonmanifold_edges),
@@ -70,16 +87,23 @@ def analyze_mesh_defects(mesh):
         'nonmanifold_faces': len(nonmanifold_faces),
     }
 
-    # 4. 生成面片布尔掩码
-    open_face_mask = np.zeros(len(mesh.faces), dtype=bool)
-    nonmanifold_face_mask = np.zeros(len(mesh.faces), dtype=bool)
+    open_face_mask = np.zeros(n_faces, dtype=bool)
+    nonmanifold_face_mask = np.zeros(n_faces, dtype=bool)
 
     for f in open_faces:
         open_face_mask[f] = True
-
     for f in nonmanifold_faces:
         nonmanifold_face_mask[f] = True
 
+    if return_face_edge_counts:
+        return (
+            defect_stats,
+            open_face_mask,
+            nonmanifold_face_mask,
+            open_edge_per_face,
+            manifold_edge_per_face,
+            nonmanifold_edge_per_face,
+        )
     return defect_stats, open_face_mask, nonmanifold_face_mask
 
 
