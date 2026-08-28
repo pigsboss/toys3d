@@ -24,7 +24,6 @@ from toys3d.geometrics import (
     compute_hole_area_stats,
     extract_boundary_loops,
     polygon_area_from_3d_ccw,
-    compute_reliable_face_mask,
     compute_topological_reliable_face_mask,
     repair_mesh_by_removing_duplicates,
     project_vertices_to_shell,

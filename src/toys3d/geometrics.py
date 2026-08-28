@@ -257,16 +257,7 @@ def compute_topological_reliable_face_mask(mesh, min_distance=2):
     return reliable_mask, dist
 
 
-def compute_reliable_face_mask(mesh, min_distance=2):
-    """
-    兼容旧接口：返回基于拓扑距离的 0~1 权重。
-    """
-    _, distances = compute_topological_reliable_face_mask(mesh, min_distance)
-    weight = np.clip(distances / max(min_distance, 1), 0.0, 1.0)
-    return weight
-
-
-def repair_mesh_by_removing_duplicates(mesh, verbose=False):
+def repair_mesh_by_removing_duplicates(mesh):
     m = mesh.copy()
     m.merge_vertices()
     m.remove_unreferenced_vertices()
@@ -356,7 +347,7 @@ def weld_small_holes(mesh, threshold=None, quantile=5.0, min_edges=3, verbose=Fa
     return repair_mesh_by_removing_duplicates(m2)
 
 
-def repair_nonmanifold_edges(mesh, max_iterations=10, verbose=False):
+def repair_nonmanifold_edges(mesh, max_iterations=10):
     m = mesh.copy()
     for _ in range(max_iterations):
         _, _, nonmanifold_face_mask = analyze_mesh_defects(m)
@@ -537,18 +528,7 @@ def fill_small_boundary_loops(mesh, max_edges=5, max_flatness=0.50,
     return repair_mesh_by_removing_duplicates(result)
 
 
-def fill_holes_adaptive(mesh, verbose=False):
-    m = mesh.copy()
-    if m.is_watertight or len(m.faces) == 0:
-        return m
-    try:
-        m.fill_holes()
-    except Exception:
-        pass
-    return repair_mesh_by_removing_duplicates(m)
-
-
-def remove_small_open_edge_chains(mesh, max_chain_edges=2, verbose=False):
+def remove_small_open_edge_chains(mesh, max_chain_edges=2):
     """
     删除短开放边链（伪孔洞）。
 
@@ -592,7 +572,7 @@ def remove_pseudo_holes(mesh, max_chain_edges=2, max_iterations=5, verbose=False
     m = mesh.copy()
     for it in range(max_iterations):
         before = len(extract_boundary_loops(m))
-        m = remove_small_open_edge_chains(m, max_chain_edges, verbose)
+        m = remove_small_open_edge_chains(m, max_chain_edges)
         after = len(extract_boundary_loops(m))
         if after == before:
             break
@@ -814,7 +794,6 @@ def _triangulate_polygon_with_interior_points(boundary_pts, interior_pts):
 
 
 def fill_holes_with_proxy(mesh, proxy_mesh,
-                          mask_threshold=0.75,
                           proxy_face_center_threshold=20,
                           max_projection_distance=None,
                           min_proxy_loop_edges=12,
@@ -842,7 +821,7 @@ def fill_holes_with_proxy(mesh, proxy_mesh,
     except Exception as e:
         if verbose:
             print(f"  [proxy patch] batch projection failed: {e}")
-        return fill_holes_adaptive(welded)
+        return repair_mesh_by_removing_duplicates(welded)
 
     if verbose:
         print(f"  [proxy patch] processing {len(loops)} boundary loops")
@@ -936,7 +915,12 @@ def fill_holes_with_proxy(mesh, proxy_mesh,
     merged = weld_small_holes(merged, quantile=5.0, min_edges=3, verbose=verbose)
 
     if extract_boundary_loops(merged):
-        merged = fill_holes_adaptive(merged, verbose=verbose)
+        # 最后尝试简单填充遗留的小孔洞，若产生新缺陷则交由后续去重处理
+        try:
+            merged.fill_holes()
+        except Exception:
+            pass
+        merged = repair_mesh_by_removing_duplicates(merged)
 
     merged.fix_normals()
     return merged

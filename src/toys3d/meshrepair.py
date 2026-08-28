@@ -16,7 +16,6 @@ from toys3d.geometrics import (
     analyze_mesh_defects,
     repair_mesh_by_removing_duplicates,
     repair_nonmanifold_edges,
-    fill_holes_adaptive,
     fill_small_boundary_loops,
     fill_holes_with_proxy,
     extract_boundary_loops,
@@ -140,25 +139,19 @@ def repair_mesh_iterative(mesh,
             defects, _, _ = analyze_mesh_defects(repaired)
             if defects['nonmanifold_edges'] > 0:
                 repaired = repair_nonmanifold_edges(
-                    repaired, max_iterations=10, verbose=False
+                    repaired, max_iterations=10
                 )
 
-        # 3. 封闭小开放边界环
+        # 3. 只填充小型和平坦的边界环，避免暴力填充导致拓扑恶化
         if fill_holes:
             defects, _, _ = analyze_mesh_defects(repaired)
             if defects['open_edges'] > 0:
-                repaired = remove_small_open_edge_chains(
+                repaired = fill_small_boundary_loops(
                     repaired,
-                    max_chain_edges=2,
+                    max_edges=5,
+                    max_flatness=0.5,
                     verbose=verbose,
                 )
-
-                if verbose:
-                    print("  Boundary loops before filling:")
-                    loops = extract_boundary_loops(repaired)
-                    print_boundary_loop_stats(loops, repaired)
-
-                repaired = fill_holes_adaptive(repaired, verbose=verbose)
 
         # 重新统计
         defect_stats, _, _ = analyze_mesh_defects(repaired)
@@ -235,12 +228,6 @@ def main():
     parser.add_argument("--proxy-min-loop-edges", type=int, default=12,
                         help="使用代理补丁的最小边界边数，"
                              "小于此值一律平面修补（默认 12）")
-    parser.add_argument("--proxy-smooth-iterations", type=int, default=3,
-                        help="可靠子网格与补丁接缝平滑迭代次数（默认 3）")
-    parser.add_argument("--proxy-smooth-alpha", type=float, default=0.5,
-                        help="可靠子网格与补丁接缝平滑步长（默认 0.5）")
-    parser.add_argument("--proxy-no-smooth", action="store_true",
-                        help="关闭可靠子网格与补丁接缝平滑")
     parser.add_argument("--prefill-small-holes", action="store_true",
                         help="在代理壳修补前，先填充边数较少的小孔洞")
     parser.add_argument("--prefill-max-edges", type=int, default=6,
