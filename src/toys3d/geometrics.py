@@ -420,6 +420,93 @@ def _triangulate_hole_loop(coords3d, boundary_indices):
     return triangles
 
 
+def fill_small_boundary_loops(mesh, max_edges=5, max_flatness=0.50,
+                              min_area=1e-8, verbose=False):
+    """
+    仅修补边数不超过 max_edges，且满足平坦度条件的单纯小孔洞。
+
+    该函数用于代理壳修补前的基础清理，可大量减少可靠面片或原始网格中
+    由删除退化面片产生的小开放边界环。
+
+    大孔洞保持不变，交由后续 fill_holes_with_proxy 处理。
+    """
+    m = mesh.copy()
+    loops = extract_boundary_loops(m)
+    if not loops:
+        return m
+
+    small_loops = []
+    for loop in loops:
+        if len(loop) > max_edges:
+            continue
+
+        pts = m.vertices[np.asarray(loop, dtype=np.int64)]
+        area = polygon_area_from_3d_ccw(pts)
+        if area < min_area:
+            continue
+
+        flatness, _ = compute_loop_flatness(m, loop)
+        if flatness > max_flatness:
+            continue
+
+        small_loops.append(loop)
+
+    if not small_loops:
+        return m
+
+    if verbose:
+        print(f"  [fill_small_boundary_loops] "
+              f"filling {len(small_loops)} small loops "
+              f"(<= {max_edges} edges)")
+
+    vertices = m.vertices.copy()
+    faces = [tuple(int(x) for x in face) for face in m.faces]
+
+    for loop in small_loops:
+        loop = [int(v) for v in loop]
+        pts = vertices[np.asarray(loop, dtype=np.int64)]
+
+        # 计算有符号面积向量，以确定边界方向。
+        area_vec = 0.5 * np.sum(np.cross(pts, np.roll(pts, -1, axis=0)), axis=0)
+        normal = np.cross(pts[1] - pts[0], pts[2] - pts[0])
+        signed_area = float(np.dot(area_vec, normal))
+
+        if signed_area >= 0.0:
+            pts_ordered = pts
+            loop_ordered = loop
+        else:
+            pts_ordered = pts[::-1]
+            loop_ordered = loop[::-1]
+
+        try:
+            local_tris = _triangulate_hole_loop(
+                pts_ordered,
+                np.arange(len(pts_ordered), dtype=np.int64),
+            )
+            if not local_tris:
+                continue
+
+            for tri in local_tris:
+                face = (
+                    loop_ordered[tri[0]],
+                    loop_ordered[tri[1]],
+                    loop_ordered[tri[2]],
+                )
+                faces.append(face)
+        except Exception:
+            continue
+
+    result = trimesh.Trimesh(
+        vertices=vertices,
+        faces=np.asarray(faces, dtype=np.int64).reshape(-1, 3),
+        process=False,
+    )
+
+    result.remove_unreferenced_vertices()
+    result.merge_vertices()
+    return repair_mesh_by_removing_duplicates(result)
+
+
 def fill_holes_adaptive(mesh,
                         strategy='flatness',
                         max_fan_edges=15,

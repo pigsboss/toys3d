@@ -17,6 +17,8 @@ from toys3d.geometrics import (
     repair_mesh_by_removing_duplicates,
     repair_nonmanifold_edges,
     fill_holes_adaptive,
+    fill_small_boundary_loops,
+    fill_holes_with_proxy,
     extract_boundary_loops,
     compute_loop_flatness,
     polygon_area_from_3d_ccw,
@@ -318,6 +320,12 @@ def main():
                         help="可靠子网格与补丁接缝平滑步长（默认 0.5）")
     parser.add_argument("--proxy-no-smooth", action="store_true",
                         help="关闭可靠子网格与补丁接缝平滑")
+    parser.add_argument("--prefill-small-holes", action="store_true",
+                        help="在代理壳修补前，先填充边数较少的小孔洞")
+    parser.add_argument("--prefill-max-edges", type=int, default=6,
+                        help="预填充小孔洞的最大边界边数（默认 6）")
+    parser.add_argument("--prefill-max-flatness", type=float, default=0.50,
+                        help="预填充小孔洞的最大边界平坦度（默认 0.50）")
 
     parser.add_argument("--watertight", action="store_true",
                         help="使用体素化 + Marching Cubes 重建水密外壳")
@@ -394,16 +402,28 @@ def main():
             shell_mesh = shell_mesh.dump(concatenate=True)
             print("Multiple shell meshes detected, merged.")
 
-        repaired = fuse_reliable_faces_with_shell(
-            mesh,
+        # 备份预清理后的输入网格，方便日志对比
+        pre_proxy_mesh = mesh.copy()
+
+        if args.prefill_small_holes:
+            if args.verbose:
+                print("\n[Pre-proxy] filling small boundary loops...")
+            pre_proxy_mesh = fill_small_boundary_loops(
+                pre_proxy_mesh,
+                max_edges=args.prefill_max_edges,
+                max_flatness=args.prefill_max_flatness,
+                verbose=args.verbose,
+            )
+            if args.verbose:
+                print("[Pre-proxy] small hole fill done")
+
+        # 直接对原输入网格执行代理壳修补，不再做可靠面片提取
+        repaired = fill_holes_with_proxy(
+            pre_proxy_mesh,
             shell_mesh,
-            mask_threshold=0.75,
             proxy_face_center_threshold=args.proxy_face_center_threshold,
             max_projection_distance=args.proxy_max_projection_distance,
             min_proxy_loop_edges=args.proxy_min_loop_edges,
-            smooth_transition=not args.proxy_no_smooth,
-            smooth_iterations=args.proxy_smooth_iterations,
-            smooth_alpha=args.proxy_smooth_alpha,
             verbose=args.verbose,
         )
     else:
