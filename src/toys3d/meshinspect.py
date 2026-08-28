@@ -25,6 +25,7 @@ from toys3d.geometrics import (
     extract_boundary_loops,
     polygon_area_from_3d_ccw,
     compute_reliable_face_mask,
+    compute_topological_reliable_face_mask,
     repair_mesh_by_removing_duplicates,
     project_vertices_to_shell,
     weld_small_holes,
@@ -118,21 +119,21 @@ def build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask):
     return vis
 
 
-def build_reliable_visualization(mesh, weights):
+def build_reliable_visualization(mesh, distances, min_distance):
     """
-    根据可靠性权重生成可视化网格。
-    - 绿色：可靠（权重 > 0.75）
-    - 黄色：中间状态（0.25 < 权重 <= 0.75）
-    - 红色：不可靠（权重 <= 0.25）
+    根据拓扑距离生成可视化网格。
+    - 绿色：可靠（距离 >= min_distance）
+    - 黄色：中间状态（0 < 距离 < min_distance）
+    - 红色：缺陷面（距离 == 0）
     """
     vis = mesh.copy()
     N = len(vis.faces)
 
-    colors = np.full((N, 4), [255, 0, 0, 255], dtype=np.uint8)  # 默认红
-    reliable = weights > 0.75
-    intermediate = (~reliable) & (weights > 0.25)
-    colors[reliable] = [0, 200, 0, 255]       # 绿
-    colors[intermediate] = [255, 220, 0, 255] # 黄
+    colors = np.full((N, 4), [255, 0, 0, 255], dtype=np.uint8)  # 默认红（缺陷面）
+    intermediate = (distances > 0) & (distances < min_distance)
+    reliable = distances >= min_distance
+    colors[intermediate] = [255, 220, 0, 255]  # 黄
+    colors[reliable] = [0, 200, 0, 255]        # 绿
 
     vis.visual.face_colors = colors
     return vis
@@ -722,11 +723,12 @@ def inspect_mesh(mesh, args):
 
         if args.keep_reliable_only:
             print_separator("Reliable-Only Extracted Mesh")
-            print(f"  threshold: {args.reliable_threshold}")
+            print(f"  min_distance: {args.reliable_distance}")
 
-            # 计算可靠面片掩码
-            weights = compute_reliable_face_mask(mesh)
-            reliable_mask = weights > args.reliable_threshold
+            # 计算拓扑可靠面片掩码
+            reliable_mask, _ = compute_topological_reliable_face_mask(
+                mesh, min_distance=args.reliable_distance
+            )
             reliable_count = int(reliable_mask.sum())
             print(f"  reliable faces: {reliable_count}/{len(mesh.faces)}")
 
@@ -821,13 +823,16 @@ def inspect_mesh(mesh, args):
             return scene
 
         if args.highlight_reliable:
-            print_separator("Reliable Neighborhood Visualization")
-            print("  green:  reliable faces")
-            print("  yellow: defect neighborhood (intermediate)")
-            print("  red:    unreliable faces")
+            print_separator("Topological Reliable Visualization")
+            print(f"  min_distance: {args.reliable_distance}")
+            print("  green:  reliable faces (distance >= min_distance)")
+            print("  yellow: intermediate faces (0 < distance < min_distance)")
+            print("  red:    defect faces (distance = 0)")
 
-            weights = compute_reliable_face_mask(mesh)
-            vis = build_reliable_visualization(mesh, weights)
+            _, distances = compute_topological_reliable_face_mask(
+                mesh, min_distance=args.reliable_distance
+            )
+            vis = build_reliable_visualization(mesh, distances, args.reliable_distance)
         else:
             print_separator("Defect Visualization")
             print("  gray:    normal faces")
@@ -942,9 +947,12 @@ def main():
     parser.add_argument("--keep-reliable-only", action="store_true",
                         help="只保留可靠面片，删除其余面片。"
                              "需配合 --output 或 --show 使用。")
-    parser.add_argument("--reliable-threshold", type=float, default=0.75,
-                        help="可靠面片权重阈值，默认 0.75。"
-                             "仅当 --keep-reliable-only 时生效。")
+    parser.add_argument("--reliable-threshold", type=float, default=None,
+                        help="[已废弃] 请使用 --reliable-distance。"
+                             "该参数不再生效，仅保留兼容。")
+    parser.add_argument("--reliable-distance", type=int, default=2,
+                        help="可靠面片距离开放/非流形面的最小拓扑距离"
+                             "（面邻接跳数），默认 2。")
     parser.add_argument("--hole-radius", type=float, default=None,
                         help="孔洞边界圆柱半径（默认自动计算，通常比普通线框略粗）")
     parser.add_argument("--double-sided", dest='double_sided',
@@ -1013,6 +1021,10 @@ def main():
         return
 
     args = parser.parse_args()
+
+    if args.reliable_threshold is not None:
+        print("[WARNING] --reliable-threshold is deprecated and ignored. "
+              "Use --reliable-distance instead.")
 
     args.wireframe_color = _parse_color_string(args.wireframe_color)
 

@@ -204,36 +204,66 @@ def polygon_area_from_3d_ccw(points):
     return float(abs(total) / (2.0 * norm))
 
 
-def compute_reliable_face_mask(mesh, threshold_angle=30.0):
-    N = len(mesh.faces)
-    if N == 0:
-        return np.array([], dtype=float)
+def compute_topological_reliable_face_mask(mesh, min_distance=2):
+    """
+    计算基于拓扑距离的可靠面片掩码。
 
-    edge_lengths = mesh.edges_unique_length
-    med_len = np.median(edge_lengths) if len(edge_lengths) > 0 else 1.0
+    可靠面片 = 面片本身是流形面，且沿面邻接图到最近缺陷面
+    （开放面或非流形面）的距离 >= min_distance。
 
-    faces = np.asarray(mesh.faces, dtype=np.int64)
-    v0 = mesh.vertices[faces[:, 0]]
-    v1 = mesh.vertices[faces[:, 1]]
-    v2 = mesh.vertices[faces[:, 2]]
-    e01 = np.linalg.norm(v1 - v0, axis=1)
-    e12 = np.linalg.norm(v2 - v1, axis=1)
-    e20 = np.linalg.norm(v0 - v2, axis=1)
-    avg_len = (e01 + e12 + e20) / 3.0
+    返回:
+        reliable_mask : bool array
+        distances     : int array, 每个面片到最近缺陷面的拓扑距离
+    """
+    n_faces = len(mesh.faces)
+    if n_faces == 0:
+        return np.zeros(0, dtype=bool), np.zeros(0, dtype=int)
 
-    len_weight = np.clip(1.0 - np.abs(avg_len - med_len) / (med_len + 1e-9), 0.0, 1.0)
+    _, open_mask, nonmanifold_mask = analyze_mesh_defects(mesh)
+    defect_mask = open_mask | nonmanifold_mask
 
-    face_normals = np.asarray(mesh.face_normals, dtype=np.float64)
-    normal_weight = np.ones(N)
-    if len(mesh.face_adjacency) > 0:
-        for i in range(len(mesh.face_adjacency)):
-            f0, f1 = mesh.face_adjacency[i]
-            cosang = np.dot(face_normals[f0], face_normals[f1])
-            normal_weight[f0] = min(normal_weight[f0], max(0.0, cosang))
-            normal_weight[f1] = min(normal_weight[f1], max(0.0, cosang))
+    if not np.any(defect_mask):
+        return np.ones(n_faces, dtype=bool), np.full(n_faces, min_distance + 1, dtype=int)
 
-    weight = 0.6 * len_weight + 0.4 * normal_weight
-    return np.clip(weight, 0.0, 1.0)
+    # 构建面邻接表
+    adjacency = [[] for _ in range(n_faces)]
+    face_adj = getattr(mesh, 'face_adjacency', None)
+    if face_adj is not None and len(face_adj) > 0:
+        for f0, f1 in face_adj:
+            f0, f1 = int(f0), int(f1)
+            if f0 < 0 or f1 < 0:
+                continue
+            adjacency[f0].append(f1)
+            adjacency[f1].append(f0)
+
+    # 多源 BFS
+    dist = np.full(n_faces, -1, dtype=int)
+    queue = deque()
+    for fid in np.where(defect_mask)[0]:
+        dist[fid] = 0
+        queue.append(int(fid))
+
+    while queue:
+        cur = queue.popleft()
+        for nb in adjacency[cur]:
+            if dist[nb] == -1:
+                dist[nb] = dist[cur] + 1
+                queue.append(nb)
+
+    # 未到达的孤立面（极少见）视为远离缺陷
+    dist[dist == -1] = min_distance + 1
+
+    reliable_mask = (~defect_mask) & (dist >= min_distance)
+    return reliable_mask, dist
+
+
+def compute_reliable_face_mask(mesh, min_distance=2):
+    """
+    兼容旧接口：返回基于拓扑距离的 0~1 权重。
+    """
+    _, distances = compute_topological_reliable_face_mask(mesh, min_distance)
+    weight = np.clip(distances / max(min_distance, 1), 0.0, 1.0)
+    return weight
 
 
 def repair_mesh_by_removing_duplicates(mesh, verbose=False):
@@ -941,7 +971,7 @@ def fill_holes_with_proxy(mesh, proxy_mesh,
 
 def fuse_reliable_faces_with_shell(mesh,
                                    shell_mesh,
-                                   mask_threshold=0.75,
+                                   min_distance=2,
                                    proxy_face_center_threshold=20,
                                    max_projection_distance=None,
                                    min_proxy_loop_edges=12,
@@ -950,8 +980,7 @@ def fuse_reliable_faces_with_shell(mesh,
                                    smooth_alpha=0.5,
                                    verbose=False):
     m = mesh.copy()
-    weights = compute_reliable_face_mask(m)
-    reliable_mask = weights > mask_threshold
+    reliable_mask, _ = compute_topological_reliable_face_mask(m, min_distance=min_distance)
     if reliable_mask.sum() == 0:
         return m
 
