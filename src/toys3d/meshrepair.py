@@ -179,7 +179,8 @@ def repair_mesh_iterative(mesh,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="迭代修复网格拓扑缺陷：开放边、非流形边、小孔洞。"
+        description="按需修复网格拓扑缺陷。默认不执行任何修复，仅导出输入网格副本；"
+                    "通过选项显式激活预清理或主修复模式。"
     )
     parser.add_argument("input_file", help="输入网格文件路径")
     parser.add_argument("-o", "--output", required=True,
@@ -241,6 +242,8 @@ def main():
 
     parser.add_argument("--watertight", action="store_true",
                         help="使用体素化 + Marching Cubes 重建水密外壳")
+    parser.add_argument("--iterative-repair", action="store_true",
+                        help="显式激活迭代修复流程（去重、非流形修复、小孔填充）")
     parser.add_argument("--watertight-resolution", type=int, default=256,
                         help="水密模式默认体素分辨率（默认 256）")
     parser.add_argument("--watertight-voxel-size", type=float, default=None,
@@ -268,22 +271,29 @@ def main():
         for k, v in compute_mesh_stats(mesh).items():
             print(f"  {k}: {v}")
 
+    # 默认不执行任何修复，仅复制输入网格
+    repaired = mesh.copy()
+    repair_activated = False
+
+    # --- 预清理步骤（按顺序执行，所有步骤可选） ---
     if args.trim_hanging_faces:
+        repair_activated = True
         if args.verbose:
             print("\n[Pre-clean] trimming hanging open faces...")
-            before, _, _ = analyze_mesh_defects(mesh)
+            before, _, _ = analyze_mesh_defects(repaired)
             print(f"  open_edges before trim: {before['open_edges']}")
-        mesh = trim_hanging_open_faces(mesh, verbose=args.verbose)
+        repaired = trim_hanging_open_faces(repaired, verbose=args.verbose)
         if args.verbose:
-            after, _, _ = analyze_mesh_defects(mesh)
+            after, _, _ = analyze_mesh_defects(repaired)
             print(f"  open_edges after trim:  {after['open_edges']}")
             print("[Pre-clean] trim done")
 
     if args.remove_pseudo_holes:
+        repair_activated = True
         if args.verbose:
             print("\n[Pre-clean] removing pseudo holes...")
-        mesh = remove_pseudo_holes(
-            mesh,
+        repaired = remove_pseudo_holes(
+            repaired,
             max_chain_edges=args.pseudo_hole_max_edges,
             max_iterations=args.pseudo_hole_iterations,
             verbose=args.verbose,
@@ -292,10 +302,11 @@ def main():
             print("[Pre-clean] done")
 
     if args.weld_small_holes:
+        repair_activated = True
         if args.verbose:
             print("\n[Pre-clean] welding small holes...")
-        mesh = weld_small_holes(
-            mesh,
+        repaired = weld_small_holes(
+            repaired,
             threshold=args.weld_hole_threshold,
             quantile=args.weld_hole_quantile,
             min_edges=args.weld_min_hole_edges,
@@ -304,63 +315,76 @@ def main():
         if args.verbose:
             print("[Pre-clean] weld done")
 
-    if args.proxy_shell:
+    if args.prefill_small_holes:
+        repair_activated = True
+        if args.verbose:
+            print("\n[Pre-proxy] filling small boundary loops...")
+        repaired = fill_small_boundary_loops(
+            repaired,
+            max_edges=args.prefill_max_edges,
+            max_flatness=args.prefill_max_flatness,
+            verbose=args.verbose,
+        )
+        if args.verbose:
+            print("[Pre-proxy] small hole fill done")
+
+    # --- 主修复模式（互斥） ---
+    modes = sum([args.proxy_shell is not None, args.watertight, args.iterative_repair])
+    if modes > 1:
+        print("[ERROR] --proxy-shell, --watertight, --iterative-repair are mutually exclusive.")
+        return 1
+
+    if args.proxy_shell is not None:
+        repair_activated = True
         print(f"Hey! Loading shell: {args.proxy_shell}")
         shell_mesh = trimesh.load(args.proxy_shell, force="mesh")
         if not isinstance(shell_mesh, trimesh.Trimesh):
             shell_mesh = shell_mesh.dump(concatenate=True)
             print("Multiple shell meshes detected, merged.")
-
-        # 备份预清理后的输入网格，方便日志对比
-        pre_proxy_mesh = mesh.copy()
-
-        if args.prefill_small_holes:
-            if args.verbose:
-                print("\n[Pre-proxy] filling small boundary loops...")
-            pre_proxy_mesh = fill_small_boundary_loops(
-                pre_proxy_mesh,
-                max_edges=args.prefill_max_edges,
-                max_flatness=args.prefill_max_flatness,
-                verbose=args.verbose,
-            )
-            if args.verbose:
-                print("[Pre-proxy] small hole fill done")
-
-        # 直接对原输入网格执行代理壳修补，不再做可靠面片提取
         repaired = fill_holes_with_proxy(
-            pre_proxy_mesh,
+            repaired,
             shell_mesh,
             proxy_face_center_threshold=args.proxy_face_center_threshold,
             max_projection_distance=args.proxy_max_projection_distance,
             min_proxy_loop_edges=args.proxy_min_loop_edges,
             verbose=args.verbose,
         )
-    else:
-        if args.watertight:
-            repaired = repair_to_watertight(
-                mesh,
-                resolution=args.watertight_resolution,
-                voxel_size=args.watertight_voxel_size,
-                project_to_input=args.watertight_project_to_input,
-                smooth_watertight=args.watertight_smooth,
-                smooth_iterations=args.watertight_smooth_iterations,
-            )
-        else:
-            repaired = repair_mesh_iterative(
-                mesh,
-                max_iterations=args.max_iterations,
-                remove_duplicate=not args.no_duplicate,
-                repair_nonmanifold=not args.no_nonmanifold,
-                fill_holes=not args.no_fill_holes,
-                normal_repair=not args.no_normal_repair,
-                verbose=args.verbose,
-            )
+    elif args.watertight:
+        repair_activated = True
+        repaired = repair_to_watertight(
+            repaired,
+            resolution=args.watertight_resolution,
+            voxel_size=args.watertight_voxel_size,
+            project_to_input=args.watertight_project_to_input,
+            smooth_watertight=args.watertight_smooth,
+            smooth_iterations=args.watertight_smooth_iterations,
+        )
+    elif args.iterative_repair:
+        repair_activated = True
+        repaired = repair_mesh_iterative(
+            repaired,
+            max_iterations=args.max_iterations,
+            remove_duplicate=not args.no_duplicate,
+            repair_nonmanifold=not args.no_nonmanifold,
+            fill_holes=not args.no_fill_holes,
+            normal_repair=not args.no_normal_repair,
+            verbose=args.verbose,
+        )
 
-    defects, _, _ = analyze_mesh_defects(repaired)
-    if defects['open_edges'] > 0 or defects['nonmanifold_edges'] > 0:
-        print(f"\n[WARNING] Output is NOT watertight: "
-              f"open_edges={defects['open_edges']}, "
-              f"nonmanifold_edges={defects['nonmanifold_edges']}")
+    if not repair_activated:
+        if args.verbose:
+            print("\nNo repair options specified; exporting original mesh.")
+    else:
+        # 最终清理（安全操作）
+        repaired = repair_mesh_by_removing_duplicates(repaired)
+        repaired.fix_normals()
+
+        # 缺陷检查
+        defects, _, _ = analyze_mesh_defects(repaired)
+        if defects['open_edges'] > 0 or defects['nonmanifold_edges'] > 0:
+            print(f"\n[WARNING] Output is NOT watertight: "
+                  f"open_edges={defects['open_edges']}, "
+                  f"nonmanifold_edges={defects['nonmanifold_edges']}")
 
     if args.verbose:
         print("\n[Output mesh stats]")
