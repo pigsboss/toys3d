@@ -23,6 +23,7 @@ from toys3d.geometrics import (
     polygon_area_from_3d_ccw,
     remove_small_open_edge_chains,
     remove_pseudo_holes,
+    trim_hanging_open_faces,
     repair_to_watertight,
     weld_small_holes,
 )
@@ -197,7 +198,10 @@ def main():
     parser.add_argument("--no-fill-holes", action="store_true",
                         help="关闭小孔封闭")
 
-    # 伪孔洞清理
+    # 伪孔洞与前处理清理
+    parser.add_argument("--trim-hanging-faces", action="store_true",
+                        help="修剪开放边数 >= 2 的悬挂面片，减少开放边界悬臂")
+
     parser.add_argument("--remove-pseudo-holes", action="store_true",
                         help="在拓扑修复前执行伪孔洞清理，删除短小开放边链")
     parser.add_argument("--pseudo-hole-max-edges", type=int, default=2,
@@ -263,6 +267,17 @@ def main():
         print("\n[Input mesh stats]")
         for k, v in compute_mesh_stats(mesh).items():
             print(f"  {k}: {v}")
+
+    if args.trim_hanging_faces:
+        if args.verbose:
+            print("\n[Pre-clean] trimming hanging open faces...")
+            before, _, _ = analyze_mesh_defects(mesh)
+            print(f"  open_edges before trim: {before['open_edges']}")
+        mesh = trim_hanging_open_faces(mesh, verbose=args.verbose)
+        if args.verbose:
+            after, _, _ = analyze_mesh_defects(mesh)
+            print(f"  open_edges after trim:  {after['open_edges']}")
+            print("[Pre-clean] trim done")
 
     if args.remove_pseudo_holes:
         if args.verbose:
