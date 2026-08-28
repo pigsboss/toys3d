@@ -537,38 +537,15 @@ def fill_small_boundary_loops(mesh, max_edges=5, max_flatness=0.50,
     return repair_mesh_by_removing_duplicates(result)
 
 
-def fill_holes_adaptive(mesh,
-                        strategy='flatness',
-                        max_fan_edges=15,
-                        max_fan_flatness=0.05,
-                        max_earclip_edges=100,
-                        max_earclip_flatness=0.15,
-                        max_surface_fit_edges=500,
-                        max_surface_fit_flatness=0.40,
-                        edge_count_small_p=50.0,
-                        edge_count_large_p=95.0,
-                        g2=False,
-                        verbose=False):
+def fill_holes_adaptive(mesh, verbose=False):
     m = mesh.copy()
-    loops = extract_boundary_loops(m)
-    if not loops:
+    if m.is_watertight or len(m.faces) == 0:
         return m
-    for loop in loops:
-        if len(loop) > 500:
-            continue
-        flatness, _ = compute_loop_flatness(m, loop)
-        if flatness > 0.8:
-            continue
     try:
         m.fill_holes()
     except Exception:
         pass
     return repair_mesh_by_removing_duplicates(m)
-
-
-def repair_normals(mesh, verbose=False):
-    mesh.fix_normals()
-    return mesh
 
 
 def remove_small_open_edge_chains(mesh, max_chain_edges=2, verbose=False):
@@ -628,13 +605,9 @@ def remove_pseudo_holes(mesh, max_chain_edges=2, max_iterations=5, verbose=False
 def repair_to_watertight(mesh,
                          resolution=256,
                          voxel_size=None,
-                         closing_iterations=2,
                          project_to_input=False,
-                         project_distance=None,
                          smooth_watertight=False,
-                         smooth_iterations=10,
-                         progress=False,
-                         verbose=False):
+                         smooth_iterations=10):
     if voxel_size is None:
         bounds = mesh.bounds
         diag = np.linalg.norm(bounds[1] - bounds[0])
@@ -965,49 +938,5 @@ def fill_holes_with_proxy(mesh, proxy_mesh,
     if extract_boundary_loops(merged):
         merged = fill_holes_adaptive(merged, verbose=verbose)
 
-    merged = repair_normals(merged, verbose=verbose)
+    merged.fix_normals()
     return merged
-
-
-def fuse_reliable_faces_with_shell(mesh,
-                                   shell_mesh,
-                                   min_distance=2,
-                                   proxy_face_center_threshold=20,
-                                   max_projection_distance=None,
-                                   min_proxy_loop_edges=12,
-                                   smooth_transition=True,
-                                   smooth_iterations=3,
-                                   smooth_alpha=0.5,
-                                   verbose=False):
-    m = mesh.copy()
-    reliable_mask, _ = compute_topological_reliable_face_mask(m, min_distance=min_distance)
-    if reliable_mask.sum() == 0:
-        return m
-
-    faces = np.asarray(m.faces)[reliable_mask]
-    flat = faces.ravel()
-    unique, inverse = np.unique(flat, return_inverse=True)
-    reliable_mesh = trimesh.Trimesh(
-        vertices=m.vertices[unique],
-        faces=inverse.reshape(-1, 3),
-        process=False,
-    )
-    reliable_mesh.remove_unreferenced_vertices()
-    reliable_mesh.merge_vertices()
-    reliable_mesh = repair_mesh_by_removing_duplicates(reliable_mesh)
-
-    repaired = fill_holes_with_proxy(
-        reliable_mesh, shell_mesh,
-        proxy_face_center_threshold=proxy_face_center_threshold,
-        max_projection_distance=max_projection_distance,
-        min_proxy_loop_edges=min_proxy_loop_edges,
-        verbose=verbose,
-    )
-
-    if smooth_transition and smooth_alpha > 0:
-        try:
-            repaired = repaired.smooth(iterations=smooth_iterations)
-        except Exception:
-            pass
-
-    return repaired
