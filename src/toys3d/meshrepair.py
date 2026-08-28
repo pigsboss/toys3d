@@ -23,7 +23,7 @@ from toys3d.geometrics import (
     polygon_area_from_3d_ccw,
     remove_small_open_edge_chains,
     remove_pseudo_holes,
-    trim_hanging_open_faces,
+    trim_isolated_faces,
     repair_to_watertight,
     weld_small_holes,
 )
@@ -200,8 +200,8 @@ def main():
                         help="关闭小孔封闭")
 
     # 伪孔洞与前处理清理
-    parser.add_argument("--trim-hanging-faces", action="store_true",
-                        help="修剪开放边数 >= 2 的悬挂面片，减少开放边界悬臂")
+    parser.add_argument("--trim-isolated-faces", action="store_true",
+                        help="删除完全孤立的面片（开放边数 == 3）")
 
     parser.add_argument("--remove-pseudo-holes", action="store_true",
                         help="在拓扑修复前执行伪孔洞清理，删除短小开放边链")
@@ -276,13 +276,13 @@ def main():
     repair_activated = False
 
     # --- 预清理步骤（按顺序执行，所有步骤可选） ---
-    if args.trim_hanging_faces:
+    if args.trim_isolated_faces:
         repair_activated = True
         if args.verbose:
-            print("\n[Pre-clean] trimming hanging open faces...")
+            print("\n[Pre-clean] trimming isolated faces...")
             before, _, _ = analyze_mesh_defects(repaired)
             print(f"  open_edges before trim: {before['open_edges']}")
-        repaired = trim_hanging_open_faces(repaired, verbose=args.verbose)
+        repaired = trim_isolated_faces(repaired, verbose=args.verbose)
         if args.verbose:
             after, _, _ = analyze_mesh_defects(repaired)
             print(f"  open_edges after trim:  {after['open_edges']}")

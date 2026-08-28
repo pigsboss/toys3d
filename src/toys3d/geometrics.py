@@ -442,9 +442,9 @@ def repair_nonmanifold_edges(mesh, max_iterations=10):
     return repair_mesh_by_removing_duplicates(m)
 
 
-def trim_hanging_open_faces(mesh, verbose=False):
+def trim_isolated_faces(mesh, verbose=False):
     """
-    删除开放边数 >= 2 的悬挂面片。
+    删除完全孤立的面片（开放边数 == 3）。
 
     仅执行一轮，不迭代，不合并顶点，不做额外清理。
     删除面片后仅移除孤立顶点。
@@ -460,13 +460,13 @@ def trim_hanging_open_faces(mesh, verbose=False):
         nonmanifold_edge_per_face,
     ) = analyze_mesh_defects(m, return_face_edge_counts=True)
 
-    bad_mask = open_edge_per_face >= 2
+    bad_mask = open_edge_per_face == 3
     count_removed = int(np.sum(bad_mask))
 
     if verbose:
         print(
-            f"  [trim_hanging_open_faces] removing "
-            f"{count_removed} faces with >= 2 open edges"
+            f"  [trim_isolated_faces] removing "
+            f"{count_removed} isolated faces with 3 open edges"
         )
 
     if count_removed > 0:
@@ -674,53 +674,6 @@ def remove_small_open_edge_chains(mesh, max_chain_edges=2):
         m.remove_unreferenced_vertices()
 
     return m
-
-
-def trim_hanging_open_faces_old(mesh, max_iterations=20, verbose=False):
-    """
-    删除开放边数 >= 2 的悬挂面片。
-
-    每轮重新分析开放边计数，持续剥除边界悬臂，
-    直到不存在开放边数 >= 2 的面片或达到最大迭代次数。
-    """
-    m = mesh.copy()
-    for it in range(max_iterations):
-        (
-            defect_stats,
-            open_face_mask,
-            nonmanifold_face_mask,
-            open_edge_per_face,
-            manifold_edge_per_face,
-            nonmanifold_edge_per_face,
-        ) = analyze_mesh_defects(m, return_face_edge_counts=True)
-
-        if defect_stats['open_edges'] == 0:
-            if verbose:
-                print("  [trim_hanging_open_faces] no open edges; stopping")
-            break
-
-        bad_mask = (open_edge_per_face >= 2)
-        if not np.any(bad_mask):
-            if verbose:
-                print("  [trim_hanging_open_faces] no hanging faces left; stopping")
-            break
-
-        count_2 = int(np.sum(open_edge_per_face == 2))
-        count_3 = int(np.sum(open_edge_per_face == 3))
-
-        if verbose:
-            print(
-                f"  [trim_hanging_open_faces] iteration {it+1}: "
-                f"removing {count_2} faces with 2 open edges, "
-                f"{count_3} faces with 3 open edges"
-            )
-
-        keep_mask = ~bad_mask
-        m.update_faces(keep_mask)
-        m.remove_unreferenced_vertices()
-        m.merge_vertices()
-
-    return repair_mesh_by_removing_duplicates(m)
 
 
 def remove_pseudo_holes(mesh, max_chain_edges=2, max_iterations=5, verbose=False):
