@@ -424,8 +424,10 @@ def trim_isolated_faces(mesh, verbose=False):
     """
     删除完全孤立的面片（开放边数 == 3）。
 
-    仅执行一轮，不迭代，不合并顶点，不做额外清理。
-    删除面片后仅移除孤立顶点。
+    调试模式下，在删除前打印 3 开放边面片的统计信息：
+      - 数量
+      - 面积分布
+      - 顶点是否被其它面片共享
     """
     m = mesh.copy()
 
@@ -443,9 +445,47 @@ def trim_isolated_faces(mesh, verbose=False):
 
     if verbose:
         print(
-            f"  [trim_isolated_faces] removing "
-            f"{count_removed} isolated faces with 3 open edges"
+            f"  [trim_isolated_faces] found {count_removed} isolated faces "
+            f"(3 open edges)"
         )
+
+        if count_removed > 0:
+            bad_face_indices = np.where(bad_mask)[0]
+            bad_faces = m.faces[bad_face_indices]
+            bad_areas = m.area_faces[bad_face_indices]
+
+            # 面积统计
+            print("    area stats:")
+            print(f"      min:  {bad_areas.min():.6f}")
+            print(f"      max:  {bad_areas.max():.6f}")
+            print(f"      mean: {bad_areas.mean():.6f}")
+            print(f"      p50:  {np.percentile(bad_areas, 50):.6f}")
+            print(f"      p90:  {np.percentile(bad_areas, 90):.6f}")
+            print(f"      p99:  {np.percentile(bad_areas, 99):.6f}")
+
+            # 顶点共享统计
+            all_face_vertices = m.faces.ravel()
+            vertex_face_counts = np.bincount(
+                all_face_vertices, minlength=len(m.vertices)
+            )
+
+            counts_per_face = vertex_face_counts[bad_faces]  # shape (N, 3)
+            is_solo = counts_per_face == 1
+            solo_counts = is_solo.sum(axis=1)
+
+            n_all_shared = int(np.sum(solo_counts == 0))
+            n_one_solo   = int(np.sum(solo_counts == 1))
+            n_two_solo   = int(np.sum(solo_counts == 2))
+            n_all_solo   = int(np.sum(solo_counts == 3))
+
+            print("    vertex sharing (among all faces):")
+            print(f"      0 solo vertices (all shared):            {n_all_shared}")
+            print(f"      1 solo vertex:                          {n_one_solo}")
+            print(f"      2 solo vertices:                        {n_two_solo}")
+            print(f"      3 solo vertices (fully isolated):       {n_all_solo}")
+
+            mean_ref_count = counts_per_face.mean()
+            print(f"    mean vertex reference count (in these faces): {mean_ref_count:.2f}")
 
     if count_removed > 0:
         m.update_faces(~bad_mask)
