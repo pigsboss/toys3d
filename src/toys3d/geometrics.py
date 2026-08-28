@@ -40,60 +40,109 @@ def analyze_mesh_defects(mesh, return_face_edge_counts=False):
         manifold_edge_per_face : 每个面片的流形边数
         nonmanifold_edge_per_face : 每个面片的非流形边数
     """
-    n_faces = len(mesh.faces)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    n_faces = len(faces)
+
+    if n_faces == 0:
+        if return_face_edge_counts:
+            empty = np.zeros(0, dtype=np.uint8)
+            return (
+                {'open_edges': 0, 'nonmanifold_edges': 0,
+                 'open_faces': 0, 'nonmanifold_faces': 0},
+                np.zeros(0, dtype=bool),
+                np.zeros(0, dtype=bool),
+                empty.copy(), empty.copy(), empty.copy()
+            )
+        else:
+            return (
+                {'open_edges': 0, 'nonmanifold_edges': 0,
+                 'open_faces': 0, 'nonmanifold_faces': 0},
+                np.zeros(0, dtype=bool),
+                np.zeros(0, dtype=bool)
+            )
+
+    # 1. 构建所有边的两个端点（共 3F 条边）
+    v0 = faces[:, 0]
+    v1 = faces[:, 1]
+    v2 = faces[:, 2]
+
+    # 三条边分别为 (v0,v1), (v1,v2), (v2,v0)
+    ea = np.concatenate([v0, v1, v2])
+    eb = np.concatenate([v1, v2, v0])
+
+    # 对应每条边的面片索引
+    face_ids = np.repeat(np.arange(n_faces, dtype=np.int64), 3)
+
+    # 将边端点排序，使 (v0,v1) 和 (v1,v0) 被视为同一条边
+    min_e = np.minimum(ea, eb)
+    max_e = np.maximum(ea, eb)
+
+    # 编码键（注意使用足够大的基数）
+    n_vertices = int(mesh.vertices.shape[0])
+    if n_vertices == 0:
+        max_vertex = int(max_e.max()) + 1
+    else:
+        max_vertex = n_vertices
+    keys = min_e.astype(np.int64) * (max_vertex + 1) + max_e
+
+    # 2. 对键排序，同时重排面片索引
+    order = np.argsort(keys, kind='stable')
+    keys_sorted = keys[order]
+    face_ids_sorted = face_ids[order]
+
+    # 3. 找出每个唯一键的连续段
+    diff = np.empty(keys_sorted.shape[0], dtype=bool)
+    diff[0] = True
+    diff[1:] = keys_sorted[1:] != keys_sorted[:-1]
+    start_idx = np.flatnonzero(diff)
+    end_idx = np.append(start_idx[1:], keys_sorted.shape[0])
+    counts = end_idx - start_idx
+
+    # 4. 统计缺陷
+    open_edges = int(np.sum(counts == 1))
+    nonmanifold_edges = int(np.sum(counts >= 3))
+
+    open_face_mask = np.zeros(n_faces, dtype=bool)
+    nonmanifold_face_mask = np.zeros(n_faces, dtype=bool)
+
     if return_face_edge_counts:
         open_edge_per_face = np.zeros(n_faces, dtype=np.uint8)
         manifold_edge_per_face = np.zeros(n_faces, dtype=np.uint8)
         nonmanifold_edge_per_face = np.zeros(n_faces, dtype=np.uint8)
 
-    # 构建边 -> 相邻面片索引的映射（原代码保持不变）
-    edge_to_faces = {}
-    faces = np.asarray(mesh.faces, dtype=np.int64)
+    # 处理开放边（counts == 1）
+    open_pos = start_idx[counts == 1]
+    if len(open_pos) > 0:
+        open_f = face_ids_sorted[open_pos]
+        open_face_mask[open_f] = True
+        if return_face_edge_counts:
+            np.add.at(open_edge_per_face, open_f, 1)
 
-    for fid, face in enumerate(faces):
-        for i in range(3):
-            v0 = int(face[i])
-            v1 = int(face[(i + 1) % 3])
-            ekey = (v0, v1) if v0 < v1 else (v1, v0)
-            edge_to_faces.setdefault(ekey, []).append(fid)
+    # 处理流形边（counts == 2）
+    manifold_pos = start_idx[counts == 2]
+    if len(manifold_pos) > 0:
+        f0 = face_ids_sorted[manifold_pos]
+        f1 = face_ids_sorted[manifold_pos + 1]  # 段内第二个
+        if return_face_edge_counts:
+            np.add.at(manifold_edge_per_face, f0, 1)
+            np.add.at(manifold_edge_per_face, f1, 1)
 
-    open_edges = set()
-    nonmanifold_edges = set()
-    open_faces = set()
-    nonmanifold_faces = set()
-
-    for ekey, face_list in edge_to_faces.items():
-        if len(face_list) == 1:
-            open_edges.add(ekey)
-            open_faces.add(face_list[0])
-            if return_face_edge_counts:
-                open_edge_per_face[face_list[0]] += 1
-        elif len(face_list) == 2:
-            # 流形边：正常共享边
-            if return_face_edge_counts:
-                manifold_edge_per_face[face_list[0]] += 1
-                manifold_edge_per_face[face_list[1]] += 1
-        else:
-            nonmanifold_edges.add(ekey)
-            nonmanifold_faces.update(face_list)
-            if return_face_edge_counts:
-                for f in face_list:
-                    nonmanifold_edge_per_face[f] += 1
+    # 处理非流形边（counts >= 3）
+    # 非流形边通常极少，可以用轻量循环
+    nonmanifold_start = start_idx[counts >= 3]
+    nonmanifold_vals = counts[counts >= 3]
+    for start, cnt in zip(nonmanifold_start, nonmanifold_vals):
+        seg_face_ids = face_ids_sorted[start:start + cnt]
+        nonmanifold_face_mask[seg_face_ids] = True
+        if return_face_edge_counts:
+            np.add.at(nonmanifold_edge_per_face, seg_face_ids, 1)
 
     defect_stats = {
-        'open_edges': len(open_edges),
-        'nonmanifold_edges': len(nonmanifold_edges),
-        'open_faces': len(open_faces),
-        'nonmanifold_faces': len(nonmanifold_faces),
+        'open_edges': open_edges,
+        'nonmanifold_edges': nonmanifold_edges,
+        'open_faces': int(open_face_mask.sum()),
+        'nonmanifold_faces': int(nonmanifold_face_mask.sum()),
     }
-
-    open_face_mask = np.zeros(n_faces, dtype=bool)
-    nonmanifold_face_mask = np.zeros(n_faces, dtype=bool)
-
-    for f in open_faces:
-        open_face_mask[f] = True
-    for f in nonmanifold_faces:
-        nonmanifold_face_mask[f] = True
 
     if return_face_edge_counts:
         return (
@@ -104,7 +153,8 @@ def analyze_mesh_defects(mesh, return_face_edge_counts=False):
             manifold_edge_per_face,
             nonmanifold_edge_per_face,
         )
-    return defect_stats, open_face_mask, nonmanifold_face_mask
+    else:
+        return defect_stats, open_face_mask, nonmanifold_face_mask
 
 
 def _build_open_edge_adjacency(mesh):
