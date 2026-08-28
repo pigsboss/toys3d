@@ -442,6 +442,40 @@ def repair_nonmanifold_edges(mesh, max_iterations=10):
     return repair_mesh_by_removing_duplicates(m)
 
 
+def trim_hanging_open_faces(mesh, verbose=False):
+    """
+    删除开放边数 >= 2 的悬挂面片。
+
+    仅执行一轮，不迭代，不合并顶点，不做额外清理。
+    删除面片后仅移除孤立顶点。
+    """
+    m = mesh.copy()
+
+    (
+        defect_stats,
+        open_face_mask,
+        nonmanifold_face_mask,
+        open_edge_per_face,
+        manifold_edge_per_face,
+        nonmanifold_edge_per_face,
+    ) = analyze_mesh_defects(m, return_face_edge_counts=True)
+
+    bad_mask = open_edge_per_face >= 2
+    count_removed = int(np.sum(bad_mask))
+
+    if verbose:
+        print(
+            f"  [trim_hanging_open_faces] removing "
+            f"{count_removed} faces with >= 2 open edges"
+        )
+
+    if count_removed > 0:
+        m.update_faces(~bad_mask)
+        m.remove_unreferenced_vertices()
+
+    return m
+
+
 def compute_loop_flatness(mesh, loop):
     if len(loop) < 4:
         return 0.0, None
@@ -642,7 +676,7 @@ def remove_small_open_edge_chains(mesh, max_chain_edges=2):
     return m
 
 
-def trim_hanging_open_faces(mesh, max_iterations=20, verbose=False):
+def trim_hanging_open_faces_old(mesh, max_iterations=20, verbose=False):
     """
     删除开放边数 >= 2 的悬挂面片。
 
