@@ -17,6 +17,8 @@ import argparse
 import colorsys
 import numpy as np
 import trimesh
+from collections import deque
+from scipy.sparse import csr_matrix
 
 from toys3d.geometrics import (
     compute_mesh_stats,
@@ -24,7 +26,6 @@ from toys3d.geometrics import (
     compute_hole_area_stats,
     extract_boundary_loops,
     polygon_area_from_3d_ccw,
-    compute_topological_reliable_face_mask,
     repair_mesh_by_removing_duplicates,
     project_vertices_to_shell,
     weld_small_holes,
@@ -90,6 +91,47 @@ def compute_volume_if_closed(mesh):
     if mesh.is_watertight:
         return float(mesh.volume)
     return float(np.nan)
+
+
+def compute_face_distances(mesh, source_mask):
+    """
+    计算每个面片到源面片集（例如缺陷面）的最短拓扑距离。
+
+    使用 scipy.sparse.csr_matrix 存储面邻接关系，避免为每个面片
+    构建 Python list，从而大幅降低内存占用。
+    """
+    n_faces = len(mesh.faces)
+    if n_faces == 0:
+        return np.zeros(0, dtype=np.int32)
+    if not np.any(source_mask):
+        return np.full(n_faces, np.iinfo(np.int32).max, dtype=np.int32)
+
+    face_adj = mesh.face_adjacency
+    rows = np.concatenate([face_adj[:, 0], face_adj[:, 1]])
+    cols = np.concatenate([face_adj[:, 1], face_adj[:, 0]])
+    data = np.ones(len(rows), dtype=np.int8)
+    adj = csr_matrix((data, (rows, cols)), shape=(n_faces, n_faces))
+
+    dist = np.full(n_faces, -1, dtype=np.int32)
+    q = deque()
+
+    for i in np.where(source_mask)[0]:
+        dist[i] = 0
+        q.append(int(i))
+
+    while q:
+        cur = q.popleft()
+        start = adj.indptr[cur]
+        end = adj.indptr[cur + 1]
+        for idx in range(start, end):
+            nb = adj.indices[idx]
+            if dist[nb] == -1:
+                dist[nb] = dist[cur] + 1
+                q.append(int(nb))
+
+    # 没有路径到达的面片（理论上极少出现）设为最大距离
+    dist[dist == -1] = np.iinfo(np.int32).max
+    return dist
 
 
 def build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask):
@@ -642,6 +684,14 @@ def inspect_mesh(mesh, args):
     bbox_stats = compute_bounding_box_stats(mesh)
     volume = compute_volume_if_closed(mesh)
 
+    defect_mask = open_face_mask | nonmanifold_face_mask
+    if np.any(defect_mask):
+        distances = compute_face_distances(mesh, defect_mask)
+        reliable_mask = (~defect_mask) & (distances >= args.reliable_distance)
+    else:
+        distances = np.full(len(mesh.faces), args.reliable_distance + 1, dtype=np.int32)
+        reliable_mask = np.ones(len(mesh.faces), dtype=bool)
+
     print_separator("Mesh Topology")
     print(f"  vertices:          {stats['vertices']}")
     print(f"  faces:             {stats['faces']}")
@@ -666,6 +716,28 @@ def inspect_mesh(mesh, args):
               f"p95={hole_stats['p95_area']:.6f}, "
               f"p99={hole_stats['p99_area']:.6f}, "
               f"max={hole_stats['max_area']:.6f}")
+
+    print_separator("Defect Face Details")
+    both_mask = open_face_mask & nonmanifold_face_mask
+    open_only_mask = open_face_mask & ~nonmanifold_face_mask
+    nonmanifold_only_mask = nonmanifold_face_mask & ~open_face_mask
+    print(f"  open-only faces:                 {open_only_mask.sum()}")
+    print(f"  nonmanifold-only faces:          {nonmanifold_only_mask.sum()}")
+    print(f"  both open & nonmanifold faces:   {both_mask.sum()}")
+
+    print_separator("Topological Reliability Distribution")
+    max_display = 5
+    for d in range(max_display + 1):
+        cnt = int(np.sum(distances == d))
+        print(f"  distance {d}: {cnt} faces")
+    rest = int(np.sum(distances > max_display))
+    print(f"  distance > {max_display}: {rest} faces")
+
+    reliable_count = int(reliable_mask.sum())
+    total_faces = len(mesh.faces)
+    pct = 100.0 * reliable_count / max(total_faces, 1)
+    print(f"  reliable faces (distance >= {args.reliable_distance}): "
+          f"{reliable_count} ({pct:.2f}%)")
 
     print_separator("Bounding Box")
     print(f"  min:      [{bbox_stats['min'][0]:.4f}, "
@@ -724,10 +796,7 @@ def inspect_mesh(mesh, args):
             print_separator("Reliable-Only Extracted Mesh")
             print(f"  min_distance: {args.reliable_distance}")
 
-            # 计算拓扑可靠面片掩码
-            reliable_mask, _ = compute_topological_reliable_face_mask(
-                mesh, min_distance=args.reliable_distance
-            )
+            # 使用之前计算好的可靠面片掩码
             reliable_count = int(reliable_mask.sum())
             print(f"  reliable faces: {reliable_count}/{len(mesh.faces)}")
 
@@ -828,9 +897,6 @@ def inspect_mesh(mesh, args):
             print("  yellow: intermediate faces (0 < distance < min_distance)")
             print("  red:    defect faces (distance = 0)")
 
-            _, distances = compute_topological_reliable_face_mask(
-                mesh, min_distance=args.reliable_distance
-            )
             vis = build_reliable_visualization(mesh, distances, args.reliable_distance)
         else:
             print_separator("Defect Visualization")
