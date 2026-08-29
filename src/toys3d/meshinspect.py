@@ -15,10 +15,18 @@ if os.path.exists(os.path.join(os.getcwd(), 'inspect.py')):
 
 import argparse
 import colorsys
+import json
+from pathlib import Path
 import numpy as np
 import trimesh
 from collections import deque
 from scipy.sparse import csr_matrix
+
+import matplotlib
+matplotlib.use('Agg')  # 无头模式，避免弹出窗口
+import matplotlib.pyplot as plt
+from matplotlib.patches import Circle
+from matplotlib.lines import Line2D
 
 from toys3d.geometrics import (
     compute_mesh_stats,
@@ -29,6 +37,9 @@ from toys3d.geometrics import (
     repair_mesh_by_removing_duplicates,
     project_vertices_to_shell,
     weld_small_holes,
+    compute_vertex_face_counts,
+    compute_face_edge_types,
+    compute_face_topology_codes,
 )
 
 
@@ -655,6 +666,407 @@ def add_proxy_overlay_to_scene(scene, args, proxy):
     scene.add_geometry(proxy)
 
 
+def _generate_topology_diagram(code, output_path):
+    """
+    根据拓扑编码生成三角形的点-线示意图。
+    编码格式：A, AB, B, BC, C, CA，每个元素为 '1','2','3'。
+    顶点：'1' 实心，'2' 或更大空心。
+    边：'1' 蓝色，'2' 绿色，'3' 红色。
+    """
+    fig, ax = plt.subplots(figsize=(1.5, 1.5), dpi=100)
+    pts = {
+        'A': (0, 0),
+        'B': (1, 0),
+        'C': (0.5, np.sqrt(3) / 2)
+    }
+    vA, eAB, vB, eBC, vC, eCA = [c for c in code]
+
+    edge_styles = {
+        '1': ('blue', 'solid'),
+        '2': ('green', 'solid'),
+        '3': ('red', 'solid')
+    }
+    for (p1, p2, ecode) in [
+        (pts['A'], pts['B'], eAB),
+        (pts['B'], pts['C'], eBC),
+        (pts['C'], pts['A'], eCA)
+    ]:
+        color, ls = edge_styles[ecode]
+        line = Line2D([p1[0], p2[0]], [p1[1], p2[1]],
+                      color=color, linewidth=2, linestyle=ls)
+        ax.add_line(line)
+
+    for (pt, vcode) in [(pts['A'], vA), (pts['B'], vB), (pts['C'], vC)]:
+        fill = (vcode == '1')
+        circle = Circle(pt, radius=0.05, fill=fill,
+                        color='black', linewidth=2)
+        ax.add_patch(circle)
+
+    ax.set_xlim(-0.2, 1.2)
+    ax.set_ylim(-0.2, 0.7)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    plt.tight_layout(pad=0)
+    plt.savefig(output_path, format='svg', bbox_inches='tight', pad_inches=0)
+    plt.close(fig)
+
+
+def _build_vertex_face_csr(mesh):
+    """
+    构建 (n_vertices, n_faces) 的 CSR 矩阵，行内存储包含该顶点的面索引。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    n_vertices = len(mesh.vertices)
+    n_faces = len(faces)
+    row_idx = faces.ravel()
+    col_idx = np.repeat(np.arange(n_faces), 3)
+    data = np.ones(3 * n_faces, dtype=np.int8)
+    return csr_matrix((data, (row_idx, col_idx)), shape=(n_vertices, n_faces))
+
+
+def _compute_class_neighbor_stats(mesh, face_indices,
+                                  open_face_mask, nonmanifold_face_mask,
+                                  vertex_faces_csr, face_adjacency):
+    """
+    计算指定面片集合的点邻和边邻面类型计数。
+    返回 (point_counts, edge_counts) 各为 dict。
+    """
+    face_set = set(face_indices)
+
+    point_counts = {'normal': 0, 'open': 0, 'nonmanifold': 0}
+    edge_counts = {'normal': 0, 'open': 0, 'nonmanifold': 0}
+
+    for fid in face_indices:
+        # 边邻
+        row_start = face_adjacency.indptr[fid]
+        row_end = face_adjacency.indptr[fid + 1]
+        edge_neighbors = face_adjacency.indices[row_start:row_end]
+
+        edge_neighbor_set = set(edge_neighbors)
+
+        for nb in edge_neighbors:
+            if nonmanifold_face_mask[nb]:
+                edge_counts['nonmanifold'] += 1
+            elif open_face_mask[nb]:
+                edge_counts['open'] += 1
+            else:
+                edge_counts['normal'] += 1
+
+        # 点邻：三个顶点的相邻面并集，减去自身和边邻
+        verts = mesh.faces[fid]
+        all_nb = set()
+        for v_ in verts:
+            row_start = vertex_faces_csr.indptr[v_]
+            row_end = vertex_faces_csr.indptr[v_ + 1]
+            indices = vertex_faces_csr.indices[row_start:row_end]
+            all_nb.update(indices)
+
+        all_nb.discard(fid)
+        point_neighbors = all_nb - edge_neighbor_set
+
+        for nb in point_neighbors:
+            if nonmanifold_face_mask[nb]:
+                point_counts['nonmanifold'] += 1
+            elif open_face_mask[nb]:
+                point_counts['open'] += 1
+            else:
+                point_counts['normal'] += 1
+
+    return point_counts, edge_counts
+
+
+def run_full_diagnosis_pass1(mesh, output_dir):
+    """
+    Pass 1: 计算异常面编码、绘制示意图、生成报告框架和检查点。
+    返回 (class_faces, id_to_code, abnormal_indices)。
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    diagrams_dir = output_dir / "diagrams"
+    diagrams_dir.mkdir(exist_ok=True)
+
+    print("\n=== Full Diagnosis Pass 1 ===")
+    print("计算面片拓扑编码...")
+
+    defects, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+    abnormal_mask = open_face_mask | nonmanifold_face_mask
+    abnormal_indices = np.where(abnormal_mask)[0]
+
+    print(f"异常面片总数: {len(abnormal_indices)}")
+
+    if len(abnormal_indices) == 0:
+        print("没有异常面，退出。")
+        # 创建空的 classes_data 和 checkpoint
+        with open(output_dir / "classes_data.json", "w") as f:
+            json.dump({"class_faces": {}, "id_to_code": []}, f)
+        with open(output_dir / "checkpoint.json", "w") as f:
+            json.dump({"mesh_hash": None, "classes": {}, "total_classes": 0,
+                       "abnormal_count": 0}, f)
+        return {}, [], abnormal_indices
+
+    vertex_face_counts = compute_vertex_face_counts(mesh)
+    face_edge_types = compute_face_edge_types(mesh)
+
+    codes, code_to_id, id_to_code = compute_face_topology_codes(
+        mesh, abnormal_indices, vertex_face_counts, face_edge_types
+    )
+
+    code_ids = np.array([code_to_id[c] for c in codes], dtype=np.int64)
+
+    unique_ids, inverse, counts = np.unique(code_ids, return_inverse=True, return_counts=True)
+
+    print(f"发现 {len(unique_ids)} 个不同拓扑类别。")
+
+    class_faces = {}
+    for class_id in unique_ids:
+        mask = inverse == np.where(unique_ids == class_id)[0][0]
+        class_faces[class_id] = abnormal_indices[mask].tolist()
+
+    # 绘制示意图
+    print("生成拓扑示意图...")
+    for class_id in id_to_code.keys():   # id_to_code is list, iterate indices
+        diagram_path = diagrams_dir / f"diagram_{class_id}.svg"
+        _generate_topology_diagram(id_to_code[class_id], str(diagram_path))
+        if class_id % 10 == 0:
+            print(f"  已生成 {class_id + 1}/{len(id_to_code)} 个示意图")
+
+    # 保存分类数据用于 resume
+    classes_data = {
+        "class_faces": {str(cid): faces for cid, faces in class_faces.items()},
+        "id_to_code": id_to_code,
+    }
+    with open(output_dir / "classes_data.json", "w") as f:
+        json.dump(classes_data, f, indent=2)
+
+    # 创建检查点文件
+    checkpoint = {
+        "mesh_hash": str(mesh.vertices.shape) + str(mesh.faces.shape),
+        "classes": {str(cid): "pending" for cid in unique_ids},
+        "total_classes": len(unique_ids),
+        "abnormal_count": len(abnormal_indices),
+    }
+    with open(output_dir / "checkpoint.json", "w") as f:
+        json.dump(checkpoint, f, indent=2)
+
+    return class_faces, id_to_code, abnormal_indices
+
+
+def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
+                             open_face_mask, nonmanifold_face_mask,
+                             resume=False):
+    """
+    Pass 2: 逐类分析并填充报告，支持断点恢复。
+    """
+    output_dir = Path(output_dir)
+    checkpoint_path = output_dir / "checkpoint.json"
+
+    if resume and checkpoint_path.exists():
+        with open(checkpoint_path, "r") as f:
+            checkpoint = json.load(f)
+        pending_classes = [int(cid) for cid, status in checkpoint["classes"].items()
+                           if status == "pending"]
+        done_classes = [int(cid) for cid, status in checkpoint["classes"].items()
+                        if status == "done"]
+        print(f"恢复模式：已完成 {len(done_classes)} 类，剩余 {len(pending_classes)} 类")
+    else:
+        pending_classes = list(class_faces.keys())
+
+    if not pending_classes:
+        print("没有待分析类别。")
+        return {}
+
+    # 预计算共享数据
+    vertex_faces_csr = _build_vertex_face_csr(mesh)
+    face_adjacency = mesh.face_adjacency  # (n,2) 数组
+    rows = np.concatenate([face_adjacency[:, 0], face_adjacency[:, 1]])
+    cols = np.concatenate([face_adjacency[:, 1], face_adjacency[:, 0]])
+    data = np.ones(len(rows), dtype=np.int8)
+    face_adjacency_csr = csr_matrix((data, (rows, cols)),
+                                    shape=(len(mesh.faces), len(mesh.faces)))
+
+    results = {}
+    for idx, class_id in enumerate(pending_classes):
+        code = id_to_code[class_id]
+        face_indices = class_faces[class_id]
+        print(f"\n=== 分析类别 {idx+1}/{len(pending_classes)} ===", flush=True)
+        print(f"  编码: {code}, 面片数: {len(face_indices)}", flush=True)
+
+        areas = mesh.area_faces[face_indices]
+        area_stats = {
+            'count': len(face_indices),
+            'mean': float(np.mean(areas)),
+            'min': float(np.min(areas)),
+            'p1': float(np.percentile(areas, 1)),
+            'p5': float(np.percentile(areas, 5)),
+            'p50': float(np.percentile(areas, 50)),
+            'p95': float(np.percentile(areas, 95)),
+            'p99': float(np.percentile(areas, 99)),
+            'max': float(np.max(areas)),
+        }
+
+        point_counts, edge_counts = _compute_class_neighbor_stats(
+            mesh, face_indices, open_face_mask, nonmanifold_face_mask,
+            vertex_faces_csr, face_adjacency_csr
+        )
+
+        class_result = {
+            'class_id': int(class_id),
+            'code': code,
+            'area_stats': area_stats,
+            'point_counts': point_counts,
+            'edge_counts': edge_counts,
+        }
+        results[class_id] = class_result
+
+        # 更新检查点
+        with open(checkpoint_path, "r") as f:
+            checkpoint = json.load(f)
+        checkpoint["classes"][str(class_id)] = "done"
+        with open(checkpoint_path, "w") as f:
+            json.dump(checkpoint, f, indent=2)
+
+        print(f"  面积: 平均={area_stats['mean']:.6f}, p50={area_stats['p50']:.6f}", flush=True)
+        print(f"  点邻: 流形={point_counts['normal']}, 开放={point_counts['open']}, "
+              f"非流形={point_counts['nonmanifold']}", flush=True)
+        print(f"  边邻: 流形={edge_counts['normal']}, 开放={edge_counts['open']}, "
+              f"非流形={edge_counts['nonmanifold']}", flush=True)
+
+    return results
+
+
+def generate_html_report(output_dir, id_to_code, results):
+    """生成 HTML 报告。"""
+    output_dir = Path(output_dir)
+    html_path = output_dir / "report.html"
+
+    html = ["<html><head><meta charset='utf-8'><title>Full Face Diagnosis</title>",
+            "<style>",
+            "body { font-family: sans-serif; margin: 20px; }",
+            "table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }",
+            "th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: center; }",
+            "th { background: #f0f0f0; }",
+            ".class-block { margin-bottom: 30px; border: 1px solid #ddd; padding: 10px; }",
+            "img { max-width: 150px; }",
+            "</style></head><body>",
+            "<h1>Full Face Diagnosis Report</h1>",
+            "<h2>Topology Classes</h2>"]
+
+    for class_id in sorted(results.keys()):
+        res = results[class_id]
+        code = res['code']
+        diagram_rel = f"diagrams/diagram_{class_id}.svg"
+        area = res['area_stats']
+        pc = res['point_counts']
+        ec = res['edge_counts']
+
+        html.append("<div class='class-block'>")
+        html.append(f"<h3>Class {class_id}: {code}</h3>")
+        html.append(f"<img src='{diagram_rel}' alt='{code}'>")
+        html.append("<table>")
+        html.append("<tr><th>面片数</th><th>平均面积</th><th>p50面积</th><th>p95面积</th><th>p99面积</th></tr>")
+        html.append(f"<tr><td>{area['count']}</td><td>{area['mean']:.6f}</td>"
+                    f"<td>{area['p50']:.6f}</td><td>{area['p95']:.6f}</td>"
+                    f"<td>{area['p99']:.6f}</td></tr>")
+        html.append("</table>")
+        html.append("<table>")
+        html.append("<tr><th></th><th>流形</th><th>开放</th><th>非流形</th></tr>")
+        html.append("<tr><th>点邻</th>"
+                    f"<td>{pc['normal']}</td><td>{pc['open']}</td><td>{pc['nonmanifold']}</td></tr>")
+        html.append("<tr><th>边邻</th>"
+                    f"<td>{ec['normal']}</td><td>{ec['open']}</td><td>{ec['nonmanifold']}</td></tr>")
+        html.append("</table>")
+        html.append("</div>")
+
+    html.append("</body></html>")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(html))
+    print(f"HTML 报告已保存: {html_path}")
+
+
+def generate_latex_report(output_dir, id_to_code, results):
+    """生成 LaTeX 报告（简化版）。"""
+    output_dir = Path(output_dir)
+    tex_path = output_dir / "report.tex"
+
+    tex = ["\\documentclass{article}",
+           "\\usepackage{graphicx}",
+           "\\usepackage{booktabs}",
+           "\\begin{document}",
+           "\\section{Full Face Diagnosis Report}"]
+
+    for class_id in sorted(results.keys()):
+        res = results[class_id]
+        code = res['code']
+        area = res['area_stats']
+        pc = res['point_counts']
+        ec = res['edge_counts']
+        diagram_rel = f"diagrams/diagram_{class_id}.svg"
+
+        tex.append(f"\\subsection{{Class {class_id}: {code}}}")
+        tex.append("\\begin{figure}[h]")
+        tex.append(f"\\includegraphics[width=0.2\\textwidth]{{{diagram_rel}}}")
+        tex.append("\\end{figure}")
+        tex.append("\\begin{tabular}{lcc}")
+        tex.append("\\toprule")
+        tex.append("Metric & Value & \\\\")
+        tex.append("\\midrule")
+        tex.append(f"Count & {area['count']} \\\\")
+        tex.append(f"Mean Area & {area['mean']:.6f} \\\\")
+        tex.append(f"p50 Area & {area['p50']:.6f} \\\\")
+        tex.append(f"p95 Area & {area['p95']:.6f} \\\\")
+        tex.append(f"p99 Area & {area['p99']:.6f} \\\\")
+        tex.append("\\bottomrule")
+        tex.append("\\end{tabular}")
+        tex.append("\\begin{tabular}{lccc}")
+        tex.append("\\toprule")
+        tex.append("Neighbor & Manifold & Open & Nonmanifold \\\\")
+        tex.append("\\midrule")
+        tex.append(f"Point & {pc['normal']} & {pc['open']} & {pc['nonmanifold']} \\\\")
+        tex.append(f"Edge & {ec['normal']} & {ec['open']} & {ec['nonmanifold']} \\\\")
+        tex.append("\\bottomrule")
+        tex.append("\\end{tabular}")
+
+    tex.append("\\end{document}")
+    with open(tex_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(tex))
+    print(f"LaTeX 报告已保存: {tex_path}")
+
+
+def perform_full_diagnosis(mesh, args):
+    """
+    Full Diagnosis 入口，协调 Pass 1 和 Pass 2。
+    """
+    output_dir = Path(args.diagnosis_output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    _, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+
+    resume_checkpoint = output_dir / "checkpoint.json"
+    classes_data_path = output_dir / "classes_data.json"
+
+    if args.resume and resume_checkpoint.exists() and classes_data_path.exists():
+        with open(classes_data_path, "r") as f:
+            data = json.load(f)
+        class_faces = {int(k): v for k, v in data["class_faces"].items()}
+        id_to_code = data["id_to_code"]
+        print("Resume: loading existing classification from Pass 1.")
+    else:
+        class_faces, id_to_code, _ = run_full_diagnosis_pass1(mesh, output_dir)
+
+    results = run_full_diagnosis_pass2(
+        mesh, output_dir, class_faces, id_to_code,
+        open_face_mask, nonmanifold_face_mask,
+        resume=args.resume
+    )
+
+    if args.diagnosis_format == "html":
+        generate_html_report(output_dir, id_to_code, results)
+    else:
+        generate_latex_report(output_dir, id_to_code, results)
+
+    print(f"\nFull Diagnosis 完成，报告已生成到 {output_dir}")
+
+
 def print_separator(title=None):
     if title:
         print(f"\n{'=' * 60}")
@@ -1124,6 +1536,15 @@ def main():
     parser.add_argument("--no-proxy-double-sided", dest='proxy_double_sided',
                         action='store_false',
                         help="关闭代理网格双面渲染")
+    parser.add_argument("--full-diagnosis", action="store_true",
+                        help="执行 Full Diagnosis（2-Pass），生成异常面拓扑分类报告")
+    parser.add_argument("--diagnosis-output", type=str, default="diagnosis_report",
+                        help="Full Diagnosis 输出目录（默认 diagnosis_report）")
+    parser.add_argument("--diagnosis-format", type=str, default="html",
+                        choices=["html", "latex"],
+                        help="报告格式：html 或 latex（默认 html）")
+    parser.add_argument("--resume", action="store_true",
+                        help="从现有检查点继续 Full Diagnosis Pass 2（跳过已完成类别）")
 
     if len(sys.argv) == 1:
         parser.print_help()
@@ -1148,6 +1569,10 @@ def main():
     if not isinstance(mesh, trimesh.Trimesh):
         mesh = mesh.dump(concatenate=True)
         print("Multiple meshes detected, merged.")
+
+    if args.full_diagnosis:
+        perform_full_diagnosis(mesh, args)
+        return
 
     scene = inspect_mesh(mesh, args)
 

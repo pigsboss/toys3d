@@ -522,3 +522,109 @@ def repair_to_watertight(mesh,
         except Exception:
             pass
     return result
+
+
+def compute_vertex_face_counts(mesh):
+    """返回每个顶点被多少个面片引用（np.int64 array）。"""
+    return np.bincount(mesh.faces.ravel(), minlength=len(mesh.vertices))
+
+
+def compute_face_edge_types(mesh):
+    """
+    返回每个面片的三条边的类型矩阵，形状 (n_faces, 3)，值为：
+      1: 开放边（只被1个面使用）
+      2: 流形边（被2个面使用）
+      3: 非流形边（被>=3个面使用）
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    n_faces = len(faces)
+    if n_faces == 0:
+        return np.zeros((0, 3), dtype=np.uint8)
+
+    v0, v1, v2 = faces[:, 0], faces[:, 1], faces[:, 2]
+    ea = np.concatenate([v0, v1, v2])
+    eb = np.concatenate([v1, v2, v0])
+    face_ids = np.repeat(np.arange(n_faces, dtype=np.int64), 3)
+
+    min_e = np.minimum(ea, eb)
+    max_e = np.maximum(ea, eb)
+    n_vertices = int(mesh.vertices.shape[0])
+    if n_vertices == 0:
+        max_vertex = int(max_e.max()) + 1
+    else:
+        max_vertex = n_vertices
+    keys = min_e.astype(np.int64) * (max_vertex + 1) + max_e
+
+    order = np.argsort(keys, kind='stable')
+    keys_sorted = keys[order]
+    face_ids_sorted = face_ids[order]
+
+    diff = np.empty(keys_sorted.shape[0], dtype=bool)
+    diff[0] = True
+    diff[1:] = keys_sorted[1:] != keys_sorted[:-1]
+    start_idx = np.flatnonzero(diff)
+    end_idx = np.append(start_idx[1:], keys_sorted.shape[0])
+    counts = end_idx - start_idx
+
+    # 每个唯一边的类型：1/2/3
+    edge_type_by_unique = np.ones(len(start_idx), dtype=np.uint8)
+    edge_type_by_unique[counts == 2] = 2
+    edge_type_by_unique[counts >= 3] = 3
+
+    # 将原始边键映射回类型
+    unique_keys = keys_sorted[start_idx]
+    pos = np.searchsorted(unique_keys, keys)
+    face_edge_types = edge_type_by_unique[pos].reshape(-1, 3)
+
+    return face_edge_types
+
+
+def compute_face_topology_codes(mesh, face_indices, vertex_face_counts, face_edge_types):
+    """
+    计算指定面片的标准化拓扑编码，返回：
+      codes: np.ndarray of str, 长度与 face_indices 相同
+      code_to_id: dict, 编码字符串到整数 id 的映射
+      id_to_code: list, 整数 id 到编码字符串的映射
+    顶点编码：共享面数 ==1 -> '1', >=2 -> '2'
+    边编码：共享面数 ==1 -> '1', ==2 -> '2', >=3 -> '3'
+    """
+    faces = np.asarray(mesh.faces)[face_indices]
+    n = len(face_indices)
+    if n == 0:
+        return np.array([], dtype=object), {}, []
+
+    # 对每个面获取顶点共享数（截断）
+    v_share = np.where(vertex_face_counts[faces] == 1, '1', '2')  # shape (n,3)
+
+    # 对每个面获取边共享数
+    e_share = face_edge_types[face_indices]  # shape (n,3), values 1/2/3
+    e_share_str = e_share.astype(str)  # convert to strings
+
+    # 组装原始字符串序列：A, AB, B, BC, C, CA
+    raw_codes = []
+    for i in range(n):
+        va, vb, vc = v_share[i]
+        eab, ebc, eca = e_share_str[i]
+        raw = va + eab + vb + ebc + vc + eca
+        raw_codes.append(raw)
+
+    # 对称标准化：枚举旋转和镜像，取字典序最小
+    normalized = []
+    for raw in raw_codes:
+        variants = []
+        for shift in [0, 2, 4]:
+            variants.append(raw[shift:] + raw[:shift])
+        mirror = raw[::-1]
+        variants.append(mirror)
+        for shift in [2, 4]:
+            variants.append(mirror[shift:] + mirror[:shift])
+        normalized.append(min(variants))
+
+    codes = np.array(normalized, dtype=object)
+
+    # 建立编码到 id 的映射
+    unique_codes = sorted(set(normalized))
+    code_to_id = {code: idx for idx, code in enumerate(unique_codes)}
+    id_to_code = unique_codes
+
+    return codes, code_to_id, id_to_code
