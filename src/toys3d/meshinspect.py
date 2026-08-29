@@ -673,7 +673,7 @@ def _generate_topology_diagram(code, output_path):
     顶点：'1' 实心，'2' 或更大空心。
     边：'1' 蓝色，'2' 绿色，'3' 红色。
     """
-    fig, ax = plt.subplots(figsize=(1.5, 1.5), dpi=100)
+    fig, ax = plt.subplots(figsize=(2.0, 2.0), dpi=120)  # 增大尺寸提高清晰度
     pts = {
         'A': (0, 0),
         'B': (1, 0),
@@ -707,7 +707,7 @@ def _generate_topology_diagram(code, output_path):
     ax.set_aspect('equal')
     ax.axis('off')
     plt.tight_layout(pad=0)
-    plt.savefig(output_path, format='svg', bbox_inches='tight', pad_inches=0)
+    plt.savefig(output_path, format='svg', bbox_inches='tight', pad_inches=0.1)
     plt.close(fig)
 
 
@@ -773,6 +773,146 @@ def _compute_class_neighbor_stats(mesh, face_indices,
                 point_counts['normal'] += 1
 
     return point_counts, edge_counts
+
+
+def _compute_single_face_neighbor_stats(mesh, face_id,
+                                        open_face_mask, nonmanifold_face_mask,
+                                        vertex_faces_csr, face_adjacency_csr):
+    """
+    计算指定面片的逐顶点、逐边邻居统计。
+
+    返回：
+        vertex_stats: list of 3 dicts，对应顶点 A,B,C，每个 dict 包含
+                      'normal', 'open', 'nonmanifold'
+        edge_stats:   list of 3 dicts，对应边 AB,BC,CA，每个 dict 包含
+                      'normal', 'open', 'nonmanifold'
+    """
+    verts = mesh.faces[face_id]  # 当前面片的三个顶点索引
+
+    # ---------- 获取边邻信息 ----------
+    # trimesh 的 face_adjacency_edges 提供每对邻接面共享的边 (顶点对)
+    if hasattr(mesh, 'face_adjacency_edges'):
+        face_adj = mesh.face_adjacency
+        face_adj_edges = mesh.face_adjacency_edges
+        # 初始化三条边的邻居面列表
+        edge_neighbors_by_edge = [[], [], []]  # 对应边 AB, BC, CA
+        for (f0, f1), (ev0, ev1) in zip(face_adj, face_adj_edges):
+            if f0 == face_id or f1 == face_id:
+                # 确定该邻接边属于当前面的哪条边
+                for i in range(3):
+                    a = verts[i]
+                    b = verts[(i + 1) % 3]
+                    if (ev0 == a and ev1 == b) or (ev0 == b and ev1 == a):
+                        neighbor = f0 if f1 == face_id else f1
+                        edge_neighbors_by_edge[i].append(neighbor)
+                        break
+    else:
+        # 后备：无法区分边时，将所有边邻面视为同一条边？这里简化处理，
+        # 将边邻集合均分给三条边，但这样不精确；实际 trimesh 应有 face_adjacency_edges。
+        row_start = face_adjacency_csr.indptr[face_id]
+        row_end = face_adjacency_csr.indptr[face_id + 1]
+        all_edge_neighbors = list(face_adjacency_csr.indices[row_start:row_end])
+        edge_neighbors_by_edge = [all_edge_neighbors, all_edge_neighbors, all_edge_neighbors]
+
+    # ---------- 逐边统计 ----------
+    edge_stats = []
+    for i in range(3):
+        cnt = {'normal': 0, 'open': 0, 'nonmanifold': 0}
+        for nb in edge_neighbors_by_edge[i]:
+            if nonmanifold_face_mask[nb]:
+                cnt['nonmanifold'] += 1
+            elif open_face_mask[nb]:
+                cnt['open'] += 1
+            else:
+                cnt['normal'] += 1
+        edge_stats.append(cnt)
+
+    # ---------- 逐顶点统计（点邻） ----------
+    # 首先获取该面的边邻面集合
+    row_start = face_adjacency_csr.indptr[face_id]
+    row_end = face_adjacency_csr.indptr[face_id + 1]
+    edge_neighbors_set = set(face_adjacency_csr.indices[row_start:row_end])
+
+    vertex_stats = []
+    for v in verts:
+        # 该顶点的所有相邻面
+        row_start = vertex_faces_csr.indptr[v]
+        row_end = vertex_faces_csr.indptr[v + 1]
+        all_nb = set(vertex_faces_csr.indices[row_start:row_end])
+        all_nb.discard(face_id)
+        # 点邻 = 顶点邻接面 - 边邻面
+        point_neighbors = all_nb - edge_neighbors_set
+
+        cnt = {'normal': 0, 'open': 0, 'nonmanifold': 0}
+        for nb in point_neighbors:
+            if nonmanifold_face_mask[nb]:
+                cnt['nonmanifold'] += 1
+            elif open_face_mask[nb]:
+                cnt['open'] += 1
+            else:
+                cnt['normal'] += 1
+        vertex_stats.append(cnt)
+
+    return vertex_stats, edge_stats
+
+
+def _generate_topology_diagram_svg(code, vertex_stats, edge_stats):
+    """
+    返回一个内联 SVG 字符串，表示拓扑编码示意图。
+    顶点和边均带有 <title> 悬浮提示，内容为邻接统计。
+    """
+    vA, eAB, vB, eBC, vC, eCA = [c for c in code]
+    coords = {
+        'A': (20, 20),
+        'B': (120, 20),
+        'C': (70, 100)
+    }
+    # 顶点样式：独占实心，共享空心
+    vertex_fill = lambda v: '#000000' if v == '1' else '#ffffff'
+    # 边颜色
+    edge_color = {'1': '#0000ff', '2': '#008000', '3': '#ff0000'}
+
+    # 顶点提示文本
+    vertex_tips = []
+    for i, (v, stats) in enumerate(zip([vA, vB, vC], vertex_stats)):
+        tip = (f"顶点{i}: 点邻面片 流形={stats['normal']}, "
+               f"开放={stats['open']}, 非流形={stats['nonmanifold']}")
+        vertex_tips.append(tip)
+
+    # 边提示文本
+    edge_tips = []
+    for i, (e, stats) in enumerate(zip([eAB, eBC, eCA], edge_stats)):
+        tip = (f"边{i}: 边邻面片 流形={stats['normal']}, "
+               f"开放={stats['open']}, 非流形={stats['nonmanifold']}")
+        edge_tips.append(tip)
+
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 140 120" width="200" height="170">
+    <line x1="{coords['A'][0]}" y1="{coords['A'][1]}" x2="{coords['B'][0]}" y2="{coords['B'][1]}"
+          stroke="{edge_color[eAB]}" stroke-width="3">
+        <title>{edge_tips[0]}</title>
+    </line>
+    <line x1="{coords['B'][0]}" y1="{coords['B'][1]}" x2="{coords['C'][0]}" y2="{coords['C'][1]}"
+          stroke="{edge_color[eBC]}" stroke-width="3">
+        <title>{edge_tips[1]}</title>
+    </line>
+    <line x1="{coords['C'][0]}" y1="{coords['C'][1]}" x2="{coords['A'][0]}" y2="{coords['A'][1]}"
+          stroke="{edge_color[eCA]}" stroke-width="3">
+        <title>{edge_tips[2]}</title>
+    </line>
+    <circle cx="{coords['A'][0]}" cy="{coords['A'][1]}" r="8"
+            fill="{vertex_fill(vA)}" stroke="black" stroke-width="2">
+        <title>{vertex_tips[0]}</title>
+    </circle>
+    <circle cx="{coords['B'][0]}" cy="{coords['B'][1]}" r="8"
+            fill="{vertex_fill(vB)}" stroke="black" stroke-width="2">
+        <title>{vertex_tips[1]}</title>
+    </circle>
+    <circle cx="{coords['C'][0]}" cy="{coords['C'][1]}" r="8"
+            fill="{vertex_fill(vC)}" stroke="black" stroke-width="2">
+        <title>{vertex_tips[2]}</title>
+    </circle>
+    </svg>'''
+    return svg
 
 
 def run_full_diagnosis_pass1(mesh, output_dir):
@@ -898,7 +1038,11 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
             'min': float(np.min(areas)),
             'p1': float(np.percentile(areas, 1)),
             'p5': float(np.percentile(areas, 5)),
+            'p10': float(np.percentile(areas, 10)),
+            'p25': float(np.percentile(areas, 25)),
             'p50': float(np.percentile(areas, 50)),
+            'p75': float(np.percentile(areas, 75)),
+            'p90': float(np.percentile(areas, 90)),
             'p95': float(np.percentile(areas, 95)),
             'p99': float(np.percentile(areas, 99)),
             'max': float(np.max(areas)),
@@ -909,12 +1053,21 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
             vertex_faces_csr, face_adjacency_csr
         )
 
+        # 选择代表面，计算逐顶点/逐边统计
+        rep_face = int(face_indices[0])
+        vertex_stats, edge_stats = _compute_single_face_neighbor_stats(
+            mesh, rep_face, open_face_mask, nonmanifold_face_mask,
+            vertex_faces_csr, face_adjacency_csr
+        )
+
         class_result = {
             'class_id': int(class_id),
             'code': code,
             'area_stats': area_stats,
             'point_counts': point_counts,
             'edge_counts': edge_counts,
+            'representative_vertex_stats': vertex_stats,
+            'representative_edge_stats': edge_stats,
         }
         results[class_id] = class_result
 
@@ -935,7 +1088,7 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
 
 
 def generate_html_report(output_dir, id_to_code, results):
-    """生成 HTML 报告。"""
+    """生成 HTML 报告，包含图例、交互式 SVG 示意图和详细统计。"""
     output_dir = Path(output_dir)
     html_path = output_dir / "report.html"
 
@@ -946,45 +1099,98 @@ def generate_html_report(output_dir, id_to_code, results):
             "th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: center; }",
             "th { background: #f0f0f0; }",
             ".class-block { margin-bottom: 30px; border: 1px solid #ddd; padding: 10px; }",
-            "img { max-width: 150px; }",
+            "img { max-width: 300px; height: auto; }",
+            ".diagram-container { display: inline-block; vertical-align: top; margin-right: 20px; }",
+            ".diagram-container svg { width: 200px; height: 170px; }",
+            ".legend { margin-bottom: 20px; padding: 10px; border: 1px solid #ccc; background: #fafafa; }",
+            ".legend span.legend-dot { display: inline-block; width: 15px; height: 15px; border-radius: 50%; margin-right: 5px; }",
+            ".legend span.solid { background: black; border: 1px solid black; }",
+            ".legend span.hollow { background: white; border: 2px solid black; }",
+            ".legend span.legend-line { display: inline-block; width: 30px; height: 0; border-top: 3px solid; margin-right: 5px; vertical-align: middle; }",
+            ".legend span.blue { border-color: blue; }",
+            ".legend span.green { border-color: green; }",
+            ".legend span.red { border-color: red; }",
             "</style></head><body>",
-            "<h1>Full Face Diagnosis Report</h1>",
-            "<h2>Topology Classes</h2>"]
+            "<h1>Full Face Diagnosis Report</h1>"]
+
+    # ---- 图例 ----
+    html.append("<div class='legend'>")
+    html.append("<strong>图例：</strong><br>")
+    html.append("<span class='legend-dot solid'></span> 独占顶点（仅被当前面引用）<br>")
+    html.append("<span class='legend-dot hollow'></span> 共享顶点（被多个面引用）<br>")
+    html.append("<span class='legend-line blue'></span> 开放边（仅属于当前面）<br>")
+    html.append("<span class='legend-line green'></span> 流形边（被两面共享）<br>")
+    html.append("<span class='legend-line red'></span> 非流形边（被三面或更多共享）<br>")
+    html.append("</div>")
+
+    html.append("<h2>Topology Classes</h2>")
 
     for class_id in sorted(results.keys()):
         res = results[class_id]
         code = res['code']
-        diagram_rel = f"diagrams/diagram_{class_id}.svg"
         area = res['area_stats']
         pc = res['point_counts']
         ec = res['edge_counts']
+        v_stats = res.get('representative_vertex_stats')
+        if not v_stats:
+            v_stats = [{'normal': 0, 'open': 0, 'nonmanifold': 0} for _ in range(3)]
+        e_stats = res.get('representative_edge_stats')
+        if not e_stats:
+            e_stats = [{'normal': 0, 'open': 0, 'nonmanifold': 0} for _ in range(3)]
+
+        # 内联 SVG 交互图
+        svg_content = _generate_topology_diagram_svg(code, v_stats, e_stats)
 
         html.append("<div class='class-block'>")
         html.append(f"<h3>Class {class_id}: {code}</h3>")
-        html.append(f"<img src='{diagram_rel}' alt='{code}'>")
+        html.append("<div class='diagram-container'>")
+        html.append(svg_content)
+        html.append("</div>")
+        html.append("<div style='display: inline-block; vertical-align: top;'>")
+
+        # 面积统计表
         html.append("<table>")
-        html.append("<tr><th>面片数</th><th>平均面积</th><th>p50面积</th><th>p95面积</th><th>p99面积</th></tr>")
-        html.append(f"<tr><td>{area['count']}</td><td>{area['mean']:.6f}</td>"
-                    f"<td>{area['p50']:.6f}</td><td>{area['p95']:.6f}</td>"
-                    f"<td>{area['p99']:.6f}</td></tr>")
+        html.append("<tr><th>面积统计</th><th>值</th></tr>")
+        rows = [
+            ("count", "面片数"),
+            ("mean", "平均"),
+            ("min", "最小值"),
+            ("p1", "p1"),
+            ("p5", "p5"),
+            ("p10", "p10"),
+            ("p25", "p25"),
+            ("p50", "p50"),
+            ("p75", "p75"),
+            ("p90", "p90"),
+            ("p95", "p95"),
+            ("p99", "p99"),
+            ("max", "最大值"),
+        ]
+        for key, label in rows:
+            html.append(f"<tr><td>{label}</td><td>{area[key]:.6f}</td></tr>")
         html.append("</table>")
+
+        # 总体邻接统计（点邻 / 边邻）
         html.append("<table>")
         html.append("<tr><th></th><th>流形</th><th>开放</th><th>非流形</th></tr>")
-        html.append("<tr><th>点邻</th>"
+        html.append("<tr><th>点邻（合计）</th>"
                     f"<td>{pc['normal']}</td><td>{pc['open']}</td><td>{pc['nonmanifold']}</td></tr>")
-        html.append("<tr><th>边邻</th>"
+        html.append("<tr><th>边邻（合计）</th>"
                     f"<td>{ec['normal']}</td><td>{ec['open']}</td><td>{ec['nonmanifold']}</td></tr>")
         html.append("</table>")
-        html.append("</div>")
+
+        html.append("</div>")  # 关闭右侧容器
+        html.append("</div>")  # 关闭 class-block
 
     html.append("</body></html>")
+
     with open(html_path, "w", encoding="utf-8") as f:
         f.write("\n".join(html))
     print(f"HTML 报告已保存: {html_path}")
 
 
 def generate_latex_report(output_dir, id_to_code, results):
-    """生成 LaTeX 报告（简化版）。"""
+    """生成 LaTeX 报告（包含更多面积百分位和邻接统计）。"""
     output_dir = Path(output_dir)
     tex_path = output_dir / "report.tex"
 
@@ -1004,20 +1210,36 @@ def generate_latex_report(output_dir, id_to_code, results):
 
         tex.append(f"\\subsection{{Class {class_id}: {code}}}")
         tex.append("\\begin{figure}[h]")
-        tex.append(f"\\includegraphics[width=0.2\\textwidth]{{{diagram_rel}}}")
+        tex.append(f"\\includegraphics[width=0.25\\textwidth]{{{diagram_rel}}}")
         tex.append("\\end{figure}")
-        tex.append("\\begin{tabular}{lcc}")
+
+        # 面积统计表
+        tex.append("\\begin{tabular}{l r}")
         tex.append("\\toprule")
-        tex.append("Metric & Value & \\\\")
+        tex.append("Area Metric & Value \\\\")
         tex.append("\\midrule")
-        tex.append(f"Count & {area['count']} \\\\")
-        tex.append(f"Mean Area & {area['mean']:.6f} \\\\")
-        tex.append(f"p50 Area & {area['p50']:.6f} \\\\")
-        tex.append(f"p95 Area & {area['p95']:.6f} \\\\")
-        tex.append(f"p99 Area & {area['p99']:.6f} \\\\")
+        rows = [
+            ("Count", area['count']),
+            ("Mean", area['mean']),
+            ("Min", area['min']),
+            ("p1", area['p1']),
+            ("p5", area['p5']),
+            ("p10", area['p10']),
+            ("p25", area['p25']),
+            ("p50", area['p50']),
+            ("p75", area['p75']),
+            ("p90", area['p90']),
+            ("p95", area['p95']),
+            ("p99", area['p99']),
+            ("Max", area['max']),
+        ]
+        for label, val in rows:
+            tex.append(f"{label} & {val:.6f} \\\\")
         tex.append("\\bottomrule")
         tex.append("\\end{tabular}")
-        tex.append("\\begin{tabular}{lccc}")
+
+        # 邻接统计表
+        tex.append("\\begin{tabular}{l c c c}")
         tex.append("\\toprule")
         tex.append("Neighbor & Manifold & Open & Nonmanifold \\\\")
         tex.append("\\midrule")
