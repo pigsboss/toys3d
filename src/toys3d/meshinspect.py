@@ -824,9 +824,9 @@ def run_full_diagnosis_pass1(mesh, output_dir):
 
     # 绘制示意图
     print("生成拓扑示意图...")
-    for class_id in id_to_code.keys():   # id_to_code is list, iterate indices
+    for class_id, code in enumerate(id_to_code):
         diagram_path = diagrams_dir / f"diagram_{class_id}.svg"
-        _generate_topology_diagram(id_to_code[class_id], str(diagram_path))
+        _generate_topology_diagram(code, str(diagram_path))
         if class_id % 10 == 0:
             print(f"  已生成 {class_id + 1}/{len(id_to_code)} 个示意图")
 
