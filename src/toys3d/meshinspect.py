@@ -40,6 +40,10 @@ from toys3d.geometrics import (
     compute_vertex_face_counts,
     compute_face_edge_types,
     compute_face_topology_codes,
+    compute_edge_to_faces,
+    compute_face_edge_keys,
+    compute_class_neighbor_stats,
+    compute_single_face_neighbor_stats,
 )
 
 
@@ -724,197 +728,6 @@ def _build_vertex_face_csr(mesh):
     return csr_matrix((data, (row_idx, col_idx)), shape=(n_vertices, n_faces))
 
 
-def _compute_class_neighbor_stats(mesh, face_indices,
-                                  open_face_mask, nonmanifold_face_mask,
-                                  vertex_faces_csr, face_adjacency):
-    """
-    计算指定面片集合的点邻和边邻面类型计数。
-    返回 (point_counts, edge_counts) 各为 dict。
-    """
-    face_set = set(face_indices)
-
-    point_counts = {'normal': 0, 'open': 0, 'nonmanifold': 0}
-    edge_counts = {'normal': 0, 'open': 0, 'nonmanifold': 0}
-
-    for fid in face_indices:
-        # 边邻
-        row_start = face_adjacency.indptr[fid]
-        row_end = face_adjacency.indptr[fid + 1]
-        edge_neighbors = face_adjacency.indices[row_start:row_end]
-
-        edge_neighbor_set = set(edge_neighbors)
-
-        for nb in edge_neighbors:
-            if nonmanifold_face_mask[nb]:
-                edge_counts['nonmanifold'] += 1
-            elif open_face_mask[nb]:
-                edge_counts['open'] += 1
-            else:
-                edge_counts['normal'] += 1
-
-        # 点邻：三个顶点的相邻面并集，减去自身和边邻
-        verts = mesh.faces[fid]
-        all_nb = set()
-        for v_ in verts:
-            row_start = vertex_faces_csr.indptr[v_]
-            row_end = vertex_faces_csr.indptr[v_ + 1]
-            indices = vertex_faces_csr.indices[row_start:row_end]
-            all_nb.update(indices)
-
-        all_nb.discard(fid)
-        point_neighbors = all_nb - edge_neighbor_set
-
-        for nb in point_neighbors:
-            if nonmanifold_face_mask[nb]:
-                point_counts['nonmanifold'] += 1
-            elif open_face_mask[nb]:
-                point_counts['open'] += 1
-            else:
-                point_counts['normal'] += 1
-
-    return point_counts, edge_counts
-
-
-def _compute_single_face_neighbor_stats(mesh, face_id,
-                                        open_face_mask, nonmanifold_face_mask,
-                                        vertex_faces_csr, face_adjacency_csr):
-    """
-    计算指定面片的逐顶点、逐边邻居统计。
-
-    返回：
-        vertex_stats: list of 3 dicts，对应顶点 A,B,C，每个 dict 包含
-                      'normal', 'open', 'nonmanifold'
-        edge_stats:   list of 3 dicts，对应边 AB,BC,CA，每个 dict 包含
-                      'normal', 'open', 'nonmanifold'
-    """
-    verts = mesh.faces[face_id]  # 当前面片的三个顶点索引
-
-    # ---------- 获取边邻信息 ----------
-    # trimesh 的 face_adjacency_edges 提供每对邻接面共享的边 (顶点对)
-    if hasattr(mesh, 'face_adjacency_edges'):
-        face_adj = mesh.face_adjacency
-        face_adj_edges = mesh.face_adjacency_edges
-        # 初始化三条边的邻居面列表
-        edge_neighbors_by_edge = [[], [], []]  # 对应边 AB, BC, CA
-        for (f0, f1), (ev0, ev1) in zip(face_adj, face_adj_edges):
-            if f0 == face_id or f1 == face_id:
-                # 确定该邻接边属于当前面的哪条边
-                for i in range(3):
-                    a = verts[i]
-                    b = verts[(i + 1) % 3]
-                    if (ev0 == a and ev1 == b) or (ev0 == b and ev1 == a):
-                        neighbor = f0 if f1 == face_id else f1
-                        edge_neighbors_by_edge[i].append(neighbor)
-                        break
-    else:
-        # 后备：无法区分边时，将所有边邻面视为同一条边？这里简化处理，
-        # 将边邻集合均分给三条边，但这样不精确；实际 trimesh 应有 face_adjacency_edges。
-        row_start = face_adjacency_csr.indptr[face_id]
-        row_end = face_adjacency_csr.indptr[face_id + 1]
-        all_edge_neighbors = list(face_adjacency_csr.indices[row_start:row_end])
-        edge_neighbors_by_edge = [all_edge_neighbors, all_edge_neighbors, all_edge_neighbors]
-
-    # ---------- 逐边统计 ----------
-    edge_stats = []
-    for i in range(3):
-        cnt = {'normal': 0, 'open': 0, 'nonmanifold': 0}
-        for nb in edge_neighbors_by_edge[i]:
-            if nonmanifold_face_mask[nb]:
-                cnt['nonmanifold'] += 1
-            elif open_face_mask[nb]:
-                cnt['open'] += 1
-            else:
-                cnt['normal'] += 1
-        edge_stats.append(cnt)
-
-    # ---------- 逐顶点统计（点邻） ----------
-    # 首先获取该面的边邻面集合
-    row_start = face_adjacency_csr.indptr[face_id]
-    row_end = face_adjacency_csr.indptr[face_id + 1]
-    edge_neighbors_set = set(face_adjacency_csr.indices[row_start:row_end])
-
-    vertex_stats = []
-    for v in verts:
-        # 该顶点的所有相邻面
-        row_start = vertex_faces_csr.indptr[v]
-        row_end = vertex_faces_csr.indptr[v + 1]
-        all_nb = set(vertex_faces_csr.indices[row_start:row_end])
-        all_nb.discard(face_id)
-        # 点邻 = 顶点邻接面 - 边邻面
-        point_neighbors = all_nb - edge_neighbors_set
-
-        cnt = {'normal': 0, 'open': 0, 'nonmanifold': 0}
-        for nb in point_neighbors:
-            if nonmanifold_face_mask[nb]:
-                cnt['nonmanifold'] += 1
-            elif open_face_mask[nb]:
-                cnt['open'] += 1
-            else:
-                cnt['normal'] += 1
-        vertex_stats.append(cnt)
-
-    return vertex_stats, edge_stats
-
-
-def _generate_topology_diagram_svg(code, vertex_stats, edge_stats):
-    """
-    返回一个内联 SVG 字符串，表示拓扑编码示意图。
-    顶点和边均带有 <title> 悬浮提示，内容为邻接统计。
-    """
-    vA, eAB, vB, eBC, vC, eCA = [c for c in code]
-    coords = {
-        'A': (20, 20),
-        'B': (120, 20),
-        'C': (70, 100)
-    }
-    # 顶点样式：独占实心，共享空心
-    vertex_fill = lambda v: '#000000' if v == '1' else '#ffffff'
-    # 边颜色
-    edge_color = {'1': '#0000ff', '2': '#008000', '3': '#ff0000'}
-
-    # 顶点提示文本
-    vertex_tips = []
-    for i, (v, stats) in enumerate(zip([vA, vB, vC], vertex_stats)):
-        tip = (f"顶点{i}: 点邻面片 流形={stats['normal']}, "
-               f"开放={stats['open']}, 非流形={stats['nonmanifold']}")
-        vertex_tips.append(tip)
-
-    # 边提示文本
-    edge_tips = []
-    for i, (e, stats) in enumerate(zip([eAB, eBC, eCA], edge_stats)):
-        tip = (f"边{i}: 边邻面片 流形={stats['normal']}, "
-               f"开放={stats['open']}, 非流形={stats['nonmanifold']}")
-        edge_tips.append(tip)
-
-    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 140 120" width="200" height="170">
-    <line x1="{coords['A'][0]}" y1="{coords['A'][1]}" x2="{coords['B'][0]}" y2="{coords['B'][1]}"
-          stroke="{edge_color[eAB]}" stroke-width="3">
-        <title>{edge_tips[0]}</title>
-    </line>
-    <line x1="{coords['B'][0]}" y1="{coords['B'][1]}" x2="{coords['C'][0]}" y2="{coords['C'][1]}"
-          stroke="{edge_color[eBC]}" stroke-width="3">
-        <title>{edge_tips[1]}</title>
-    </line>
-    <line x1="{coords['C'][0]}" y1="{coords['C'][1]}" x2="{coords['A'][0]}" y2="{coords['A'][1]}"
-          stroke="{edge_color[eCA]}" stroke-width="3">
-        <title>{edge_tips[2]}</title>
-    </line>
-    <circle cx="{coords['A'][0]}" cy="{coords['A'][1]}" r="8"
-            fill="{vertex_fill(vA)}" stroke="black" stroke-width="2">
-        <title>{vertex_tips[0]}</title>
-    </circle>
-    <circle cx="{coords['B'][0]}" cy="{coords['B'][1]}" r="8"
-            fill="{vertex_fill(vB)}" stroke="black" stroke-width="2">
-        <title>{vertex_tips[1]}</title>
-    </circle>
-    <circle cx="{coords['C'][0]}" cy="{coords['C'][1]}" r="8"
-            fill="{vertex_fill(vC)}" stroke="black" stroke-width="2">
-        <title>{vertex_tips[2]}</title>
-    </circle>
-    </svg>'''
-    return svg
-
-
 def run_full_diagnosis_pass1(mesh, output_dir):
     """
     Pass 1: 计算异常面编码、绘制示意图、生成报告框架和检查点。
@@ -1017,12 +830,9 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
 
     # 预计算共享数据
     vertex_faces_csr = _build_vertex_face_csr(mesh)
-    face_adjacency = mesh.face_adjacency  # (n,2) 数组
-    rows = np.concatenate([face_adjacency[:, 0], face_adjacency[:, 1]])
-    cols = np.concatenate([face_adjacency[:, 1], face_adjacency[:, 0]])
-    data = np.ones(len(rows), dtype=np.int8)
-    face_adjacency_csr = csr_matrix((data, (rows, cols)),
-                                    shape=(len(mesh.faces), len(mesh.faces)))
+    edge_keys, edge_faces = compute_edge_to_faces(mesh)
+    edge_to_faces = {int(k): v for k, v in zip(edge_keys, edge_faces)}
+    face_edge_keys = compute_face_edge_keys(mesh)
 
     results = {}
     for idx, class_id in enumerate(pending_classes):
@@ -1048,16 +858,16 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
             'max': float(np.max(areas)),
         }
 
-        point_counts, edge_counts = _compute_class_neighbor_stats(
+        point_counts, edge_counts = compute_class_neighbor_stats(
             mesh, face_indices, open_face_mask, nonmanifold_face_mask,
-            vertex_faces_csr, face_adjacency_csr
+            vertex_faces_csr, edge_to_faces, face_edge_keys
         )
 
         # 选择代表面，计算逐顶点/逐边统计
         rep_face = int(face_indices[0])
-        vertex_stats, edge_stats = _compute_single_face_neighbor_stats(
+        vertex_stats, edge_stats = compute_single_face_neighbor_stats(
             mesh, rep_face, open_face_mask, nonmanifold_face_mask,
-            vertex_faces_csr, face_adjacency_csr
+            vertex_faces_csr, edge_to_faces, face_edge_keys
         )
 
         class_result = {

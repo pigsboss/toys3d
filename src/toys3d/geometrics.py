@@ -579,6 +579,182 @@ def compute_face_edge_types(mesh):
     return face_edge_types
 
 
+def compute_edge_to_faces(mesh):
+    """
+    返回两个数组：
+        edge_keys: 每条非开放边的唯一键（int64）
+        edge_faces: 列表的列表，每个列表包含共享该边的所有面索引
+    仅包含流形边（2个面）和非流形边（≥3个面）。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    n_faces = len(faces)
+    if n_faces == 0:
+        return np.array([], dtype=np.int64), []
+
+    v0, v1, v2 = faces[:, 0], faces[:, 1], faces[:, 2]
+    ea = np.concatenate([v0, v1, v2])
+    eb = np.concatenate([v1, v2, v0])
+    face_ids = np.repeat(np.arange(n_faces, dtype=np.int64), 3)
+
+    min_e = np.minimum(ea, eb)
+    max_e = np.maximum(ea, eb)
+    n_vertices = int(mesh.vertices.shape[0])
+    if n_vertices == 0:
+        max_vertex = int(max_e.max()) + 1
+    else:
+        max_vertex = n_vertices
+    keys = min_e.astype(np.int64) * (max_vertex + 1) + max_e
+
+    order = np.argsort(keys, kind='stable')
+    keys_sorted = keys[order]
+    face_ids_sorted = face_ids[order]
+
+    diff = np.empty(keys_sorted.shape[0], dtype=bool)
+    diff[0] = True
+    diff[1:] = keys_sorted[1:] != keys_sorted[:-1]
+    start_idx = np.flatnonzero(diff)
+    end_idx = np.append(start_idx[1:], keys_sorted.shape[0])
+    counts = end_idx - start_idx
+
+    # 筛选出非开放边
+    valid = counts >= 2
+    valid_start = start_idx[valid]
+    valid_counts = counts[valid]
+    valid_keys = keys_sorted[valid_start]
+
+    edge_faces = []
+    for s, c in zip(valid_start, valid_counts):
+        edge_faces.append(face_ids_sorted[s:s+c].tolist())
+
+    return valid_keys, edge_faces
+
+
+def compute_face_edge_keys(mesh):
+    """
+    返回形状 (n_faces, 3) 的 int64 数组，每个元素为该面对应边的唯一键，
+    顺序与 (v0,v1), (v1,v2), (v2,v0) 一致。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    n_faces = len(faces)
+    if n_faces == 0:
+        return np.zeros((0, 3), dtype=np.int64)
+
+    v0, v1, v2 = faces[:, 0], faces[:, 1], faces[:, 2]
+    ea = np.concatenate([v0, v1, v2])
+    eb = np.concatenate([v1, v2, v0])
+
+    min_e = np.minimum(ea, eb)
+    max_e = np.maximum(ea, eb)
+    n_vertices = int(mesh.vertices.shape[0])
+    if n_vertices == 0:
+        max_vertex = int(max_e.max()) + 1
+    else:
+        max_vertex = n_vertices
+    keys = min_e.astype(np.int64) * (max_vertex + 1) + max_e
+
+    return keys.reshape(-1, 3)
+
+
+def compute_class_neighbor_stats(mesh, face_indices,
+                                 open_face_mask, nonmanifold_face_mask,
+                                 vertex_faces_csr, edge_to_faces, face_edge_keys):
+    """
+    计算指定面片集合的点邻和边邻面类型计数。
+    边邻基于精确的 edge_to_faces 映射，点邻 = 顶点邻接面 - 边邻面。
+    """
+    point_counts = {'normal': 0, 'open': 0, 'nonmanifold': 0}
+    edge_counts = {'normal': 0, 'open': 0, 'nonmanifold': 0}
+
+    for fid in face_indices:
+        # 边邻：通过三条边键查询所有共享面
+        edge_neighbors = set()
+        for key in face_edge_keys[fid]:
+            for nb in edge_to_faces.get(int(key), []):
+                if nb != fid:
+                    edge_neighbors.add(nb)
+                    if nonmanifold_face_mask[nb]:
+                        edge_counts['nonmanifold'] += 1
+                    elif open_face_mask[nb]:
+                        edge_counts['open'] += 1
+                    else:
+                        edge_counts['normal'] += 1
+
+        # 点邻：顶点邻接面并集减去边邻面
+        verts = mesh.faces[fid]
+        all_nb = set()
+        for v in verts:
+            row_start = vertex_faces_csr.indptr[v]
+            row_end = vertex_faces_csr.indptr[v + 1]
+            indices = vertex_faces_csr.indices[row_start:row_end]
+            all_nb.update(indices)
+        all_nb.discard(fid)
+        point_neighbors = all_nb - edge_neighbors
+
+        for nb in point_neighbors:
+            if nonmanifold_face_mask[nb]:
+                point_counts['nonmanifold'] += 1
+            elif open_face_mask[nb]:
+                point_counts['open'] += 1
+            else:
+                point_counts['normal'] += 1
+
+    return point_counts, edge_counts
+
+
+def compute_single_face_neighbor_stats(mesh, face_id,
+                                       open_face_mask, nonmanifold_face_mask,
+                                       vertex_faces_csr, edge_to_faces, face_edge_keys):
+    """
+    计算指定面片的逐顶点、逐边邻居统计。
+    返回 vertex_stats (list of 3 dicts) 和 edge_stats (list of 3 dicts)。
+    """
+    verts = mesh.faces[face_id]
+
+    # ---- 逐边统计 ----
+    edge_stats = []
+    for i in range(3):
+        key = int(face_edge_keys[face_id, i])
+        neighbor_faces = [nb for nb in edge_to_faces.get(key, []) if nb != face_id]
+
+        cnt = {'normal': 0, 'open': 0, 'nonmanifold': 0}
+        for nb in neighbor_faces:
+            if nonmanifold_face_mask[nb]:
+                cnt['nonmanifold'] += 1
+            elif open_face_mask[nb]:
+                cnt['open'] += 1
+            else:
+                cnt['normal'] += 1
+        edge_stats.append(cnt)
+
+    # ---- 收集该面的所有边邻面，用于点邻计算 ----
+    edge_neighbors_set = set()
+    for key in face_edge_keys[face_id]:
+        for nb in edge_to_faces.get(int(key), []):
+            if nb != face_id:
+                edge_neighbors_set.add(nb)
+
+    # ---- 逐顶点统计 ----
+    vertex_stats = []
+    for v in verts:
+        row_start = vertex_faces_csr.indptr[v]
+        row_end = vertex_faces_csr.indptr[v + 1]
+        all_nb = set(vertex_faces_csr.indices[row_start:row_end])
+        all_nb.discard(face_id)
+        point_neighbors = all_nb - edge_neighbors_set
+
+        cnt = {'normal': 0, 'open': 0, 'nonmanifold': 0}
+        for nb in point_neighbors:
+            if nonmanifold_face_mask[nb]:
+                cnt['nonmanifold'] += 1
+            elif open_face_mask[nb]:
+                cnt['open'] += 1
+            else:
+                cnt['normal'] += 1
+        vertex_stats.append(cnt)
+
+    return vertex_stats, edge_stats
+
+
 def compute_face_topology_codes(mesh, face_indices, vertex_face_counts, face_edge_types):
     """
     计算指定面片的标准化拓扑编码，返回：

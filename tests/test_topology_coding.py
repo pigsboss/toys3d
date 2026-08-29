@@ -12,7 +12,13 @@ from toys3d.geometrics import (
     compute_vertex_face_counts,
     compute_face_edge_types,
     compute_face_topology_codes,
+    compute_edge_to_faces,
+    compute_face_edge_keys,
+    compute_class_neighbor_stats,
+    compute_single_face_neighbor_stats,
+    analyze_mesh_defects,
 )
+from scipy.sparse import csr_matrix
 
 
 def validate_topology_code(code: str) -> bool:
@@ -62,6 +68,16 @@ def validate_topology_code(code: str) -> bool:
         return False
 
     return True
+
+
+def _build_vertex_faces_csr(mesh):
+    """根据 mesh.faces 构建 (n_vertices, n_faces) 的 CSR 矩阵。"""
+    n_vertices = len(mesh.vertices)
+    n_faces = len(mesh.faces)
+    row = mesh.faces.ravel()
+    col = np.repeat(np.arange(n_faces), 3)
+    data = np.ones(3 * n_faces, dtype=np.int8)
+    return csr_matrix((data, (row, col)), shape=(n_vertices, n_faces))
 
 
 @pytest.fixture
@@ -182,3 +198,125 @@ def test_nonmanifold_edge_valid():
     )
     for code in codes:
         assert validate_topology_code(code), f"invalid code: {code}"
+
+
+def test_edge_to_faces_two_triangles_share_edge():
+    vertices = np.array([[0,0,0],[1,0,0],[0,1,0],[1,1,0]], float)
+    faces = np.array([[0,1,2],[0,3,1]], int)
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    edge_keys, edge_faces = compute_edge_to_faces(mesh)
+    assert len(edge_keys) == 1
+    assert len(edge_faces[0]) == 2
+    face_edge_keys = compute_face_edge_keys(mesh)
+    assert face_edge_keys.shape == (2,3)
+
+
+def test_class_neighbor_stats_two_triangles_share_edge():
+    vertices = np.array([[0,0,0],[1,0,0],[0,1,0],[1,1,0]], float)
+    faces = np.array([[0,1,2],[0,3,1]], int)
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    _, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+    edge_keys, edge_faces = compute_edge_to_faces(mesh)
+    edge_to_faces = {int(k): v for k, v in zip(edge_keys, edge_faces)}
+    face_edge_keys = compute_face_edge_keys(mesh)
+    vertex_faces_csr = _build_vertex_faces_csr(mesh)
+
+    point_counts, edge_counts = compute_class_neighbor_stats(
+        mesh, [0,1], open_face_mask, nonmanifold_face_mask,
+        vertex_faces_csr, edge_to_faces, face_edge_keys
+    )
+    # 两个面共享一条边，所以总边邻 normal=2（每个面各一个正常邻居）
+    assert edge_counts == {'normal': 2, 'open': 0, 'nonmanifold': 0}
+    # 无点邻
+    assert point_counts == {'normal': 0, 'open': 0, 'nonmanifold': 0}
+
+
+def test_single_face_neighbor_stats_two_triangles_share_edge():
+    # 类似上面，检查面0的逐边/逐顶点统计
+    vertices = np.array([[0,0,0],[1,0,0],[0,1,0],[1,1,0]], float)
+    faces = np.array([[0,1,2],[0,3,1]], int)
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    _, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+    edge_keys, edge_faces = compute_edge_to_faces(mesh)
+    edge_to_faces = {int(k): v for k, v in zip(edge_keys, edge_faces)}
+    face_edge_keys = compute_face_edge_keys(mesh)
+    vertex_faces_csr = _build_vertex_faces_csr(mesh)
+
+    v_stats, e_stats = compute_single_face_neighbor_stats(
+        mesh, 0, open_face_mask, nonmanifold_face_mask,
+        vertex_faces_csr, edge_to_faces, face_edge_keys
+    )
+    # 面0的边(0,1)是流形边，邻居正常面1
+    # 其他两条边开放，无边邻
+    assert e_stats[0] == {'normal': 1, 'open': 0, 'nonmanifold': 0}
+    for i in [1,2]:
+        assert e_stats[i] == {'normal': 0, 'open': 0, 'nonmanifold': 0}
+    # 三个顶点均无边外点邻
+    for vs in v_stats:
+        assert vs == {'normal': 0, 'open': 0, 'nonmanifold': 0}
+
+
+def test_class_neighbor_stats_three_triangles_share_vertex():
+    # 三个三角形仅共享顶点0，无边共享 => 所有边开放，点邻=两个开放面
+    vertices = np.array([
+        [0,0,0],[1,0,0],[0,1,0],
+        [2,0,0],[3,0,0],
+        [4,0,0],[5,0,0]
+    ], float)
+    faces = np.array([
+        [0,1,2],
+        [0,3,4],
+        [0,5,6]
+    ], int)
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    _, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+    edge_keys, edge_faces = compute_edge_to_faces(mesh)
+    edge_to_faces = {int(k): v for k, v in zip(edge_keys, edge_faces)}
+    face_edge_keys = compute_face_edge_keys(mesh)
+    vertex_faces_csr = _build_vertex_faces_csr(mesh)
+
+    point_counts, edge_counts = compute_class_neighbor_stats(
+        mesh, [0,1,2], open_face_mask, nonmanifold_face_mask,
+        vertex_faces_csr, edge_to_faces, face_edge_keys
+    )
+    # 每个面通过顶点0与另外两个面点邻，所以总点邻 open=6
+    assert point_counts == {'normal': 0, 'open': 6, 'nonmanifold': 0}
+    # 无边邻
+    assert edge_counts == {'normal': 0, 'open': 0, 'nonmanifold': 0}
+
+
+def test_single_face_neighbor_stats_nonmanifold_edge():
+    # 三个三角形共享同一条非流形边(0,1)
+    vertices = np.array([
+        [0,0,0],[1,0,0],[0,1,0],
+        [1,1,0],[0.5,2,0]
+    ], float)
+    faces = np.array([
+        [0,1,2],
+        [1,0,3],
+        [0,1,4]
+    ], int)
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    _, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+    edge_keys, edge_faces = compute_edge_to_faces(mesh)
+    edge_to_faces = {int(k): v for k, v in zip(edge_keys, edge_faces)}
+    face_edge_keys = compute_face_edge_keys(mesh)
+    vertex_faces_csr = _build_vertex_faces_csr(mesh)
+
+    v_stats, e_stats = compute_single_face_neighbor_stats(
+        mesh, 0, open_face_mask, nonmanifold_face_mask,
+        vertex_faces_csr, edge_to_faces, face_edge_keys
+    )
+    # 面0的三条边：边0(0,1)非流形，邻居面1、面2（均为非流形面）=> nonmanifold=2
+    assert e_stats[0] == {'normal': 0, 'open': 0, 'nonmanifold': 2}
+    # 其他边开放，无边邻
+    assert e_stats[1] == {'normal': 0, 'open': 0, 'nonmanifold': 0}
+    assert e_stats[2] == {'normal': 0, 'open': 0, 'nonmanifold': 0}
+    # 顶点点邻应无，因为所有相邻面均通过边相连
+    for vs in v_stats:
+        assert vs == {'normal': 0, 'open': 0, 'nonmanifold': 0}
