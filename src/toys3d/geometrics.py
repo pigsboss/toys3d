@@ -593,11 +593,24 @@ def compute_face_topology_codes(mesh, face_indices, vertex_face_counts, face_edg
     if n == 0:
         return np.array([], dtype=object), {}, []
 
-    # 对每个面获取顶点共享数（截断）
-    v_share = np.where(vertex_face_counts[faces] == 1, '1', '2')  # shape (n,3)
+    # 对每个面获取原始顶点共享数（截断）
+    base_v_share = np.where(vertex_face_counts[faces] == 1, '1', '2')  # shape (n,3)
 
     # 对每个面获取边共享数
     e_share = face_edge_types[face_indices]  # shape (n,3), values 1/2/3
+
+    # 为保证编码拓扑一致性，若某条边是流形/非流形（共享），
+    # 则其两个端点必须视为共享顶点。若某个顶点本身已共享，也保留共享。
+    e0 = e_share[:, 0]
+    e1 = e_share[:, 1]
+    e2 = e_share[:, 2]
+    v0_shared = (base_v_share[:, 0] == '2') | (e0 > 1) | (e2 > 1)
+    v1_shared = (base_v_share[:, 1] == '2') | (e0 > 1) | (e1 > 1)
+    v2_shared = (base_v_share[:, 2] == '2') | (e1 > 1) | (e2 > 1)
+    v_share = np.empty_like(base_v_share)
+    v_share[:, 0] = np.where(v0_shared, '2', '1')
+    v_share[:, 1] = np.where(v1_shared, '2', '1')
+    v_share[:, 2] = np.where(v2_shared, '2', '1')
     e_share_str = e_share.astype(str)  # convert to strings
 
     # 组装原始字符串序列：A, AB, B, BC, C, CA
