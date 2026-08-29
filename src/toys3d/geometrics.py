@@ -62,15 +62,15 @@ def analyze_mesh_defects(mesh, return_face_edge_counts=False):
             )
 
     # 1. 构建所有边的两个端点（共 3F 条边）
-    v0 = faces[:, 0]
-    v1 = faces[:, 1]
-    v2 = faces[:, 2]
+    # 先构建形状 (n_faces, 3, 2)，每行对应一个面的三条边
+    edge_pairs = np.stack([
+        faces[:, [0, 1]],
+        faces[:, [1, 2]],
+        faces[:, [2, 0]]
+    ], axis=1).reshape(-1, 2)
 
-    # 三条边分别为 (v0,v1), (v1,v2), (v2,v0)
-    ea = np.concatenate([v0, v1, v2])
-    eb = np.concatenate([v1, v2, v0])
-
-    # 对应每条边的面片索引
+    ea = edge_pairs[:, 0]
+    eb = edge_pairs[:, 1]
     face_ids = np.repeat(np.arange(n_faces, dtype=np.int64), 3)
 
     # 将边端点排序，使 (v0,v1) 和 (v1,v0) 被视为同一条边
@@ -541,9 +541,14 @@ def compute_face_edge_types(mesh):
     if n_faces == 0:
         return np.zeros((0, 3), dtype=np.uint8)
 
-    v0, v1, v2 = faces[:, 0], faces[:, 1], faces[:, 2]
-    ea = np.concatenate([v0, v1, v2])
-    eb = np.concatenate([v1, v2, v0])
+    edge_pairs = np.stack([
+        faces[:, [0, 1]],
+        faces[:, [1, 2]],
+        faces[:, [2, 0]]
+    ], axis=1).reshape(-1, 2)
+
+    ea = edge_pairs[:, 0]
+    eb = edge_pairs[:, 1]
     face_ids = np.repeat(np.arange(n_faces, dtype=np.int64), 3)
 
     min_e = np.minimum(ea, eb)
@@ -591,9 +596,14 @@ def compute_edge_to_faces(mesh):
     if n_faces == 0:
         return np.array([], dtype=np.int64), []
 
-    v0, v1, v2 = faces[:, 0], faces[:, 1], faces[:, 2]
-    ea = np.concatenate([v0, v1, v2])
-    eb = np.concatenate([v1, v2, v0])
+    edge_pairs = np.stack([
+        faces[:, [0, 1]],
+        faces[:, [1, 2]],
+        faces[:, [2, 0]]
+    ], axis=1).reshape(-1, 2)
+
+    ea = edge_pairs[:, 0]
+    eb = edge_pairs[:, 1]
     face_ids = np.repeat(np.arange(n_faces, dtype=np.int64), 3)
 
     min_e = np.minimum(ea, eb)
@@ -639,9 +649,14 @@ def compute_face_edge_keys(mesh):
     if n_faces == 0:
         return np.zeros((0, 3), dtype=np.int64)
 
-    v0, v1, v2 = faces[:, 0], faces[:, 1], faces[:, 2]
-    ea = np.concatenate([v0, v1, v2])
-    eb = np.concatenate([v1, v2, v0])
+    edge_pairs = np.stack([
+        faces[:, [0, 1]],
+        faces[:, [1, 2]],
+        faces[:, [2, 0]]
+    ], axis=1).reshape(-1, 2)
+
+    ea = edge_pairs[:, 0]
+    eb = edge_pairs[:, 1]
 
     min_e = np.minimum(ea, eb)
     max_e = np.maximum(ea, eb)
