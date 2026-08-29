@@ -1286,6 +1286,28 @@ def perform_full_diagnosis(mesh, args):
     else:
         generate_latex_report(output_dir, id_to_code, results)
 
+    # 计算异常面总数（用于 meta）
+    abnormal_mask = open_face_mask | nonmanifold_face_mask
+    abnormal_count = int(abnormal_mask.sum())
+
+    # 保存 JSON 诊断报告（机器可读格式）
+    json_path = output_dir / "diagnosis_results.json"
+    diagnosis_json = {
+        "meta": {
+            "mesh_file": args.input_file,
+            "abnormal_count": abnormal_count,
+            "total_classes": len(id_to_code),
+            "classes_completed": len(results),
+            "format_version": 1,
+            "generated_by": "meshinspect.py --full-diagnosis",
+        },
+        "id_to_code": id_to_code,
+        "classes": {str(class_id): res for class_id, res in results.items()},
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(diagnosis_json, f, indent=2, ensure_ascii=False)
+    print(f"JSON 诊断报告已保存: {json_path}")
+
     print(f"\nFull Diagnosis 完成，报告已生成到 {output_dir}")
 
 
