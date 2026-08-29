@@ -227,8 +227,9 @@ def test_class_neighbor_stats_two_triangles_share_edge():
         mesh, [0,1], open_face_mask, nonmanifold_face_mask,
         vertex_faces_csr, edge_to_faces, face_edge_keys
     )
-    # 两个面共享一条边，所以总边邻 normal=2（每个面各一个正常邻居）
-    assert edge_counts == {'normal': 2, 'open': 0, 'nonmanifold': 0}
+    # 两个面共享一条边，每个面的邻居都是开放面（因为每个面都有开放边），
+    # 所以边邻均为 open。
+    assert edge_counts == {'normal': 0, 'open': 2, 'nonmanifold': 0}
     # 无点邻
     assert point_counts == {'normal': 0, 'open': 0, 'nonmanifold': 0}
 
@@ -249,9 +250,9 @@ def test_single_face_neighbor_stats_two_triangles_share_edge():
         mesh, 0, open_face_mask, nonmanifold_face_mask,
         vertex_faces_csr, edge_to_faces, face_edge_keys
     )
-    # 面0的边(0,1)是流形边，邻居正常面1
+    # 面0的边(0,1)是共享边，邻居面1是开放面（它也有开放边）
     # 其他两条边开放，无边邻
-    assert e_stats[0] == {'normal': 1, 'open': 0, 'nonmanifold': 0}
+    assert e_stats[0] == {'normal': 0, 'open': 1, 'nonmanifold': 0}
     for i in [1,2]:
         assert e_stats[i] == {'normal': 0, 'open': 0, 'nonmanifold': 0}
     # 三个顶点均无边外点邻
@@ -307,6 +308,14 @@ def test_single_face_neighbor_stats_nonmanifold_edge():
     edge_to_faces = {int(k): v for k, v in zip(edge_keys, edge_faces)}
     face_edge_keys = compute_face_edge_keys(mesh)
     vertex_faces_csr = _build_vertex_faces_csr(mesh)
+
+    # 临时诊断输出，便于定位 edge_to_faces 映射问题
+    print("edge_to_faces keys:", list(edge_to_faces.keys()))
+    print("nonmanifold_face_mask:", nonmanifold_face_mask)
+    print("face_edge_keys[0]:", face_edge_keys[0])
+    print("nonmanifold edge key:", int(face_edge_keys[0, 0]))
+    print("edge_to_faces.get(key):",
+          edge_to_faces.get(int(face_edge_keys[0, 0])))
 
     v_stats, e_stats = compute_single_face_neighbor_stats(
         mesh, 0, open_face_mask, nonmanifold_face_mask,
