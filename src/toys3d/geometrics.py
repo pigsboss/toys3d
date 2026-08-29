@@ -627,7 +627,8 @@ def compute_face_topology_codes(mesh, face_indices, vertex_face_counts, face_edg
         variants = []
         for shift in [0, 2, 4]:
             variants.append(raw[shift:] + raw[:shift])
-        mirror = raw[::-1]
+        # 正确镜像：v0, e2, v2, e1, v1, e0，保持顶点-边交替
+        mirror = raw[0] + raw[5] + raw[4] + raw[3] + raw[2] + raw[1]
         variants.append(mirror)
         for shift in [2, 4]:
             variants.append(mirror[shift:] + mirror[:shift])
