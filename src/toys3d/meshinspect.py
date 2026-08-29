@@ -949,7 +949,11 @@ def generate_html_report(output_dir, id_to_code, results):
             e_stats = [{'normal': 0, 'open': 0, 'nonmanifold': 0} for _ in range(3)]
 
         # 内联 SVG 交互图
-        svg_content = _generate_topology_diagram_svg(code, v_stats, e_stats)
+        diagram_path = output_dir / "diagrams" / f"diagram_{class_id}.svg"
+        if diagram_path.exists():
+            svg_content = diagram_path.read_text(encoding="utf-8")
+        else:
+            svg_content = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='170'><text x='10' y='80'>Diagram not generated</text></svg>"
 
         html.append("<div class='class-block'>")
         html.append(f"<h3>Class {class_id}: {code}</h3>")
