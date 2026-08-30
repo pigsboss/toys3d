@@ -833,3 +833,30 @@ def compute_face_topology_codes(mesh, face_indices, vertex_face_counts, face_edg
     id_to_code = unique_codes
 
     return codes, code_to_id, id_to_code
+
+
+def compute_raw_codes_for_faces(mesh, face_indices, vertex_face_counts,
+                                edge_to_faces, face_edge_keys):
+    """
+    返回指定面片的原始具体拓扑编码列表。
+
+    每个编码为 6 位字符串，格式：
+        顶点A共享数, 边AB共享数, 顶点B共享数, 边BC共享数, 顶点C共享数, 边CA共享数
+    其中顶点共享数为真实值，边共享数为真实值（开放边为1，流形边为2，非流形边≥3）。
+    """
+    faces = np.asarray(mesh.faces)[face_indices]
+    raw_codes = []
+    for i, fid in enumerate(face_indices):
+        v_counts = vertex_face_counts[faces[i]]          # 三个顶点真实共享数
+        e_counts = []
+        for j in range(3):
+            key = int(face_edge_keys[fid, j])
+            shared_faces = edge_to_faces.get(key, [])
+            # 若边不在 edge_to_faces 中，则为开放边，计数为1
+            e_counts.append(len(shared_faces) if shared_faces else 1)
+        # 顺序：vA, eAB, vB, eBC, vC, eCA
+        code = (f"{v_counts[0]}{e_counts[0]}"
+                f"{v_counts[1]}{e_counts[1]}"
+                f"{v_counts[2]}{e_counts[2]}")
+        raw_codes.append(code)
+    return raw_codes

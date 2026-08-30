@@ -19,7 +19,7 @@ import json
 from pathlib import Path
 import numpy as np
 import trimesh
-from collections import deque
+from collections import deque, Counter
 from scipy.sparse import csr_matrix
 
 import matplotlib
@@ -44,6 +44,7 @@ from toys3d.geometrics import (
     compute_face_edge_keys,
     compute_class_neighbor_stats,
     compute_single_face_neighbor_stats,
+    compute_raw_codes_for_faces,
 )
 
 
@@ -830,6 +831,7 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
 
     # 预计算共享数据
     vertex_faces_csr = _build_vertex_face_csr(mesh)
+    vertex_face_counts = compute_vertex_face_counts(mesh)
     edge_keys, edge_faces = compute_edge_to_faces(mesh)
     edge_to_faces = {int(k): v for k, v in zip(edge_keys, edge_faces)}
     face_edge_keys = compute_face_edge_keys(mesh)
@@ -870,6 +872,13 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
             vertex_faces_csr, edge_to_faces, face_edge_keys
         )
 
+        # 计算原始具体编码分布（归并前）
+        raw_codes = compute_raw_codes_for_faces(
+            mesh, face_indices, vertex_face_counts,
+            edge_to_faces, face_edge_keys
+        )
+        raw_code_distribution = dict(Counter(raw_codes))
+
         class_result = {
             'class_id': int(class_id),
             'code': code,
@@ -878,6 +887,7 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
             'edge_counts': edge_counts,
             'representative_vertex_stats': vertex_stats,
             'representative_edge_stats': edge_stats,
+            'raw_code_distribution': raw_code_distribution,
         }
         results[class_id] = class_result
 
