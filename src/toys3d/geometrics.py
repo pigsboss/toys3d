@@ -860,3 +860,69 @@ def compute_raw_codes_for_faces(mesh, face_indices, vertex_face_counts,
                 f"{v_counts[2]}{e_counts[2]}")
         raw_codes.append(code)
     return raw_codes
+
+
+def get_face_topology_code_and_order(mesh, face_id, vertex_face_counts, edge_to_faces, face_edge_keys):
+    """
+    返回指定面片的标准化拓扑编码以及对应的顶点/边顺序映射。
+
+    参数：
+        mesh: trimesh.Trimesh
+        face_id: int
+        vertex_face_counts: np.ndarray
+        edge_to_faces: dict
+        face_edge_keys: np.ndarray, shape (n_faces,3)
+    返回：
+        standard_code: str
+        vertex_order: list of int, 标准编码中顶点序列对应的原始顶点索引
+        edge_order: list of int, 标准编码中边序列对应的原始边索引
+    """
+    verts = mesh.faces[face_id]
+    v_counts = vertex_face_counts[verts]  # 真实顶点共享数
+
+    # 从 edge_to_faces 获取边共享数，开放边为1
+    e_counts = []
+    for j in range(3):
+        key = int(face_edge_keys[face_id, j])
+        shared_faces = edge_to_faces.get(key, [])
+        e_counts.append(len(shared_faces) if shared_faces else 1)
+    e_counts = np.array(e_counts)
+
+    # 应用与 compute_face_topology_codes 相同的拓扑一致性修正
+    e0, e1, e2 = e_counts
+    v0_shared = (v_counts[0] > 1) or (e0 > 1) or (e2 > 1)
+    v1_shared = (v_counts[1] > 1) or (e0 > 1) or (e1 > 1)
+    v2_shared = (v_counts[2] > 1) or (e1 > 1) or (e2 > 1)
+    v_share_corrected = np.where([v0_shared, v1_shared, v2_shared], '2', '1')
+    e_str = [str(e) for e in e_counts]
+
+    raw = ''.join([v_share_corrected[0], e_str[0],
+                   v_share_corrected[1], e_str[1],
+                   v_share_corrected[2], e_str[2]])
+
+    # 六种对称变换及其对应的顶点/边顺序
+    transforms = [
+        {"vertex_order": [0, 1, 2], "edge_order": [0, 1, 2]},  # 原始
+        {"vertex_order": [1, 2, 0], "edge_order": [1, 2, 0]},  # 旋转2
+        {"vertex_order": [2, 0, 1], "edge_order": [2, 0, 1]},  # 旋转4
+        {"vertex_order": [0, 2, 1], "edge_order": [2, 1, 0]},  # 镜像
+        {"vertex_order": [2, 1, 0], "edge_order": [1, 0, 2]},  # 镜像旋转2
+        {"vertex_order": [1, 0, 2], "edge_order": [0, 2, 1]},  # 镜像旋转4
+    ]
+
+    # 候选字符串及变换索引
+    candidates = []
+    for shift, idx in [(0, 0), (2, 1), (4, 2)]:
+        cand = raw[shift:] + raw[:shift]
+        candidates.append((cand, idx))
+
+    mirror = raw[0] + raw[5] + raw[4] + raw[3] + raw[2] + raw[1]
+    candidates.append((mirror, 3))
+    for shift, offset in [(2, 1), (4, 2)]:
+        cand = mirror[shift:] + mirror[:shift]
+        candidates.append((cand, 3 + offset))
+
+    # 选择字典序最小的候选
+    min_code, min_idx = min(candidates, key=lambda x: x[0])
+    transform = transforms[min_idx]
+    return min_code, transform["vertex_order"], transform["edge_order"]

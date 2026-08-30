@@ -45,6 +45,7 @@ from toys3d.geometrics import (
     compute_class_neighbor_stats,
     compute_single_face_neighbor_stats,
     compute_raw_codes_for_faces,
+    get_face_topology_code_and_order,
 )
 
 
@@ -872,6 +873,15 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
             vertex_faces_csr, edge_to_faces, face_edge_keys
         )
 
+        # 获取代表面的标准编码对应的顶点/边顺序
+        _, v_order, e_order = get_face_topology_code_and_order(
+            mesh, rep_face, vertex_face_counts, edge_to_faces, face_edge_keys
+        )
+
+        # 重排统计与标准编码对齐
+        aligned_vertex_stats = [vertex_stats[i] for i in v_order]
+        aligned_edge_stats = [edge_stats[i] for i in e_order]
+
         # 计算原始具体编码分布（归并前）
         raw_codes = compute_raw_codes_for_faces(
             mesh, face_indices, vertex_face_counts,
@@ -885,8 +895,8 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
             'area_stats': area_stats,
             'point_counts': point_counts,
             'edge_counts': edge_counts,
-            'representative_vertex_stats': vertex_stats,
-            'representative_edge_stats': edge_stats,
+            'representative_vertex_stats': aligned_vertex_stats,
+            'representative_edge_stats': aligned_edge_stats,
             'raw_code_distribution': raw_code_distribution,
         }
         results[class_id] = class_result
