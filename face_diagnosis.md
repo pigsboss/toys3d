@@ -3,6 +3,8 @@ name: face-diagnosis
 description: 三角网格异常面片拓扑分类与编码分析 SKILL
 ---
 
+> 本文档为纯说明性规范，不创建任何新文件。文中路径均为占位示例。
+
 # Face Diagnosis：三角网格异常面片拓扑分类
 
 ## 1. 适用范围
