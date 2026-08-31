@@ -749,7 +749,7 @@ def _build_vertex_face_csr(mesh):
     return csr_matrix((data, (row_idx, col_idx)), shape=(n_vertices, n_faces))
 
 
-def run_full_diagnosis_pass1(mesh, output_dir, valence_threshold=8):
+def run_full_diagnosis_pass1(mesh, output_dir, valence_threshold=5):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -831,7 +831,7 @@ def run_full_diagnosis_pass1(mesh, output_dir, valence_threshold=8):
 
 def run_full_diagnosis_pass2(mesh, output_dir, class_faces,
                              open_face_mask, nonmanifold_face_mask,
-                             valence_threshold=8,
+                             valence_threshold=5,
                              resume=False):
     output_dir = Path(output_dir)
     checkpoint_path = output_dir / "checkpoint.json"
@@ -1828,8 +1828,8 @@ def main():
                         help="从现有检查点继续 Full Diagnosis Pass 2（跳过已完成类别）")
     parser.add_argument("--valence-threshold",
                         type=int,
-                        default=8,
-                        help="顶点元 valence 截断阈值，默认 8。"
+                        default=5,
+                        help="顶点元 valence 截断阈值，默认 5。"
                              "当顶点被引用的面片数 >= 阈值时，截断编码归并为该阈值。")
 
     if len(sys.argv) == 1:
