@@ -1448,6 +1448,7 @@ def analyze_uncovered_open_edge_components(mesh, hole_data, spatial_threshold=No
             'num_edges': int(len(comp_global)),
             'num_vertices': int(len(unique_verts)),
             'vertices': unique_verts.tolist(),
+            'edge_vertex_pairs': comp_edges.tolist(),   # 新增
             'endpoints': endpoints.tolist(),
             'branch_vertices': branch_vertices.tolist(),
             'is_cycle': bool(is_cycle),

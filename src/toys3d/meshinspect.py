@@ -812,6 +812,87 @@ def _generate_topology_diagram(code, output_path):
     plt.close(fig)
 
 
+def _generate_component_3d_diagram(component, mesh, output_path):
+    """
+    为单个未覆盖开放边连通分量生成三维 SVG 图。
+
+    - 边：蓝色线段
+    - 端点（度数为1）：绿色圆点
+    - 分支点（度数>=3）：红色方块
+    - 候选断裂点对：橙色虚线
+    """
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    vertex_pairs = component.get('edge_vertex_pairs', [])
+    if not vertex_pairs:
+        return
+
+    vertices = mesh.vertices
+    # 提取组件所有顶点索引，用于确定坐标范围
+    involved_vertices = list(set(sum(vertex_pairs, [])))
+
+    v_coords = vertices[involved_vertices]
+    vmin = v_coords.min(axis=0)
+    vmax = v_coords.max(axis=0)
+    center = (vmin + vmax) / 2.0
+    max_extent = (vmax - vmin).max()
+    extra = max_extent * 0.1 + 1e-12
+
+    fig = plt.figure(figsize=(3.0, 3.0), dpi=120)
+    ax = fig.add_subplot(111, projection='3d')
+
+    # 绘制边
+    for v0, v1 in vertex_pairs:
+        p0 = vertices[v0]
+        p1 = vertices[v1]
+        ax.plot(
+            [p0[0], p1[0]], [p0[1], p1[1]], [p0[2], p1[2]],
+            color='blue', linewidth=0.8, alpha=0.7
+        )
+
+    # 端点
+    endpoints = component.get('endpoints', [])
+    if endpoints:
+        ep = vertices[endpoints]
+        ax.scatter(ep[:, 0], ep[:, 1], ep[:, 2],
+                   c='green', marker='o', s=20, label='端点')
+
+    # 分支点
+    branch_vertices = component.get('branch_vertices', [])
+    if branch_vertices:
+        bv = vertices[branch_vertices]
+        ax.scatter(bv[:, 0], bv[:, 1], bv[:, 2],
+                   c='red', marker='s', s=30, label='分支点')
+
+    # 候选断裂点对
+    candidate_breaks = component.get('candidate_breaks', [])
+    for cand in candidate_breaks:
+        p0 = vertices[cand['v0']]
+        p1 = vertices[cand['v1']]
+        ax.plot(
+            [p0[0], p1[0]], [p0[1], p1[1]], [p0[2], p1[2]],
+            '--', color='orange', linewidth=0.8, alpha=0.9
+        )
+
+    # 设置坐标轴范围，使图居中
+    ax.set_xlim([center[0] - max_extent/2 - extra, center[0] + max_extent/2 + extra])
+    ax.set_ylim([center[1] - max_extent/2 - extra, center[1] + max_extent/2 + extra])
+    ax.set_zlim([center[2] - max_extent/2 - extra, center[2] + max_extent/2 + extra])
+
+    # 隐藏坐标轴
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_zticks([])
+    ax.set_axis_off()
+
+    if endpoints or branch_vertices:
+        ax.legend(loc='upper right', fontsize=6)
+
+    plt.tight_layout(pad=0)
+    plt.savefig(output_path, format='svg', bbox_inches='tight', pad_inches=0.1)
+    plt.close(fig)
+
+
 def _build_vertex_face_csr(mesh):
     """
     构建 (n_vertices, n_faces) 的 CSR 矩阵，行内存储包含该顶点的面索引。
@@ -1517,7 +1598,9 @@ def perform_hole_diagnosis(mesh, args):
             "<style>body{font-family:sans-serif;margin:20px}",
             "table{border-collapse:collapse;width:100%;margin-bottom:20px}",
             "th,td{border:1px solid #ccc;padding:4px 8px;text-align:center}",
-            "th{background:#f0f0f0}</style></head><body>",
+            "th{background:#f0f0f0}",
+            ".component-block{margin-bottom:20px;border:1px solid #ddd;padding:10px}",
+            "</style></head><body>",
             "<h1>Hole Diagnosis Report</h1>",
             f"<p>总开放边: {total_open_edges}</p>",
             f"<p>健康孔洞数: {total_holes}</p>",
@@ -1542,6 +1625,37 @@ def perform_hole_diagnosis(mesh, args):
                     f"<td>{len(comp['endpoints'])}</td><td>{len(comp['branch_vertices'])}</td>"
                     f"<td>{len(comp['candidate_breaks'])}</td></tr>")
     html.append("</table>")
+
+    # 生成并嵌入每个组件的 3D 图
+    component_diagrams_dir = output_dir / "component_diagrams"
+    component_diagrams_dir.mkdir(exist_ok=True)
+
+    html.append("<h2>未覆盖开放边组件三维视图</h2>")
+    for comp in components:
+        comp_id = comp['component_id']
+        diagram_path = component_diagrams_dir / f"component_{comp_id}.svg"
+        try:
+            _generate_component_3d_diagram(comp, mesh, str(diagram_path))
+        except Exception as e:
+            print(f"  [WARN] Component {comp_id} 3D diagram failed: {e}")
+            diagram_path = None
+
+        if diagram_path and diagram_path.exists():
+            svg_content = diagram_path.read_text(encoding="utf-8")
+        else:
+            svg_content = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='170'><text x='10' y='80'>Diagram not generated</text></svg>"
+
+        html.append("<div class='component-block'>")
+        html.append(f"<h3>组件 {comp_id}（边数 {comp['num_edges']}）</h3>")
+        html.append("<div class='diagram-container'>")
+        html.append(svg_content)
+        html.append("</div>")
+        html.append("<p>")
+        html.append(f"顶点数: {comp['num_vertices']} | 端点: {len(comp['endpoints'])} | "
+                    f"分支点: {len(comp['branch_vertices'])} | 断裂候选: {len(comp['candidate_breaks'])}")
+        html.append("</p>")
+        html.append("</div>")
+
     html.append("</body></html>")
     html_path.write_text("\n".join(html), encoding="utf-8")
     print(f"孔洞诊断 HTML 报告已保存: {html_path}")
