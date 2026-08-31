@@ -51,6 +51,7 @@ from toys3d.geometrics import (
     save_codes,
     group_faces_by_topology_codes,
     build_hole_diagnosis_data,
+    analyze_uncovered_open_edge_components,
 )
 
 
@@ -1446,7 +1447,18 @@ def perform_hole_diagnosis(mesh, args):
         uncovered_category=hole_data['uncovered_category'],
     )
 
-    # 2. 构造 JSON 报告
+    # 2. 分析未覆盖开放边连通分量（异常孔洞）
+    print("分析未覆盖开放边连通分量...")
+    components = analyze_uncovered_open_edge_components(mesh, hole_data)
+    component_json_path = output_dir / "uncovered_component_analysis.json"
+    with open(component_json_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "total_components": len(components),
+            "components": components,
+        }, f, indent=2, ensure_ascii=False)
+    print(f"未覆盖开放边分量分析已保存: {component_json_path}")
+
+    # 3. 构造 JSON 报告
     print("生成孔洞诊断 JSON...")
     total_open_edges = len(open_edge_ids)
     total_holes = len(hole_data['hole_vertex_lists'])
@@ -1498,7 +1510,7 @@ def perform_hole_diagnosis(mesh, args):
     with open(output_dir / "hole_diagnosis.json", "w", encoding="utf-8") as f:
         json.dump(diagnosis_json, f, indent=2, ensure_ascii=False)
 
-    # 3. 生成 HTML 报告
+    # 4. 生成 HTML 报告
     print("生成孔洞诊断 HTML...")
     html_path = output_dir / "hole_report.html"
     html = ["<html><head><meta charset='utf-8'><title>Hole Diagnosis</title>",
@@ -1521,6 +1533,14 @@ def perform_hole_diagnosis(mesh, args):
     for hole in hole_info_list:
         html.append(f"<tr><td>{hole['hole_id']}</td><td>{hole['num_edges']}</td>"
                     f"<td>{hole['area']:.6f}</td><td>{hole['perimeter']:.6f}</td></tr>")
+    html.append("</table>")
+    html.append("<h2>未覆盖开放边组件分析</h2>")
+    html.append("<table><tr><th>组件ID</th><th>边数</th><th>端点</th><th>分支点</th>"
+                "<th>断裂候选</th></tr>")
+    for comp in components:
+        html.append(f"<tr><td>{comp['component_id']}</td><td>{comp['num_edges']}</td>"
+                    f"<td>{len(comp['endpoints'])}</td><td>{len(comp['branch_vertices'])}</td>"
+                    f"<td>{len(comp['candidate_breaks'])}</td></tr>")
     html.append("</table>")
     html.append("</body></html>")
     html_path.write_text("\n".join(html), encoding="utf-8")

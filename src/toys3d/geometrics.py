@@ -1325,3 +1325,137 @@ def build_hole_diagnosis_data(mesh):
         'uncovered_category': categories,
         'nonmanifold_face_mask': nonmanifold_face_mask,
     }
+
+
+def analyze_uncovered_open_edge_components(mesh, hole_data, spatial_threshold=None):
+    """
+    进一步分析“异常孔洞”：对未覆盖开放边做连通分量分析，找出导致
+    健康孔洞无法闭合的异常点/断裂点。
+
+    返回:
+        list of dict，每个元素描述一个未覆盖开放边连通分量，包含：
+            component_id         : int，分量编号
+            num_edges            : int，分量内边数
+            num_vertices         : int，分量内顶点数
+            vertices             : list[int]，分量顶点索引
+            endpoints            : list[int]，度数为 1 的顶点（端点）
+            branch_vertices      : list[int]，度数 >= 3 的顶点（分支点）
+            is_cycle             : bool，是否所有顶点度数均为 2（闭合环）
+            face_ids             : list[int]，相邻面片索引（去重）
+            open_face_count      : int，开放面数量（所有相邻面均为开放面）
+            nonmanifold_face_count : int，非流形面数量
+            candidate_breaks     : list[dict]，空间上可能断裂的端点对
+                                   [{'v0':int,'v1':int,'distance':float}]
+    """
+    from scipy.spatial import cKDTree
+
+    uncovered_ids = hole_data['uncovered_edge_ids']
+    all_vertex_pairs = hole_data['open_edge_vertex_pairs']
+    all_face_ids = hole_data['open_edge_face_ids']
+    vertex_csr = hole_data['vertex_open_edges_csr']
+    hole_ids_per_edge = hole_data['hole_ids_per_edge']
+    nonmanifold_face_mask = hole_data['nonmanifold_face_mask']
+
+    U = len(uncovered_ids)
+    if U == 0:
+        return []
+
+    # 建立全局开放边 ID 到未覆盖索引的映射
+    uncovered_index = np.full(len(hole_ids_per_edge), -1, dtype=np.int64)
+    uncovered_index[uncovered_ids] = np.arange(U, dtype=np.int64)
+
+    visited = np.zeros(U, dtype=bool)
+    components = []
+
+    # BFS 搜索连通分量
+    for start in range(U):
+        if visited[start]:
+            continue
+        comp_indices = []
+        queue = deque([start])
+        visited[start] = True
+
+        while queue:
+            ue_idx = queue.popleft()
+            comp_indices.append(ue_idx)
+            global_eid = uncovered_ids[ue_idx]
+            v0, v1 = all_vertex_pairs[global_eid]
+
+            for v in (v0, v1):
+                row_start = vertex_csr.indptr[v]
+                row_end = vertex_csr.indptr[v + 1]
+                for j in range(row_start, row_end):
+                    gid = vertex_csr.indices[j]
+                    if hole_ids_per_edge[gid] != -1:
+                        continue
+                    nu = uncovered_index[gid]
+                    if nu == -1 or visited[nu]:
+                        continue
+                    visited[nu] = True
+                    queue.append(int(nu))
+
+        # 本分量数据
+        comp_local = np.array(comp_indices, dtype=np.int64)
+        comp_global = uncovered_ids[comp_local]
+        comp_edges = all_vertex_pairs[comp_global]
+        comp_face_ids = np.unique(all_face_ids[comp_global])
+
+        # 顶点度数（未覆盖子图）
+        verts = comp_edges.ravel()
+        unique_verts, counts = np.unique(verts, return_counts=True)
+        endpoints = unique_verts[counts == 1]
+        branch_vertices = unique_verts[counts >= 3]
+        is_cycle = bool(np.all(counts == 2) and len(unique_verts) == len(comp_global))
+
+        # 几何断裂候选
+        candidate_breaks = []
+        if len(endpoints) >= 2:
+            endpoint_pts = mesh.vertices[endpoints]
+            if spatial_threshold is None:
+                edge_lengths = np.linalg.norm(
+                    mesh.vertices[comp_edges[:, 1]] - mesh.vertices[comp_edges[:, 0]],
+                    axis=1
+                )
+                if len(edge_lengths) == 0:
+                    spatial_threshold = 0.0
+                else:
+                    spatial_threshold = float(np.median(edge_lengths)) * 3.0
+
+            if spatial_threshold > 0:
+                tree = cKDTree(endpoint_pts)
+                pairs = tree.query_pairs(spatial_threshold, output_type='ndarray')
+
+                # 排除直接相连的边（同一条边的两个端点）
+                direct_edges = set()
+                for a, b in comp_edges:
+                    direct_edges.add((int(a), int(b)))
+                    direct_edges.add((int(b), int(a)))
+
+                for i, j in pairs:
+                    u = int(endpoints[i])
+                    v = int(endpoints[j])
+                    if (u, v) in direct_edges or (v, u) in direct_edges:
+                        continue
+                    dist = float(np.linalg.norm(mesh.vertices[u] - mesh.vertices[v]))
+                    candidate_breaks.append({'v0': u, 'v1': v, 'distance': dist})
+
+        # 非流形面统计
+        nonmanifold_face_count = int(np.sum(nonmanifold_face_mask[comp_face_ids]))
+        open_face_count = len(comp_face_ids)  # 所有相邻面都含开放边
+
+        component_info = {
+            'component_id': len(components),
+            'num_edges': int(len(comp_global)),
+            'num_vertices': int(len(unique_verts)),
+            'vertices': unique_verts.tolist(),
+            'endpoints': endpoints.tolist(),
+            'branch_vertices': branch_vertices.tolist(),
+            'is_cycle': bool(is_cycle),
+            'face_ids': comp_face_ids.tolist(),
+            'open_face_count': open_face_count,
+            'nonmanifold_face_count': nonmanifold_face_count,
+            'candidate_breaks': candidate_breaks,
+        }
+        components.append(component_info)
+
+    return components
