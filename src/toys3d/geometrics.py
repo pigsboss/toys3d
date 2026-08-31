@@ -772,157 +772,169 @@ def compute_single_face_neighbor_stats(mesh, face_id,
 
 def compute_face_topology_codes(mesh, face_indices, vertex_face_counts, face_edge_types):
     """
-    计算指定面片的标准化拓扑编码，返回：
-      codes: np.ndarray of str, 长度与 face_indices 相同
-      code_to_id: dict, 编码字符串到整数 id 的映射
-      id_to_code: list, 整数 id 到编码字符串的映射
-    顶点编码：共享面数 ==1 -> '1', >=2 -> '2'
-    边编码：共享面数 ==1 -> '1', ==2 -> '2', >=3 -> '3'
+    计算指定面片的标准化拓扑编码。
+
+    返回:
+        codes : np.ndarray, 形状 (n,6), dtype uint8
+                每行 6 个字段依次为: vA, eAB, vB, eBC, vC, eCA
+                顶点元为真实 valence 截断到 255；边元为 1/2/3。
+        code_to_id : dict, 6 字节 bytes 编码 -> 整数 id
+        id_to_code : list, 整数 id -> 6 字节 bytes 编码
     """
-    faces = np.asarray(mesh.faces)[face_indices]
+    face_indices = np.asarray(face_indices, dtype=np.int64)
     n = len(face_indices)
     if n == 0:
-        return np.array([], dtype=object), {}, []
+        return np.zeros((0, 6), dtype=np.uint8), {}, []
 
-    # 对每个面获取原始顶点共享数（截断）
-    base_v_share = np.where(vertex_face_counts[faces] == 1, '1', '2')  # shape (n,3)
+    faces = np.asarray(mesh.faces)[face_indices]
+    # 顶点元：真实 valence，截断到 uint8 上限
+    v_counts_raw = vertex_face_counts[faces]
+    v_counts = np.clip(v_counts_raw, 0, 255).astype(np.uint8)
 
-    # 对每个面获取边共享数
-    e_share = face_edge_types[face_indices]  # shape (n,3), values 1/2/3
+    # 边元：face_edge_types 已为 1/2/3
+    e_types = face_edge_types[face_indices].astype(np.uint8)
 
-    # 为保证编码拓扑一致性，若某条边是流形/非流形（共享），
-    # 则其两个端点必须视为共享顶点。若某个顶点本身已共享，也保留共享。
-    e0 = e_share[:, 0]
-    e1 = e_share[:, 1]
-    e2 = e_share[:, 2]
-    v0_shared = (base_v_share[:, 0] == '2') | (e0 > 1) | (e2 > 1)
-    v1_shared = (base_v_share[:, 1] == '2') | (e0 > 1) | (e1 > 1)
-    v2_shared = (base_v_share[:, 2] == '2') | (e1 > 1) | (e2 > 1)
-    v_share = np.empty_like(base_v_share)
-    v_share[:, 0] = np.where(v0_shared, '2', '1')
-    v_share[:, 1] = np.where(v1_shared, '2', '1')
-    v_share[:, 2] = np.where(v2_shared, '2', '1')
-    e_share_str = e_share.astype(str)  # convert to strings
+    all_codes = []
 
-    # 组装原始字符串序列：A, AB, B, BC, C, CA
-    raw_codes = []
     for i in range(n):
-        va, vb, vc = v_share[i]
-        eab, ebc, eca = e_share_str[i]
-        raw = va + eab + vb + ebc + vc + eca
-        raw_codes.append(raw)
+        va, vb, vc = v_counts[i]
+        eab, ebc, eca = e_types[i]
 
-    # 对称标准化：枚举旋转和镜像，取字典序最小
-    normalized = []
-    for raw in raw_codes:
-        variants = []
+        # 原始 6 字段序列
+        raw = np.array([va, eab, vb, ebc, vc, eca], dtype=np.uint8)
+
+        # 生成 6 个候选：3 旋转 + 3 镜像
+        candidates = []
+        # 旋转
         for shift in [0, 2, 4]:
-            variants.append(raw[shift:] + raw[:shift])
-        # 正确镜像：v0, e2, v2, e1, v1, e0，保持顶点-边交替
-        mirror = raw[0] + raw[5] + raw[4] + raw[3] + raw[2] + raw[1]
-        variants.append(mirror)
+            candidates.append(np.concatenate([raw[shift:], raw[:shift]]))
+        # 镜像：vA, eCA, vC, eBC, vB, eAB
+        mirror = np.concatenate([raw[[0]], raw[[5]], raw[[4]], raw[[3]], raw[[2]], raw[[1]]])
+        candidates.append(mirror)
         for shift in [2, 4]:
-            variants.append(mirror[shift:] + mirror[:shift])
-        normalized.append(min(variants))
+            candidates.append(np.concatenate([mirror[shift:], mirror[:shift]]))
 
-    codes = np.array(normalized, dtype=object)
+        # 取字典序最小的 uint8 数组
+        min_code = min(candidates, key=lambda x: tuple(x))
+        all_codes.append(min_code)
 
-    # 建立编码到 id 的映射
-    unique_codes = sorted(set(normalized))
-    code_to_id = {code: idx for idx, code in enumerate(unique_codes)}
-    id_to_code = unique_codes
+    codes = np.array(all_codes, dtype=np.uint8)
+
+    # 建立编码到 id 的映射（按字典序排序）
+    unique_bytes = sorted(set(bytes(c) for c in all_codes))
+    code_to_id = {b: i for i, b in enumerate(unique_bytes)}
+    id_to_code = unique_bytes
 
     return codes, code_to_id, id_to_code
 
 
-def compute_raw_codes_for_faces(mesh, face_indices, vertex_face_counts,
-                                edge_to_faces, face_edge_keys):
-    """
-    返回指定面片的原始具体拓扑编码列表。
-
-    每个编码为 6 位字符串，格式：
-        顶点A共享数, 边AB共享数, 顶点B共享数, 边BC共享数, 顶点C共享数, 边CA共享数
-    其中顶点共享数为真实值，边共享数为真实值（开放边为1，流形边为2，非流形边≥3）。
-    """
-    faces = np.asarray(mesh.faces)[face_indices]
-    raw_codes = []
-    for i, fid in enumerate(face_indices):
-        v_counts = vertex_face_counts[faces[i]]          # 三个顶点真实共享数
-        e_counts = []
-        for j in range(3):
-            key = int(face_edge_keys[fid, j])
-            shared_faces = edge_to_faces.get(key, [])
-            # 若边不在 edge_to_faces 中，则为开放边，计数为1
-            e_counts.append(len(shared_faces) if shared_faces else 1)
-        # 顺序：vA, eAB, vB, eBC, vC, eCA
-        code = (f"{v_counts[0]}{e_counts[0]}"
-                f"{v_counts[1]}{e_counts[1]}"
-                f"{v_counts[2]}{e_counts[2]}")
-        raw_codes.append(code)
-    return raw_codes
-
-
 def get_face_topology_code_and_order(mesh, face_id, vertex_face_counts, edge_to_faces, face_edge_keys):
     """
-    返回指定面片的标准化拓扑编码以及对应的顶点/边顺序映射。
+    返回指定面片的标准化拓扑编码（6 字节 bytes）以及对应的顶点/边顺序映射。
 
-    参数：
-        mesh: trimesh.Trimesh
-        face_id: int
-        vertex_face_counts: np.ndarray
-        edge_to_faces: dict
-        face_edge_keys: np.ndarray, shape (n_faces,3)
-    返回：
-        standard_code: str
-        vertex_order: list of int, 标准编码中顶点序列对应的原始顶点索引
-        edge_order: list of int, 标准编码中边序列对应的原始边索引
+    顶点元为真实 valence 截断到 255；边元为真实共享数（开放边为 1，流形边为 2，非流形边为 >=3）。
+    移除拓扑一致性修正。
     """
     verts = mesh.faces[face_id]
-    v_counts = vertex_face_counts[verts]  # 真实顶点共享数
 
-    # 从 edge_to_faces 获取边共享数，开放边为1
-    e_counts = []
+    # 真实顶点共享数，截断到 255
+    v_counts = np.clip(vertex_face_counts[verts], 0, 255).astype(np.uint8)
+
+    # 边共享数
+    e_counts_list = []
     for j in range(3):
         key = int(face_edge_keys[face_id, j])
         shared_faces = edge_to_faces.get(key, [])
-        e_counts.append(len(shared_faces) if shared_faces else 1)
-    e_counts = np.array(e_counts)
+        e_counts_list.append(len(shared_faces) if shared_faces else 1)
+    e_counts = np.clip(e_counts_list, 0, 255).astype(np.uint8)
 
-    # 应用与 compute_face_topology_codes 相同的拓扑一致性修正
-    e0, e1, e2 = e_counts
-    v0_shared = (v_counts[0] > 1) or (e0 > 1) or (e2 > 1)
-    v1_shared = (v_counts[1] > 1) or (e0 > 1) or (e1 > 1)
-    v2_shared = (v_counts[2] > 1) or (e1 > 1) or (e2 > 1)
-    v_share_corrected = np.where([v0_shared, v1_shared, v2_shared], '2', '1')
-    e_str = [str(e) for e in e_counts]
+    raw = np.array([
+        v_counts[0], e_counts[0],
+        v_counts[1], e_counts[1],
+        v_counts[2], e_counts[2]
+    ], dtype=np.uint8)
 
-    raw = ''.join([v_share_corrected[0], e_str[0],
-                   v_share_corrected[1], e_str[1],
-                   v_share_corrected[2], e_str[2]])
-
-    # 六种对称变换及其对应的顶点/边顺序
+    # 六种对称变换对应的顶点/边顺序映射
     transforms = [
-        {"vertex_order": [0, 1, 2], "edge_order": [0, 1, 2]},  # 原始
-        {"vertex_order": [1, 2, 0], "edge_order": [1, 2, 0]},  # 旋转2
-        {"vertex_order": [2, 0, 1], "edge_order": [2, 0, 1]},  # 旋转4
-        {"vertex_order": [0, 2, 1], "edge_order": [2, 1, 0]},  # 镜像
-        {"vertex_order": [2, 1, 0], "edge_order": [1, 0, 2]},  # 镜像旋转2
-        {"vertex_order": [1, 0, 2], "edge_order": [0, 2, 1]},  # 镜像旋转4
+        {"vertex_order": [0, 1, 2], "edge_order": [0, 1, 2]},
+        {"vertex_order": [1, 2, 0], "edge_order": [1, 2, 0]},
+        {"vertex_order": [2, 0, 1], "edge_order": [2, 0, 1]},
+        {"vertex_order": [0, 2, 1], "edge_order": [2, 1, 0]},
+        {"vertex_order": [2, 1, 0], "edge_order": [1, 0, 2]},
+        {"vertex_order": [1, 0, 2], "edge_order": [0, 2, 1]},
     ]
 
-    # 候选字符串及变换索引
     candidates = []
+    # 旋转候选
     for shift, idx in [(0, 0), (2, 1), (4, 2)]:
-        cand = raw[shift:] + raw[:shift]
+        cand = np.concatenate([raw[shift:], raw[:shift]])
         candidates.append((cand, idx))
-
-    mirror = raw[0] + raw[5] + raw[4] + raw[3] + raw[2] + raw[1]
+    # 镜像候选
+    mirror = np.concatenate([raw[[0]], raw[[5]], raw[[4]], raw[[3]], raw[[2]], raw[[1]]])
     candidates.append((mirror, 3))
     for shift, offset in [(2, 1), (4, 2)]:
-        cand = mirror[shift:] + mirror[:shift]
+        cand = np.concatenate([mirror[shift:], mirror[:shift]])
         candidates.append((cand, 3 + offset))
 
-    # 选择字典序最小的候选
-    min_code, min_idx = min(candidates, key=lambda x: x[0])
+    # 字典序最小
+    min_code, min_idx = min(candidates, key=lambda x: tuple(x[0]))
     transform = transforms[min_idx]
-    return min_code, transform["vertex_order"], transform["edge_order"]
+
+    standard_code = bytes(min_code)
+    return standard_code, transform["vertex_order"], transform["edge_order"]
+
+
+def group_faces_by_topology_codes(mesh, face_indices, vertex_face_counts, face_edge_types, valence_threshold=5):
+    """
+    按截断后的标准拓扑编码对面片进行聚类。
+
+    参数:
+        mesh : trimesh.Trimesh
+        face_indices : 待聚类的面片索引数组
+        vertex_face_counts : np.ndarray, 每个顶点被面片引用的真实次数
+        face_edge_types : np.ndarray, 形状 (n_faces, 3)，值为 1/2/3
+        valence_threshold : int, 顶点元截断阈值，默认 5。
+                            当顶点 valence >= valence_threshold 时，顶点元归并为阈值。
+
+    返回:
+        dict : {6 字节 bytes 编码 : np.ndarray of face indices}
+    """
+    face_indices = np.asarray(face_indices, dtype=np.int64)
+    n = len(face_indices)
+    if n == 0:
+        return {}
+
+    faces = np.asarray(mesh.faces)[face_indices]
+
+    # 顶点元：真实 valence 截断到阈值后转为 uint8
+    v_counts_raw = vertex_face_counts[faces]
+    v_counts_clipped = np.minimum(v_counts_raw, valence_threshold).astype(np.uint8)
+    # 边元：1/2/3
+    e_types = face_edge_types[face_indices].astype(np.uint8)
+
+    grouped = {}
+
+    for i, fid in enumerate(face_indices):
+        va, vb, vc = v_counts_clipped[i]
+        eab, ebc, eca = e_types[i]
+
+        raw = np.array([va, eab, vb, ebc, vc, eca], dtype=np.uint8)
+
+        candidates = []
+        for shift in [0, 2, 4]:
+            candidates.append(np.concatenate([raw[shift:], raw[:shift]]))
+        mirror = np.concatenate([raw[[0]], raw[[5]], raw[[4]], raw[[3]], raw[[2]], raw[[1]]])
+        candidates.append(mirror)
+        for shift in [2, 4]:
+            candidates.append(np.concatenate([mirror[shift:], mirror[:shift]]))
+
+        min_code = min(candidates, key=lambda x: tuple(x))
+        key = bytes(min_code)
+
+        grouped.setdefault(key, []).append(fid)
+
+    # 将列表转为 np.ndarray
+    for key in grouped:
+        grouped[key] = np.array(grouped[key], dtype=np.int64)
+
+    return grouped
