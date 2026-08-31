@@ -42,6 +42,7 @@ from toys3d.geometrics import (
     compute_face_topology_codes,
     compute_edge_to_faces,
     compute_face_edge_keys,
+    compute_face_edge_valences,
     compute_class_neighbor_stats,
     compute_single_face_neighbor_stats,
     get_face_topology_code_and_order,
@@ -723,8 +724,11 @@ def _generate_topology_diagram(code, output_path):
                         color='black', linewidth=2)
         ax.add_patch(circle)
 
-    ax.set_xlim(-0.2, 1.2)
-    ax.set_ylim(-0.2, 0.7)
+    height = np.sqrt(3) / 2
+    margin_x = 0.2
+    margin_y = 0.15
+    ax.set_xlim(0 - margin_x, 1 + margin_x)
+    ax.set_ylim(0 - margin_y, height + margin_y)
     ax.set_aspect('equal')
     ax.axis('off')
     plt.tight_layout(pad=0)
@@ -827,6 +831,7 @@ def run_full_diagnosis_pass1(mesh, output_dir, valence_threshold=8):
 
 def run_full_diagnosis_pass2(mesh, output_dir, class_faces,
                              open_face_mask, nonmanifold_face_mask,
+                             valence_threshold=8,
                              resume=False):
     output_dir = Path(output_dir)
     checkpoint_path = output_dir / "checkpoint.json"
@@ -852,6 +857,7 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces,
     edge_keys, edge_faces = compute_edge_to_faces(mesh)
     edge_to_faces = {int(k): v for k, v in zip(edge_keys, edge_faces)}
     face_edge_keys = compute_face_edge_keys(mesh)
+    edge_valences_all = compute_face_edge_valences(mesh, edge_to_faces, face_edge_keys)
 
     results = {}
     for idx, hex_code in enumerate(pending_classes):
@@ -894,6 +900,21 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces,
         aligned_vertex_stats = [vertex_stats[i] for i in v_order]
         aligned_edge_stats = [edge_stats[i] for i in e_order]
 
+        # 截断字段的真实值分布
+        verts = mesh.faces[face_indices]                # (k,3)
+        v_counts = vertex_face_counts[verts]            # (k,3)
+        e_counts = edge_valences_all[face_indices]      # (k,3)
+
+        # 顶点元截断分布：只统计 >= valence_threshold 的字段
+        truncated_v_mask = v_counts >= valence_threshold
+        truncated_v_vals = v_counts[truncated_v_mask]
+        truncated_v_dist = Counter(truncated_v_vals.tolist())
+
+        # 边元截断分布：只统计 >= 3 的字段
+        truncated_e_mask = e_counts >= 3
+        truncated_e_vals = e_counts[truncated_e_mask]
+        truncated_e_dist = Counter(truncated_e_vals.tolist())
+
         class_result = {
             'class_id': hex_code,
             'code': hex_code,
@@ -902,6 +923,8 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces,
             'edge_counts': edge_counts,
             'representative_vertex_stats': aligned_vertex_stats,
             'representative_edge_stats': aligned_edge_stats,
+            'truncated_vertex_valence_dist': dict(sorted(truncated_v_dist.items())),
+            'truncated_edge_valence_dist': dict(sorted(truncated_e_dist.items())),
         }
         results[hex_code] = class_result
 
@@ -920,6 +943,12 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces,
         data["classes"][hex_code]["representative_vertex_stats"] = aligned_vertex_stats
         data["classes"][hex_code]["representative_edge_stats"] = aligned_edge_stats
         data["classes"][hex_code]["status"] = "done"
+
+        data["classes"][hex_code]["truncated_vertex_valence_dist"] = \
+            dict(sorted(truncated_v_dist.items()))
+        data["classes"][hex_code]["truncated_edge_valence_dist"] = \
+            dict(sorted(truncated_e_dist.items()))
+
         with open(classes_json_path, "w") as f:
             json.dump(data, f, indent=2)
 
@@ -1247,6 +1276,24 @@ def generate_html_report_from_json(output_dir):
                                 f"<td>{es.get('normal', 0)}</td><td>{es.get('open', 0)}</td><td>{es.get('nonmanifold', 0)}</td></tr>")
                 html.append("</table>")
 
+            # 截断字段真实分布
+            vertex_dist = cls_data.get("truncated_vertex_valence_dist", {})
+            edge_dist = cls_data.get("truncated_edge_valence_dist", {})
+
+            if vertex_dist:
+                html.append("<table>")
+                html.append("<tr><th>顶点元截断分布</th><th>真实 valence</th><th>计数</th></tr>")
+                for val_str, cnt in vertex_dist.items():
+                    html.append(f"<tr><td>valence</td><td>{val_str}</td><td>{cnt}</td></tr>")
+                html.append("</table>")
+
+            if edge_dist:
+                html.append("<table>")
+                html.append("<tr><th>边元截断分布</th><th>真实共享数</th><th>计数</th></tr>")
+                for val_str, cnt in edge_dist.items():
+                    html.append(f"<tr><td>edge</td><td>{val_str}</td><td>{cnt}</td></tr>")
+                html.append("</table>")
+
             html.append("</div>")  # 关闭右侧容器
             html.append("</div>")  # 关闭 class-block
 
@@ -1282,6 +1329,7 @@ def perform_full_diagnosis(mesh, args):
     results = run_full_diagnosis_pass2(
         mesh, output_dir, class_faces,
         open_face_mask, nonmanifold_face_mask,
+        valence_threshold=args.valence_threshold,
         resume=args.resume
     )
 

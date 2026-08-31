@@ -1119,3 +1119,23 @@ def validate_code(code):
     if arr.shape != (6,):
         return False
     return True
+
+
+def compute_face_edge_valences(mesh, edge_to_faces, face_edge_keys):
+    """
+    返回形状 (n_faces, 3) 的 int32 数组，每个元素为对应边的真实共享面数：
+        1：开放边
+        2：流形边
+        n>=3：非流形边（保留真实 n）
+    """
+    n_faces = len(mesh.faces)
+    if n_faces == 0:
+        return np.zeros((0, 3), dtype=np.int32)
+
+    edge_valences = np.ones((n_faces, 3), dtype=np.int32)
+    for fid in range(n_faces):
+        for j in range(3):
+            key = int(face_edge_keys[fid, j])
+            shared = edge_to_faces.get(key, [])
+            edge_valences[fid, j] = len(shared) if shared else 1
+    return edge_valences
