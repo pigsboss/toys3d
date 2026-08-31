@@ -149,18 +149,18 @@ def test_hole_diagnosis_three_triangles_share_vertex(tmp_path):
 
     # 每个三角形三条边，没有共享边，所以 9 条开放边
     assert json_data["total_open_edges"] == 9
-    # 中心顶点度数为 6，其他顶点度数为 1，无法形成闭合环
+    # 中心顶点度数为 6，其他顶点度数为 2，无法形成闭合环
     assert json_data["total_healthy_holes"] == 0
     assert json_data["covered_open_edges"] == 0
     assert json_data["uncovered_open_edges"] == 9
 
-    # 未覆盖开放边分类：全部为“悬空开放边”（分类 1）
-    assert json_data["uncovered_categories_summary"] == {"悬空开放边": 9}
+    # 未覆盖开放边分类：全部为“分支内部开放边”（分类 2）
+    assert json_data["uncovered_categories_summary"] == {"分支内部开放边": 9}
 
-    # uncovered_category 数组长度 9，值全部 1
+    # uncovered_category 数组长度 9，值全部 2
     uncovered_category = npz["uncovered_category"]
     assert uncovered_category.shape == (9,)
-    assert np.all(uncovered_category == 1)
+    assert np.all(uncovered_category == 2)
 
 
 def test_hole_diagnosis_three_triangles_share_edge_nonmanifold(tmp_path):
