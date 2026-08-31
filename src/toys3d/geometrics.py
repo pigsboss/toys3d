@@ -1042,6 +1042,13 @@ def code_to_bytes(code):
     """
     if isinstance(code, FaceTopologyCode6):
         return bytes(code)
+
+    # 直接处理 bytes / bytearray 输入
+    if isinstance(code, (bytes, bytearray)):
+        if len(code) != 6:
+            raise ValueError("code must have exactly 6 uint8 fields")
+        return bytes(code)
+
     arr = np.asarray(code, dtype=np.uint8)
     if arr.shape != (6,):
         raise ValueError("code must have exactly 6 uint8 fields")
