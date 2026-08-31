@@ -21,50 +21,65 @@ from toys3d.geometrics import (
 from scipy.sparse import csr_matrix
 
 
-def validate_topology_code(code: str) -> bool:
+def _code_to_raw(code):
+    """
+    将字符串或一维数组/列表形式的拓扑编码规范化为长度为 6 的整数列表。
+    若无法解析，返回 None。
+    """
+    if isinstance(code, str):
+        if len(code) != 6 or not code.isdigit():
+            return None
+        return [int(ch) for ch in code]
+    try:
+        arr = list(code)
+    except TypeError:
+        return None
+    if len(arr) != 6:
+        return None
+    for x in arr:
+        if not isinstance(x, (int, np.integer)):
+            return None
+    return [int(x) for x in arr]
+
+
+def validate_topology_code(code) -> bool:
     """
     验证一个 6 位拓扑编码是否合法。
 
     编码格式：v0 e0 v1 e1 v2 e2
-    - 奇数位（索引 0,2,4）必须是顶点编码：'1'（独占）或 '2'（共享）
-    - 偶数位（索引 1,3,5）必须是边编码：'1'（开放），'2'（流形），'3'（非流形）
+    - 奇数位（索引 0,2,4）是顶点元，表示顶点关联的面片数（>=0）
+    - 偶数位（索引 1,3,5）是边元，表示边关联的面片数（1=开放边，2=流形边，3+=非流形边）
     - 拓扑约束：
-        * 若顶点为 '1'（独占），则与之相邻的两条边必须为 '1'（开放）
-        * 若边为 '2' 或 '3'，则其两个端点必须为 '2'（共享）
+        * 每条边 e 的两个端点顶点的关联面数都必须 >= e
+        * 若顶点关联面数为 1，则与它相邻的两条边必须都是开放边（e==1）
     """
-    if len(code) != 6:
+    raw = _code_to_raw(code)
+    if raw is None:
         return False
 
-    # 格式检查
-    vertices = [code[0], code[2], code[4]]
-    edges = [code[1], code[3], code[5]]
+    v0, e0, v1, e1, v2, e2 = raw
 
-    if any(v not in ('1', '2') for v in vertices):
-        return False
-    if any(e not in ('1', '2', '3') for e in edges):
+    # 边元不能为 0，且当前实现中只出现 1/2/3
+    if any(e < 1 or e > 3 for e in [e0, e1, e2]):
         return False
 
-    v0, e0, v1, e1, v2, e2 = code
+    # 顶点元可以为 0（孤立点），但出现在面中的顶点至少为 1；
+    # 不强制限制上限。
 
-    # 拓扑约束
-    # 顶点 v0 独占 -> e0 和 e2 必须开放
-    if v0 == '1' and (e0 != '1' or e2 != '1'):
+    # 每条边的两个端点必须具有足够的关联面数
+    if v0 < e0 or v1 < e0:
         return False
-    # 顶点 v1 独占 -> e0 和 e1 必须开放
-    if v1 == '1' and (e0 != '1' or e1 != '1'):
+    if v1 < e1 or v2 < e1:
         return False
-    # 顶点 v2 独占 -> e1 和 e2 必须开放
-    if v2 == '1' and (e1 != '1' or e2 != '1'):
+    if v2 < e2 or v0 < e2:
         return False
 
-    # 边 e0 流形/非流形 -> v0 和 v1 必须共享
-    if e0 in ('2', '3') and (v0 != '2' or v1 != '2'):
+    # 顶点关联面数为 1 时，其两条邻边必须都是开放边
+    if v0 == 1 and (e0 != 1 or e2 != 1):
         return False
-    # 边 e1 流形/非流形 -> v1 和 v2 必须共享
-    if e1 in ('2', '3') and (v1 != '2' or v2 != '2'):
+    if v1 == 1 and (e0 != 1 or e1 != 1):
         return False
-    # 边 e2 流形/非流形 -> v2 和 v0 必须共享
-    if e2 in ('2', '3') and (v2 != '2' or v0 != '2'):
+    if v2 == 1 and (e1 != 1 or e2 != 1):
         return False
 
     return True
@@ -98,12 +113,9 @@ def test_validate_format_checks():
         '11111',      # 长度错误
         '1111111',    # 长度错误
         '1a1111',     # 非法字符
-        '111116',     # 顶点位出现 6
-        '113111',     # 边位出现 3 但格式仍正确？此例顶点位1,1,1 边位1,3,1，格式合法但拓扑可能非法，看拓扑约束
+        '111116',     # 边位出现 6（>3）
     ]
-    # '113111'：v0='1', e0='1', v1='1', e1='3', v2='1', e2='1'。
-    # v1='1' 要求 e0 和 e1 都 '1'，但 e1='3'，所以非法。
-    # 这里作为格式+拓扑联合测试，我们期望抛出 False。
+    # '113111'：v1='1', e1='3'，违反 v1>=e1，拓扑非法
     invalid_format.append('113111')
     for code in invalid_format:
         assert validate_topology_code(code) is False
@@ -137,7 +149,8 @@ def test_single_triangle_isolated(single_triangle_mesh):
         mesh, face_indices, v_counts, e_types
     )
     assert len(codes) == 1
-    assert codes[0] == '111111'
+    # 将 uint8 数组转为可比较的字符串
+    assert ''.join(str(int(x)) for x in codes[0]) == '111111'
     assert validate_topology_code(codes[0])
 
 
