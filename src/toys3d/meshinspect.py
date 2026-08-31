@@ -1139,6 +1139,8 @@ def perform_full_diagnosis(mesh, args):
 
     # 保存 JSON 诊断报告（机器可读格式）
     json_path = output_dir / "diagnosis_results.json"
+    # 将 id_to_code 转换为 hex 字符串列表，避免 JSON 无法序列化 bytes
+    id_to_code_hex = [code_to_hex(b) for b in id_to_code]
     diagnosis_json = {
         "meta": {
             "mesh_file": args.input_file,
@@ -1148,7 +1150,7 @@ def perform_full_diagnosis(mesh, args):
             "format_version": 1,
             "generated_by": "meshinspect.py --full-diagnosis",
         },
-        "id_to_code": id_to_code,
+        "id_to_code": id_to_code_hex,
         "classes": {str(class_id): res for class_id, res in results.items()},
     }
     with open(json_path, "w", encoding="utf-8") as f:
