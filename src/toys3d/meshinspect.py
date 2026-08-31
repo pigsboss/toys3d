@@ -44,8 +44,10 @@ from toys3d.geometrics import (
     compute_face_edge_keys,
     compute_class_neighbor_stats,
     compute_single_face_neighbor_stats,
-    compute_raw_codes_for_faces,
     get_face_topology_code_and_order,
+    code_to_hex,
+    hex_to_code,
+    save_codes,
 )
 
 
@@ -675,35 +677,47 @@ def add_proxy_overlay_to_scene(scene, args, proxy):
 def _generate_topology_diagram(code, output_path):
     """
     根据拓扑编码生成三角形的点-线示意图。
-    编码格式：A, AB, B, BC, C, CA，每个元素为 '1','2','3'。
-    顶点：'1' 实心，'2' 或更大空心。
-    边：'1' 蓝色，'2' 绿色，'3' 红色。
+    编码格式：A, AB, B, BC, C, CA，每个字段为 uint8 数值。
+    顶点元：1 实心，其他空心。
+    边元：1 蓝色，2 绿色，3 红色。
     """
-    fig, ax = plt.subplots(figsize=(2.0, 2.0), dpi=120)  # 增大尺寸提高清晰度
+    # 将输入统一为整数列表
+    if isinstance(code, bytes):
+        fields = list(code)
+    elif hasattr(code, 'tolist'):
+        fields = [int(x) for x in code.tolist()]
+    else:
+        fields = [int(x) for x in code]
+
+    if len(fields) != 6:
+        raise ValueError("code must have exactly 6 fields")
+
+    vA, eAB, vB, eBC, vC, eCA = fields
+
+    fig, ax = plt.subplots(figsize=(2.0, 2.0), dpi=120)
     pts = {
         'A': (0, 0),
         'B': (1, 0),
         'C': (0.5, np.sqrt(3) / 2)
     }
-    vA, eAB, vB, eBC, vC, eCA = [c for c in code]
 
     edge_styles = {
-        '1': ('blue', 'solid'),
-        '2': ('green', 'solid'),
-        '3': ('red', 'solid')
+        1: ('blue', 'solid'),
+        2: ('green', 'solid'),
+        3: ('red', 'solid')
     }
     for (p1, p2, ecode) in [
         (pts['A'], pts['B'], eAB),
         (pts['B'], pts['C'], eBC),
         (pts['C'], pts['A'], eCA)
     ]:
-        color, ls = edge_styles[ecode]
+        color, ls = edge_styles.get(ecode, ('black', 'dashed'))
         line = Line2D([p1[0], p2[0]], [p1[1], p2[1]],
                       color=color, linewidth=2, linestyle=ls)
         ax.add_line(line)
 
     for (pt, vcode) in [(pts['A'], vA), (pts['B'], vB), (pts['C'], vC)]:
-        fill = (vcode == '1')
+        fill = (vcode == 1)
         circle = Circle(pt, radius=0.05, fill=fill,
                         color='black', linewidth=2)
         ax.add_patch(circle)
@@ -766,7 +780,7 @@ def run_full_diagnosis_pass1(mesh, output_dir):
         mesh, abnormal_indices, vertex_face_counts, face_edge_types
     )
 
-    code_ids = np.array([code_to_id[c] for c in codes], dtype=np.int64)
+    code_ids = np.array([code_to_id[bytes(c)] for c in codes], dtype=np.int64)
 
     unique_ids, inverse, counts = np.unique(code_ids, return_inverse=True, return_counts=True)
 
@@ -785,10 +799,15 @@ def run_full_diagnosis_pass1(mesh, output_dir):
         if class_id % 10 == 0:
             print(f"  已生成 {class_id + 1}/{len(id_to_code)} 个示意图")
 
+    # 保存逐面片真实编码到 .npy
+    save_codes(codes, output_dir / "face_codes.npy")
+
+    # 将 id_to_code 转为 hex 字符串列表以便 JSON 序列化
+    id_to_code_hex = [code_to_hex(b) for b in id_to_code]
     # 保存分类数据用于 resume
     classes_data = {
         "class_faces": {str(cid): faces for cid, faces in class_faces.items()},
-        "id_to_code": id_to_code,
+        "id_to_code": id_to_code_hex,
     }
     with open(output_dir / "classes_data.json", "w") as f:
         json.dump(classes_data, f, indent=2)
@@ -839,10 +858,11 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
 
     results = {}
     for idx, class_id in enumerate(pending_classes):
-        code = id_to_code[class_id]
+        code = id_to_code[class_id]  # bytes
         face_indices = class_faces[class_id]
+        code_hex = code_to_hex(code)
         print(f"\n=== 分析类别 {idx+1}/{len(pending_classes)} ===", flush=True)
-        print(f"  编码: {code}, 面片数: {len(face_indices)}", flush=True)
+        print(f"  编码: {code_hex}, 面片数: {len(face_indices)}", flush=True)
 
         areas = mesh.area_faces[face_indices]
         area_stats = {
@@ -882,22 +902,14 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
         aligned_vertex_stats = [vertex_stats[i] for i in v_order]
         aligned_edge_stats = [edge_stats[i] for i in e_order]
 
-        # 计算原始具体编码分布（归并前）
-        raw_codes = compute_raw_codes_for_faces(
-            mesh, face_indices, vertex_face_counts,
-            edge_to_faces, face_edge_keys
-        )
-        raw_code_distribution = dict(Counter(raw_codes))
-
         class_result = {
             'class_id': int(class_id),
-            'code': code,
+            'code': code_hex,
             'area_stats': area_stats,
             'point_counts': point_counts,
             'edge_counts': edge_counts,
             'representative_vertex_stats': aligned_vertex_stats,
             'representative_edge_stats': aligned_edge_stats,
-            'raw_code_distribution': raw_code_distribution,
         }
         results[class_id] = class_result
 
@@ -1104,7 +1116,8 @@ def perform_full_diagnosis(mesh, args):
         with open(classes_data_path, "r") as f:
             data = json.load(f)
         class_faces = {int(k): v for k, v in data["class_faces"].items()}
-        id_to_code = data["id_to_code"]
+        # 将 hex 字符串转换回 bytes 列表
+        id_to_code = [bytes(hex_to_code(s)) for s in data["id_to_code"]]
         print("Resume: loading existing classification from Pass 1.")
     else:
         class_faces, id_to_code, _ = run_full_diagnosis_pass1(mesh, output_dir)

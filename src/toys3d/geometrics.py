@@ -938,3 +938,177 @@ def group_faces_by_topology_codes(mesh, face_indices, vertex_face_counts, face_e
         grouped[key] = np.array(grouped[key], dtype=np.int64)
 
     return grouped
+
+
+class FaceTopologyCode6:
+    """
+    表示三角面片拓扑编码的六元数，六个字段均为 uint8：
+        [vA, eAB, vB, eBC, vC, eCA]
+    """
+    __slots__ = ("data",)
+
+    def __init__(self, *values):
+        if len(values) == 1 and isinstance(values[0], np.ndarray):
+            arr = values[0]
+        else:
+            arr = np.array(values, dtype=np.uint8)
+        if arr.shape != (6,) or arr.dtype != np.uint8:
+            # 尝试转换并检查长度
+            arr = np.asarray(arr, dtype=np.uint8).reshape(-1)
+            if arr.shape != (6,):
+                raise ValueError("code must have exactly 6 uint8 fields")
+        self.data = arr
+
+    def __bytes__(self):
+        return self.data.tobytes()
+
+    def __repr__(self):
+        return f"FaceTopologyCode6({self.data.tolist()})"
+
+    def __eq__(self, other):
+        if not isinstance(other, FaceTopologyCode6):
+            return NotImplemented
+        return np.array_equal(self.data, other.data)
+
+    def __hash__(self):
+        return hash(bytes(self.data))
+
+    def to_hex(self):
+        return self.data.tobytes().hex()
+
+    @classmethod
+    def from_hex(cls, s):
+        return cls(np.frombuffer(bytes.fromhex(s), dtype=np.uint8))
+
+
+def canonicalize_single_code(code):
+    """
+    输入长度 6 的 uint8 序列（或 FaceTopologyCode6），
+    返回规范化后的长度 6 的 uint8 数组（旋转/镜像无关，字典序最小）。
+    """
+    if isinstance(code, FaceTopologyCode6):
+        raw = code.data.copy()
+    else:
+        raw = np.asarray(code, dtype=np.uint8)
+        if raw.shape != (6,):
+            raise ValueError("code must have exactly 6 uint8 fields")
+
+    candidates = []
+    # 旋转
+    for shift in [0, 2, 4]:
+        candidates.append(np.concatenate([raw[shift:], raw[:shift]]))
+    # 镜像：vA, eCA, vC, eBC, vB, eAB
+    mirror = np.concatenate([raw[[0]], raw[[5]], raw[[4]], raw[[3]], raw[[2]], raw[[1]]])
+    candidates.append(mirror)
+    for shift in [2, 4]:
+        candidates.append(np.concatenate([mirror[shift:], mirror[:shift]]))
+
+    return min(candidates, key=lambda x: tuple(x))
+
+
+def canonicalize_faces(codes):
+    """
+    输入形状 (n,6) 的 uint8 数组，返回规范化后的 (n,6) 数组。
+    与 compute_face_topology_codes 中的归一化逻辑一致。
+    """
+    codes = np.asarray(codes, dtype=np.uint8)
+    if codes.ndim != 2 or codes.shape[1] != 6:
+        raise ValueError("codes must be of shape (n,6)")
+    n = len(codes)
+    result = np.empty((n, 6), dtype=np.uint8)
+    for i in range(n):
+        result[i] = canonicalize_single_code(codes[i])
+    return result
+
+
+def truncate_codes(codes, valence_threshold=5):
+    """
+    对顶点元（索引 0,2,4）按阈值截断，返回新的 (n,6) uint8 数组。
+    """
+    codes = np.asarray(codes, dtype=np.uint8)
+    if codes.ndim != 2 or codes.shape[1] != 6:
+        raise ValueError("codes must be of shape (n,6)")
+    out = codes.copy()
+    # 顶点元索引
+    v_idx = [0, 2, 4]
+    clipped = np.minimum(out[:, v_idx], valence_threshold).astype(np.uint8)
+    out[:, v_idx] = clipped
+    return out
+
+
+def code_to_bytes(code):
+    """
+    将单个长度 6 的 uint8 序列或 FaceTopologyCode6 转为 6 字节 bytes。
+    """
+    if isinstance(code, FaceTopologyCode6):
+        return bytes(code)
+    arr = np.asarray(code, dtype=np.uint8)
+    if arr.shape != (6,):
+        raise ValueError("code must have exactly 6 uint8 fields")
+    return arr.tobytes()
+
+
+def bytes_to_code(b):
+    """
+    从 6 字节 bytes 恢复长度 6 的 uint8 数组。
+    """
+    if not isinstance(b, (bytes, bytearray)):
+        raise TypeError("input must be bytes-like")
+    if len(b) != 6:
+        raise ValueError("bytes must have length 6")
+    return np.frombuffer(b, dtype=np.uint8).copy()
+
+
+def code_to_hex(code):
+    """
+    将单个长度 6 的 uint8 序列转为十六进制字符串（不含前缀）。
+    例如 [1,2,3,4,5,6] -> '010203040506'
+    """
+    return code_to_bytes(code).hex()
+
+
+def hex_to_code(s):
+    """
+    从十六进制字符串恢复长度 6 的 uint8 数组。
+    """
+    # 若字符串以 0x 开头，移除前缀
+    if s.lower().startswith("0x"):
+        s = s[2:]
+    if len(s) != 12:
+        raise ValueError("hex string must represent exactly 6 bytes (12 hex digits)")
+    return bytes_to_code(bytes.fromhex(s))
+
+
+def save_codes(codes, path):
+    """
+    将形状 (n,6) 的 uint8 数组保存为 .npy 文件。
+    """
+    codes = np.asarray(codes, dtype=np.uint8)
+    if codes.ndim != 2 or codes.shape[1] != 6:
+        raise ValueError("codes must be of shape (n,6)")
+    np.save(path, codes)
+
+
+def load_codes(path):
+    """
+    从 .npy 文件加载形状 (n,6) 的 uint8 数组。
+    """
+    arr = np.load(path)
+    arr = np.asarray(arr, dtype=np.uint8)
+    if arr.ndim != 2 or arr.shape[1] != 6:
+        raise ValueError("loaded array must be of shape (n,6)")
+    return arr
+
+
+def validate_code(code):
+    """
+    校验一个编码是否是合法的 6 字段 uint8 序列。
+    返回 bool。
+    """
+    try:
+        arr = np.asarray(code, dtype=np.uint8)
+    except (TypeError, ValueError):
+        return False
+    if arr.shape != (6,):
+        return False
+    return True
