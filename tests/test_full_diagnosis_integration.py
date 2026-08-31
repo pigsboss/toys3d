@@ -16,6 +16,7 @@ def _run_diagnosis(tmp_path, mesh):
         diagnosis_output=str(tmp_path),
         resume=False,
         diagnosis_format='html',
+        valence_threshold=8,
     )
     perform_full_diagnosis(mesh, args)
     return tmp_path
@@ -44,7 +45,7 @@ def _assert_common_structure(codes, abnormal_data, html_text, expected_n_faces):
     assert codes.shape[0] == expected_n_faces
 
     # JSON 基本字段
-    assert abnormal_data["valence_threshold"] == 5
+    assert abnormal_data["valence_threshold"] == 8
     assert "classes" in abnormal_data
 
     # 每个类条目结构
@@ -171,7 +172,7 @@ def test_full_diagnosis_three_triangles_share_edge_nonmanifold(tmp_path):
 
 
 def test_full_diagnosis_high_valence_vertex(tmp_path):
-    """六个三角形共享顶点0，中心顶点 valence=6，截断后顶点元=5。"""
+    """六个三角形共享顶点0，中心顶点 valence=6，截断后顶点元=6（因阈值 8 > 6 不截断）。"""
     vertices = np.array([
         [0,0,0],
         [1,0,0],[0,1,0],
@@ -197,19 +198,17 @@ def test_full_diagnosis_high_valence_vertex(tmp_path):
 
     _assert_common_structure(codes, abnormal_data, html_text, expected_n_faces=6)
 
-    # 真实编码中，中心顶点 valence=6，所以真实编码某位置应为 6，
-    # 但截断后的分类中，顶点元为 5。
-    # 真实编码未截断，所以每个面的顶点元包含 6，规范化后最小字典序为 010101010601
+    # 真实编码中，中心顶点 valence=6，所以真实编码某位置应为 6。
+    # 阈值 8 > 6 不截断，因此截断分类和真实编码相同。
     assert _codes_to_hex_set(codes) == {"010101010601"}
 
-    # 截断分类：顶点元 6 -> 5，所以键为 010101010501
     classes = abnormal_data["classes"]
-    assert set(classes.keys()) == {"010101010501"}
-    cls = classes["010101010501"]
+    assert set(classes.keys()) == {"010101010601"}
+    cls = classes["010101010601"]
     assert set(cls["face_indices"]) == set(range(6))
     assert cls["count"] == 6
 
-    assert "Class 010101010501" in html_text
+    assert "Class 010101010601" in html_text
 
 
 def test_full_diagnosis_single_triangle_plus_degenerate(tmp_path):

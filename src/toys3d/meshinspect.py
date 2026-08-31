@@ -745,7 +745,7 @@ def _build_vertex_face_csr(mesh):
     return csr_matrix((data, (row_idx, col_idx)), shape=(n_vertices, n_faces))
 
 
-def run_full_diagnosis_pass1(mesh, output_dir):
+def run_full_diagnosis_pass1(mesh, output_dir, valence_threshold=8):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -770,14 +770,14 @@ def run_full_diagnosis_pass1(mesh, output_dir):
     if len(abnormal_indices) == 0:
         # 创建空的分类 JSON 和 checkpoint
         empty_classes = {
-            "valence_threshold": 5,
+            "valence_threshold": valence_threshold,
             "total_abnormal_faces": 0,
             "classes": {}
         }
         with open(output_dir / "abnormal_truncated_classes.json", "w") as f:
             json.dump(empty_classes, f, indent=2)
         checkpoint = {
-            "valence_threshold": 5,
+            "valence_threshold": valence_threshold,
             "classes": {},
             "total_classes": 0,
             "abnormal_count": 0
@@ -790,7 +790,7 @@ def run_full_diagnosis_pass1(mesh, output_dir):
     print("截断聚类异常面片...")
     grouped = group_faces_by_topology_codes(
         mesh, abnormal_indices, vertex_face_counts, face_edge_types,
-        valence_threshold=5
+        valence_threshold=valence_threshold
     )
 
     class_faces = {}
@@ -805,7 +805,7 @@ def run_full_diagnosis_pass1(mesh, output_dir):
         }
 
     abnormal_data = {
-        "valence_threshold": 5,
+        "valence_threshold": valence_threshold,
         "total_abnormal_faces": int(len(abnormal_indices)),
         "classes": classes_json
     }
@@ -813,7 +813,7 @@ def run_full_diagnosis_pass1(mesh, output_dir):
         json.dump(abnormal_data, f, indent=2)
 
     checkpoint = {
-        "valence_threshold": 5,
+        "valence_threshold": valence_threshold,
         "classes": {hex_code: "pending" for hex_code in class_faces},
         "total_classes": len(class_faces),
         "abnormal_count": int(len(abnormal_indices))
@@ -1274,7 +1274,10 @@ def perform_full_diagnosis(mesh, args):
                        for hex_code, entry in classes_data.get("classes", {}).items()}
         print("Resume: loading existing classifications from Pass 1.")
     else:
-        class_faces, _ = run_full_diagnosis_pass1(mesh, output_dir)
+        class_faces, _ = run_full_diagnosis_pass1(
+            mesh, output_dir,
+            valence_threshold=args.valence_threshold
+        )
 
     results = run_full_diagnosis_pass2(
         mesh, output_dir, class_faces,
@@ -1775,6 +1778,11 @@ def main():
                         help="报告格式：html 或 latex（默认 html）")
     parser.add_argument("--resume", action="store_true",
                         help="从现有检查点继续 Full Diagnosis Pass 2（跳过已完成类别）")
+    parser.add_argument("--valence-threshold",
+                        type=int,
+                        default=8,
+                        help="顶点元 valence 截断阈值，默认 8。"
+                             "当顶点被引用的面片数 >= 阈值时，截断编码归并为该阈值。")
 
     if len(sys.argv) == 1:
         parser.print_help()
