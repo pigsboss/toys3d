@@ -115,8 +115,8 @@ def test_validate_format_checks():
         '1a1111',     # 非法字符
         '111116',     # 边位出现 6（>3）
     ]
-    # '113111'：v1='1', e1='3'，违反 v1>=e1，拓扑非法
-    invalid_format.append('113111')
+    # '111311'：v1='1', e1='3'，违反 v1>=e1，拓扑非法
+    invalid_format.append('111311')
     for code in invalid_format:
         assert validate_topology_code(code) is False
 
