@@ -9,6 +9,7 @@
 import numpy as np
 import trimesh
 from collections import deque
+from scipy.sparse import csr_matrix
 
 
 def compute_mesh_stats(mesh):
@@ -1139,3 +1140,188 @@ def compute_face_edge_valences(mesh, edge_to_faces, face_edge_keys):
             shared = edge_to_faces.get(key, [])
             edge_valences[fid, j] = len(shared) if shared else 1
     return edge_valences
+
+
+def compute_open_edge_data(mesh):
+    """
+    提取网格中所有开放边的核心数据。
+
+    返回字典：
+        open_edge_vertex_pairs : (E,2) int64, 每条开放边的两个顶点索引
+        open_edge_face_ids     : (E,)   int64, 每条开放边唯一所属的面片 id
+        open_edge_keys         : (E,)   int64, 边的唯一键（min_v * max_vertex + max_v）
+        open_edge_key_to_id    : dict,  键 -> 开放边 id
+        vertex_open_edges_csr  : scipy.sparse.csr_matrix, 形状 (n_vertices, E),
+                                 每行存储关联该顶点的开放边 id
+        vertex_degree          : (n_vertices,) int32, 每个顶点在开放边图上的度数
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    n_faces = len(faces)
+    n_vertices = len(mesh.vertices)
+
+    if n_faces == 0 or n_vertices == 0:
+        return {
+            'open_edge_vertex_pairs': np.zeros((0, 2), dtype=np.int64),
+            'open_edge_face_ids': np.zeros(0, dtype=np.int64),
+            'open_edge_keys': np.zeros(0, dtype=np.int64),
+            'open_edge_key_to_id': {},
+            'vertex_open_edges_csr': csr_matrix((n_vertices, 0), dtype=np.int64),
+            'vertex_degree': np.zeros(n_vertices, dtype=np.int32),
+        }
+
+    # 构造所有有向边
+    edge_pairs = np.stack([
+        faces[:, [0, 1]],
+        faces[:, [1, 2]],
+        faces[:, [2, 0]]
+    ], axis=1).reshape(-1, 2)
+
+    ea = edge_pairs[:, 0]
+    eb = edge_pairs[:, 1]
+    face_ids = np.repeat(np.arange(n_faces, dtype=np.int64), 3)
+
+    min_e = np.minimum(ea, eb)
+    max_e = np.maximum(ea, eb)
+    max_vertex = n_vertices
+    keys = min_e.astype(np.int64) * (max_vertex + 1) + max_e
+
+    order = np.argsort(keys, kind='stable')
+    keys_sorted = keys[order]
+    face_ids_sorted = face_ids[order]
+    ea_sorted = ea[order]
+    eb_sorted = eb[order]
+
+    diff = np.empty(keys_sorted.shape[0], dtype=bool)
+    diff[0] = True
+    diff[1:] = keys_sorted[1:] != keys_sorted[:-1]
+    start_idx = np.flatnonzero(diff)
+    end_idx = np.append(start_idx[1:], keys_sorted.shape[0])
+    counts = end_idx - start_idx
+
+    # 筛选开放边（counts == 1）
+    open_mask = counts == 1
+    open_start = start_idx[open_mask]
+    open_face_ids = face_ids_sorted[open_start]
+    open_vertex_pairs = np.column_stack([
+        ea_sorted[open_start],
+        eb_sorted[open_start]
+    ])
+    open_keys = keys_sorted[open_start]
+
+    E = len(open_face_ids)
+    open_edge_key_to_id = {int(k): i for i, k in enumerate(open_keys)}
+
+    # 构建顶点 -> 开放边 CSR
+    rows = open_vertex_pairs.ravel()
+    cols = np.repeat(np.arange(E, dtype=np.int64), 2)
+    data = np.ones(2 * E, dtype=np.int8)
+    vertex_open_edges_csr = csr_matrix(
+        (data, (rows, cols)),
+        shape=(n_vertices, E),
+        dtype=np.int64,
+    )
+
+    vertex_degree = np.asarray(vertex_open_edges_csr.getnnz(axis=1)).ravel().astype(np.int32)
+
+    return {
+        'open_edge_vertex_pairs': open_vertex_pairs.astype(np.int64),
+        'open_edge_face_ids': open_face_ids.astype(np.int64),
+        'open_edge_keys': open_keys.astype(np.int64),
+        'open_edge_key_to_id': open_edge_key_to_id,
+        'vertex_open_edges_csr': vertex_open_edges_csr,
+        'vertex_degree': vertex_degree,
+    }
+
+
+def build_hole_diagnosis_data(mesh):
+    """
+    构建孔洞诊断数据结构。
+
+    返回字典包含：
+        open_edge_vertex_pairs, open_edge_face_ids, open_edge_keys,
+        open_edge_key_to_id, vertex_open_edges_csr, vertex_degree,
+        hole_vertex_lists : list of list[int]，健康孔洞的顶点序列
+        hole_edge_lists   : list of list[int]，健康孔洞的开放边 id 序列
+        hole_ids_per_edge : (E,) int32，每条开放边所属健康孔洞 id，-1 表示未覆盖
+        uncovered_edge_ids : (U,) int64，未被任何健康孔洞覆盖的开放边 id
+        uncovered_category : (U,) int8，未覆盖开放边分类（见规则）
+    """
+    open_data = compute_open_edge_data(mesh)
+    vertex_pairs = open_data['open_edge_vertex_pairs']
+    edge_keys = open_data['open_edge_keys']
+    key_to_id = open_data['open_edge_key_to_id']
+
+    E = len(vertex_pairs)
+    hole_ids_per_edge = np.full(E, -1, dtype=np.int32)
+    hole_vertex_lists = []
+    hole_edge_lists = []
+
+    # 健康孔洞提取：使用现有 extract_boundary_loops 获取闭合、度数为2的环
+    loops = extract_boundary_loops(mesh)
+
+    for loop in loops:
+        # 环的顶点列表
+        loop_vertices = [int(v) for v in loop]
+        edge_ids = []
+        valid = True
+        for i in range(len(loop_vertices)):
+            v0 = loop_vertices[i]
+            v1 = loop_vertices[(i + 1) % len(loop_vertices)]
+            min_v = min(v0, v1)
+            max_v = max(v0, v1)
+            key = min_v * (len(mesh.vertices) + 1) + max_v
+            if key not in key_to_id:
+                valid = False
+                break
+            edge_ids.append(key_to_id[key])
+        if not valid:
+            continue
+
+        hole_id = len(hole_vertex_lists)
+        hole_vertex_lists.append(loop_vertices)
+        hole_edge_lists.append(edge_ids)
+        for eid in edge_ids:
+            hole_ids_per_edge[eid] = hole_id
+
+    # 未覆盖开放边 id
+    uncovered = np.where(hole_ids_per_edge == -1)[0].astype(np.int64)
+
+    # 分类未覆盖开放边
+    degree = open_data['vertex_degree']
+    nonmanifold_mask = None
+    # 获取非流形面片掩码
+    _, _, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+
+    categories = np.zeros(len(uncovered), dtype=np.int8)
+    for idx, edge_id in enumerate(uncovered):
+        v0, v1 = vertex_pairs[edge_id]
+        d0 = degree[v0]
+        d1 = degree[v1]
+
+        # 非流形关联优先
+        face_id = open_data['open_edge_face_ids'][edge_id]
+        if nonmanifold_face_mask[face_id]:
+            categories[idx] = 4
+            continue
+
+        # 两端度数都为1：孤立开放链
+        if d0 == 1 and d1 == 1:
+            categories[idx] = 0
+        # 一端度数1，另一端>=2：悬空开放边
+        elif (d0 == 1 and d1 >= 2) or (d1 == 1 and d0 >= 2):
+            categories[idx] = 1
+        # 两端度数都>=2：分支内部开放边
+        elif d0 >= 2 and d1 >= 2:
+            categories[idx] = 2
+        else:
+            categories[idx] = 5
+
+    return {
+        **open_data,
+        'hole_vertex_lists': hole_vertex_lists,
+        'hole_edge_lists': hole_edge_lists,
+        'hole_ids_per_edge': hole_ids_per_edge,
+        'uncovered_edge_ids': uncovered,
+        'uncovered_category': categories,
+        'nonmanifold_face_mask': nonmanifold_face_mask,
+    }

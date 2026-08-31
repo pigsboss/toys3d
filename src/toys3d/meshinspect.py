@@ -50,6 +50,7 @@ from toys3d.geometrics import (
     hex_to_code,
     save_codes,
     group_faces_by_topology_codes,
+    build_hole_diagnosis_data,
 )
 
 
@@ -1348,6 +1349,113 @@ def perform_full_diagnosis(mesh, args):
           f"报告已生成到 {output_dir}")
 
 
+def perform_hole_diagnosis(mesh, args):
+    """执行孔洞诊断，输出健康孔洞与未覆盖开放边分析。"""
+    output_dir = Path(args.hole_diagnosis_output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n=== Hole Diagnosis ===")
+    print("提取开放边与健康孔洞...")
+    hole_data = build_hole_diagnosis_data(mesh)
+
+    # 1. 保存二进制数据
+    print("保存开放边与孔洞数据...")
+    open_edge_ids = np.arange(len(hole_data['open_edge_face_ids']), dtype=np.int64)
+    np.savez_compressed(
+        output_dir / "hole_diagnosis_data.npz",
+        open_edge_ids=open_edge_ids,
+        open_edge_vertex_pairs=hole_data['open_edge_vertex_pairs'],
+        open_edge_face_ids=hole_data['open_edge_face_ids'],
+        open_edge_keys=hole_data['open_edge_keys'],
+        hole_ids_per_edge=hole_data['hole_ids_per_edge'],
+        uncovered_edge_ids=hole_data['uncovered_edge_ids'],
+        uncovered_category=hole_data['uncovered_category'],
+    )
+
+    # 2. 构造 JSON 报告
+    print("生成孔洞诊断 JSON...")
+    total_open_edges = len(open_edge_ids)
+    total_holes = len(hole_data['hole_vertex_lists'])
+    uncovered_count = len(hole_data['uncovered_edge_ids'])
+    covered_count = total_open_edges - uncovered_count
+
+    hole_info_list = []
+    for hole_id, (vert_list, edge_list) in enumerate(zip(
+        hole_data['hole_vertex_lists'],
+        hole_data['hole_edge_lists']
+    )):
+        # 计算周长和面积
+        pts = mesh.vertices[np.asarray(vert_list, dtype=np.int64)]
+        # 面积调用 polygon_area_from_3d_ccw
+        area = polygon_area_from_3d_ccw(pts)
+        perimeter = float(np.sum(np.linalg.norm(pts - np.roll(pts, -1, axis=0), axis=1)))
+        hole_info_list.append({
+            "hole_id": hole_id,
+            "num_edges": len(edge_list),
+            "num_vertices": len(vert_list),
+            "area": area,
+            "perimeter": perimeter,
+            "vertex_indices": vert_list,
+        })
+
+    # 未覆盖开放边分类统计
+    category_counts = Counter(hole_data['uncovered_category'].tolist())
+    category_names = {
+        0: "孤立开放链",
+        1: "悬空开放边",
+        2: "分支内部开放边",
+        4: "非流形关联开放边",
+        5: "其他复杂开放边",
+    }
+    uncovered_categories_summary = {
+        category_names.get(int(cat), f"cat_{cat}"): int(cnt)
+        for cat, cnt in category_counts.items()
+    }
+
+    diagnosis_json = {
+        "total_open_edges": total_open_edges,
+        "total_healthy_holes": total_holes,
+        "covered_open_edges": covered_count,
+        "uncovered_open_edges": uncovered_count,
+        "healthy_holes": hole_info_list,
+        "uncovered_categories_summary": uncovered_categories_summary,
+        "open_edge_face_ids": hole_data['open_edge_face_ids'].tolist(),  # 可用于关联面片
+    }
+    with open(output_dir / "hole_diagnosis.json", "w", encoding="utf-8") as f:
+        json.dump(diagnosis_json, f, indent=2, ensure_ascii=False)
+
+    # 3. 生成 HTML 报告
+    print("生成孔洞诊断 HTML...")
+    html_path = output_dir / "hole_report.html"
+    html = ["<html><head><meta charset='utf-8'><title>Hole Diagnosis</title>",
+            "<style>body{font-family:sans-serif;margin:20px}",
+            "table{border-collapse:collapse;width:100%;margin-bottom:20px}",
+            "th,td{border:1px solid #ccc;padding:4px 8px;text-align:center}",
+            "th{background:#f0f0f0}</style></head><body>",
+            "<h1>Hole Diagnosis Report</h1>",
+            f"<p>总开放边: {total_open_edges}</p>",
+            f"<p>健康孔洞数: {total_holes}</p>",
+            f"<p>覆盖开放边: {covered_count}</p>",
+            f"<p>未覆盖开放边: {uncovered_count}</p>",
+            "<h2>未覆盖开放边分类</h2>",
+            "<table><tr><th>分类</th><th>数量</th></tr>"]
+    for cat, cnt in uncovered_categories_summary.items():
+        html.append(f"<tr><td>{cat}</td><td>{cnt}</td></tr>")
+    html.append("</table>")
+    html.append("<h2>健康孔洞概览</h2>")
+    html.append("<table><tr><th>孔洞ID</th><th>边数</th><th>面积</th><th>周长</th></tr>")
+    for hole in hole_info_list:
+        html.append(f"<tr><td>{hole['hole_id']}</td><td>{hole['num_edges']}</td>"
+                    f"<td>{hole['area']:.6f}</td><td>{hole['perimeter']:.6f}</td></tr>")
+    html.append("</table>")
+    html.append("</body></html>")
+    html_path.write_text("\n".join(html), encoding="utf-8")
+    print(f"孔洞诊断 HTML 报告已保存: {html_path}")
+
+    print(f"\nHole Diagnosis 完成，健康孔洞：{total_holes}，未覆盖开放边：{uncovered_count}，"
+          f"报告已生成到 {output_dir}")
+
+
 def print_separator(title=None):
     if title:
         print(f"\n{'=' * 60}")
@@ -1819,6 +1927,10 @@ def main():
                         help="关闭代理网格双面渲染")
     parser.add_argument("--full-diagnosis", action="store_true",
                         help="执行 Full Diagnosis（2-Pass），生成异常面拓扑分类报告")
+    parser.add_argument("--hole-diagnosis", action="store_true",
+                        help="执行孔洞诊断（健康孔洞提取及未覆盖开放边分类）")
+    parser.add_argument("--hole-diagnosis-output", type=str, default="hole_diagnosis_report",
+                        help="孔洞诊断输出目录（默认 hole_diagnosis_report）")
     parser.add_argument("--diagnosis-output", type=str, default="diagnosis_report",
                         help="Full Diagnosis 输出目录（默认 diagnosis_report）")
     parser.add_argument("--diagnosis-format", type=str, default="html",
@@ -1855,6 +1967,10 @@ def main():
     if not isinstance(mesh, trimesh.Trimesh):
         mesh = mesh.dump(concatenate=True)
         print("Multiple meshes detected, merged.")
+
+    if args.hole_diagnosis:
+        perform_hole_diagnosis(mesh, args)
+        return
 
     if args.full_diagnosis:
         perform_full_diagnosis(mesh, args)
