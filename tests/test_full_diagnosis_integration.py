@@ -96,17 +96,17 @@ def test_full_diagnosis_two_triangles_share_edge(tmp_path):
 
     _assert_common_structure(codes, abnormal_data, html_text, expected_n_faces=2)
 
-    # 两个面的真实规范化编码相同：010101020202
-    assert _codes_to_hex_set(codes) == {"010101020202"}
+    # 两个面的真实规范化编码相同：010102020201
+    assert _codes_to_hex_set(codes) == {"010102020201"}
 
     classes = abnormal_data["classes"]
-    assert set(classes.keys()) == {"010101020202"}
-    cls = classes["010101020202"]
+    assert set(classes.keys()) == {"010102020201"}
+    cls = classes["010102020201"]
     # 两个面都是异常面，索引 {0,1}
     assert set(cls["face_indices"]) == {0,1}
     assert cls["count"] == 2
 
-    assert "Class 010101020202" in html_text
+    assert "Class 010102020201" in html_text
 
 
 def test_full_diagnosis_three_triangles_share_vertex(tmp_path):
@@ -128,16 +128,16 @@ def test_full_diagnosis_three_triangles_share_vertex(tmp_path):
 
     _assert_common_structure(codes, abnormal_data, html_text, expected_n_faces=3)
 
-    # 三个面的真实规范化编码相同：010101010103
-    assert _codes_to_hex_set(codes) == {"010101010103"}
+    # 三个面的真实规范化编码相同：010101010301
+    assert _codes_to_hex_set(codes) == {"010101010301"}
 
     classes = abnormal_data["classes"]
-    assert set(classes.keys()) == {"010101010103"}
-    cls = classes["010101010103"]
+    assert set(classes.keys()) == {"010101010301"}
+    cls = classes["010101010301"]
     assert set(cls["face_indices"]) == {0,1,2}
     assert cls["count"] == 3
 
-    assert "Class 010101010103" in html_text
+    assert "Class 010101010301" in html_text
 
 
 def test_full_diagnosis_three_triangles_share_edge_nonmanifold(tmp_path):
@@ -158,16 +158,16 @@ def test_full_diagnosis_three_triangles_share_edge_nonmanifold(tmp_path):
 
     _assert_common_structure(codes, abnormal_data, html_text, expected_n_faces=3)
 
-    # 三个面的真实规范化编码相同：010101030303
-    assert _codes_to_hex_set(codes) == {"010101030303"}
+    # 三个面的真实规范化编码相同：010103030301
+    assert _codes_to_hex_set(codes) == {"010103030301"}
 
     classes = abnormal_data["classes"]
-    assert set(classes.keys()) == {"010101030303"}
-    cls = classes["010101030303"]
+    assert set(classes.keys()) == {"010103030301"}
+    cls = classes["010103030301"]
     assert set(cls["face_indices"]) == {0,1,2}
     assert cls["count"] == 3
 
-    assert "Class 010101030303" in html_text
+    assert "Class 010103030301" in html_text
 
 
 def test_full_diagnosis_high_valence_vertex(tmp_path):
@@ -199,17 +199,17 @@ def test_full_diagnosis_high_valence_vertex(tmp_path):
 
     # 真实编码中，中心顶点 valence=6，所以真实编码某位置应为 6，
     # 但截断后的分类中，顶点元为 5。
-    # 真实编码未截断，所以每个面的顶点元包含 6，规范化后最小字典序为 010101010106
-    assert _codes_to_hex_set(codes) == {"010101010106"}
+    # 真实编码未截断，所以每个面的顶点元包含 6，规范化后最小字典序为 010101010601
+    assert _codes_to_hex_set(codes) == {"010101010601"}
 
-    # 截断分类：顶点元 6 -> 5，所以键为 010101010105
+    # 截断分类：顶点元 6 -> 5，所以键为 010101010501
     classes = abnormal_data["classes"]
-    assert set(classes.keys()) == {"010101010105"}
-    cls = classes["010101010105"]
+    assert set(classes.keys()) == {"010101010501"}
+    cls = classes["010101010501"]
     assert set(cls["face_indices"]) == set(range(6))
     assert cls["count"] == 6
 
-    assert "Class 010101010105" in html_text
+    assert "Class 010101010501" in html_text
 
 
 def test_full_diagnosis_single_triangle_plus_degenerate(tmp_path):
