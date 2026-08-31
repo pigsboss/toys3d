@@ -48,6 +48,7 @@ from toys3d.geometrics import (
     code_to_hex,
     hex_to_code,
     save_codes,
+    group_faces_by_topology_codes,
 )
 
 
@@ -745,103 +746,99 @@ def _build_vertex_face_csr(mesh):
 
 
 def run_full_diagnosis_pass1(mesh, output_dir):
-    """
-    Pass 1: 计算异常面编码、绘制示意图、生成报告框架和检查点。
-    返回 (class_faces, id_to_code, abnormal_indices)。
-    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    diagrams_dir = output_dir / "diagrams"
-    diagrams_dir.mkdir(exist_ok=True)
 
     print("\n=== Full Diagnosis Pass 1 ===")
-    print("计算面片拓扑编码...")
-
-    defects, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+    print("分析网格缺陷...")
+    _, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
     abnormal_mask = open_face_mask | nonmanifold_face_mask
     abnormal_indices = np.where(abnormal_mask)[0]
 
     print(f"异常面片总数: {len(abnormal_indices)}")
 
-    if len(abnormal_indices) == 0:
-        print("没有异常面，退出。")
-        # 创建空的 classes_data 和 checkpoint
-        with open(output_dir / "classes_data.json", "w") as f:
-            json.dump({"class_faces": {}, "id_to_code": []}, f)
-        with open(output_dir / "checkpoint.json", "w") as f:
-            json.dump({"mesh_hash": None, "classes": {}, "total_classes": 0,
-                       "abnormal_count": 0}, f)
-        return {}, [], abnormal_indices
-
     vertex_face_counts = compute_vertex_face_counts(mesh)
     face_edge_types = compute_face_edge_types(mesh)
 
-    codes, code_to_id, id_to_code = compute_face_topology_codes(
-        mesh, abnormal_indices, vertex_face_counts, face_edge_types
+    # 计算所有面片的拓扑编码
+    all_face_indices = np.arange(len(mesh.faces))
+    codes_all, _, _ = compute_face_topology_codes(
+        mesh, all_face_indices, vertex_face_counts, face_edge_types
+    )
+    save_codes(codes_all, output_dir / "face_codes.npy")
+
+    if len(abnormal_indices) == 0:
+        # 创建空的分类 JSON 和 checkpoint
+        empty_classes = {
+            "valence_threshold": 5,
+            "total_abnormal_faces": 0,
+            "classes": {}
+        }
+        with open(output_dir / "abnormal_truncated_classes.json", "w") as f:
+            json.dump(empty_classes, f, indent=2)
+        checkpoint = {
+            "valence_threshold": 5,
+            "classes": {},
+            "total_classes": 0,
+            "abnormal_count": 0
+        }
+        with open(output_dir / "checkpoint.json", "w") as f:
+            json.dump(checkpoint, f, indent=2)
+        return {}, abnormal_indices
+
+    # 对异常面片进行截断聚类
+    print("截断聚类异常面片...")
+    grouped = group_faces_by_topology_codes(
+        mesh, abnormal_indices, vertex_face_counts, face_edge_types,
+        valence_threshold=5
     )
 
-    code_ids = np.array([code_to_id[bytes(c)] for c in codes], dtype=np.int64)
-
-    unique_ids, inverse, counts = np.unique(code_ids, return_inverse=True, return_counts=True)
-
-    print(f"发现 {len(unique_ids)} 个不同拓扑类别。")
-
     class_faces = {}
-    for class_id in unique_ids:
-        mask = inverse == np.where(unique_ids == class_id)[0][0]
-        class_faces[class_id] = abnormal_indices[mask].tolist()
+    classes_json = {}
+    for key, face_list in grouped.items():
+        hex_code = code_to_hex(key)
+        class_faces[hex_code] = face_list
+        classes_json[hex_code] = {
+            "face_indices": face_list.tolist(),
+            "count": int(len(face_list)),
+            "status": "pending"
+        }
 
-    # 绘制示意图
-    print("生成拓扑示意图...")
-    for class_id, code in enumerate(id_to_code):
-        diagram_path = diagrams_dir / f"diagram_{class_id}.svg"
-        _generate_topology_diagram(code, str(diagram_path))
-        if class_id % 10 == 0:
-            print(f"  已生成 {class_id + 1}/{len(id_to_code)} 个示意图")
-
-    # 保存逐面片真实编码到 .npy
-    save_codes(codes, output_dir / "face_codes.npy")
-
-    # 将 id_to_code 转为 hex 字符串列表以便 JSON 序列化
-    id_to_code_hex = [code_to_hex(b) for b in id_to_code]
-    # 保存分类数据用于 resume
-    classes_data = {
-        "class_faces": {str(cid): faces for cid, faces in class_faces.items()},
-        "id_to_code": id_to_code_hex,
+    abnormal_data = {
+        "valence_threshold": 5,
+        "total_abnormal_faces": int(len(abnormal_indices)),
+        "classes": classes_json
     }
-    with open(output_dir / "classes_data.json", "w") as f:
-        json.dump(classes_data, f, indent=2)
+    with open(output_dir / "abnormal_truncated_classes.json", "w") as f:
+        json.dump(abnormal_data, f, indent=2)
 
-    # 创建检查点文件
     checkpoint = {
-        "mesh_hash": str(mesh.vertices.shape) + str(mesh.faces.shape),
-        "classes": {str(cid): "pending" for cid in unique_ids},
-        "total_classes": len(unique_ids),
-        "abnormal_count": len(abnormal_indices),
+        "valence_threshold": 5,
+        "classes": {hex_code: "pending" for hex_code in class_faces},
+        "total_classes": len(class_faces),
+        "abnormal_count": int(len(abnormal_indices))
     }
     with open(output_dir / "checkpoint.json", "w") as f:
         json.dump(checkpoint, f, indent=2)
 
-    return class_faces, id_to_code, abnormal_indices
+    print(f"发现 {len(class_faces)} 个不同拓扑类别（截断）。")
+    return class_faces, abnormal_indices
 
 
-def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
+def run_full_diagnosis_pass2(mesh, output_dir, class_faces,
                              open_face_mask, nonmanifold_face_mask,
                              resume=False):
-    """
-    Pass 2: 逐类分析并填充报告，支持断点恢复。
-    """
     output_dir = Path(output_dir)
     checkpoint_path = output_dir / "checkpoint.json"
+    classes_json_path = output_dir / "abnormal_truncated_classes.json"
 
-    if resume and checkpoint_path.exists():
+    if resume and checkpoint_path.exists() and classes_json_path.exists():
         with open(checkpoint_path, "r") as f:
             checkpoint = json.load(f)
-        pending_classes = [int(cid) for cid, status in checkpoint["classes"].items()
+        pending_classes = [hex_code for hex_code, status in checkpoint["classes"].items()
                            if status == "pending"]
-        done_classes = [int(cid) for cid, status in checkpoint["classes"].items()
-                        if status == "done"]
-        print(f"恢复模式：已完成 {len(done_classes)} 类，剩余 {len(pending_classes)} 类")
+        print(f"恢复模式：已完成 {len(checkpoint['classes']) - len(pending_classes)} 类，"
+              f"剩余 {len(pending_classes)} 类")
     else:
         pending_classes = list(class_faces.keys())
 
@@ -857,16 +854,14 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
     face_edge_keys = compute_face_edge_keys(mesh)
 
     results = {}
-    for idx, class_id in enumerate(pending_classes):
-        code = id_to_code[class_id]  # bytes
-        face_indices = class_faces[class_id]
-        code_hex = code_to_hex(code)
+    for idx, hex_code in enumerate(pending_classes):
+        face_indices = np.asarray(class_faces[hex_code], dtype=np.int64)
         print(f"\n=== 分析类别 {idx+1}/{len(pending_classes)} ===", flush=True)
-        print(f"  编码: {code_hex}, 面片数: {len(face_indices)}", flush=True)
+        print(f"  编码: {hex_code}, 面片数: {len(face_indices)}", flush=True)
 
         areas = mesh.area_faces[face_indices]
         area_stats = {
-            'count': len(face_indices),
+            'count': int(len(face_indices)),
             'mean': float(np.mean(areas)),
             'min': float(np.min(areas)),
             'p1': float(np.percentile(areas, 1)),
@@ -886,39 +881,56 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces, id_to_code,
             vertex_faces_csr, edge_to_faces, face_edge_keys
         )
 
-        # 选择代表面，计算逐顶点/逐边统计
         rep_face = int(face_indices[0])
         vertex_stats, edge_stats = compute_single_face_neighbor_stats(
             mesh, rep_face, open_face_mask, nonmanifold_face_mask,
             vertex_faces_csr, edge_to_faces, face_edge_keys
         )
 
-        # 获取代表面的标准编码对应的顶点/边顺序
         _, v_order, e_order = get_face_topology_code_and_order(
             mesh, rep_face, vertex_face_counts, edge_to_faces, face_edge_keys
         )
 
-        # 重排统计与标准编码对齐
         aligned_vertex_stats = [vertex_stats[i] for i in v_order]
         aligned_edge_stats = [edge_stats[i] for i in e_order]
 
         class_result = {
-            'class_id': int(class_id),
-            'code': code_hex,
+            'class_id': hex_code,
+            'code': hex_code,
             'area_stats': area_stats,
             'point_counts': point_counts,
             'edge_counts': edge_counts,
             'representative_vertex_stats': aligned_vertex_stats,
             'representative_edge_stats': aligned_edge_stats,
         }
-        results[class_id] = class_result
+        results[hex_code] = class_result
 
-        # 更新检查点
+        # 更新 abnormal_truncated_classes.json
+        with open(classes_json_path, "r") as f:
+            data = json.load(f)
+        if hex_code not in data["classes"]:
+            # 兼容恢复时 dict 中可能没有该键
+            data["classes"][hex_code] = {
+                "face_indices": face_indices.tolist(),
+                "count": len(face_indices)
+            }
+        data["classes"][hex_code]["area_stats"] = area_stats
+        data["classes"][hex_code]["point_counts"] = point_counts
+        data["classes"][hex_code]["edge_counts"] = edge_counts
+        data["classes"][hex_code]["representative_vertex_stats"] = aligned_vertex_stats
+        data["classes"][hex_code]["representative_edge_stats"] = aligned_edge_stats
+        data["classes"][hex_code]["status"] = "done"
+        with open(classes_json_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+        # 更新 checkpoint
         with open(checkpoint_path, "r") as f:
-            checkpoint = json.load(f)
-        checkpoint["classes"][str(class_id)] = "done"
+            ckpt = json.load(f)
+        if hex_code not in ckpt["classes"]:
+            ckpt["classes"][hex_code] = "pending"  # 兼容可能缺失
+        ckpt["classes"][hex_code] = "done"
         with open(checkpoint_path, "w") as f:
-            json.dump(checkpoint, f, indent=2)
+            json.dump(ckpt, f, indent=2)
 
         print(f"  面积: 平均={area_stats['mean']:.6f}, p50={area_stats['p50']:.6f}", flush=True)
         print(f"  点邻: 流形={point_counts['normal']}, 开放={point_counts['open']}, "
@@ -1100,6 +1112,149 @@ def generate_latex_report(output_dir, id_to_code, results):
     print(f"LaTeX 报告已保存: {tex_path}")
 
 
+def generate_html_report_from_json(output_dir):
+    """
+    从 abnormal_truncated_classes.json 生成 HTML 报告，
+    包含每个类的拓扑 SVG 示意图和统计表。
+    """
+    output_dir = Path(output_dir)
+    html_path = output_dir / "report.html"
+    classes_json_path = output_dir / "abnormal_truncated_classes.json"
+    diagrams_dir = output_dir / "diagrams"
+    diagrams_dir.mkdir(exist_ok=True)
+
+    if not classes_json_path.exists():
+        print(f"[ERROR] {classes_json_path} not found.")
+        return
+
+    with open(classes_json_path, "r") as f:
+        data = json.load(f)
+
+    html = ["<html><head><meta charset='utf-8'><title>Full Face Diagnosis</title>",
+            "<style>",
+            "body { font-family: sans-serif; margin: 20px; }",
+            "table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }",
+            "th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: center; }",
+            "th { background: #f0f0f0; }",
+            ".class-block { margin-bottom: 30px; border: 1px solid #ddd; padding: 10px; }",
+            "img { max-width: 300px; height: auto; }",
+            ".diagram-container { display: inline-block; vertical-align: top; margin-right: 20px; }",
+            ".diagram-container svg { width: 200px; height: 170px; }",
+            ".legend { margin-bottom: 20px; padding: 10px; border: 1px solid #ccc; background: #fafafa; }",
+            ".legend span.legend-dot { display: inline-block; width: 15px; height: 15px; border-radius: 50%; margin-right: 5px; }",
+            ".legend span.solid { background: black; border: 1px solid black; }",
+            ".legend span.hollow { background: white; border: 2px solid black; }",
+            ".legend span.legend-line { display: inline-block; width: 30px; height: 0; border-top: 3px solid; margin-right: 5px; vertical-align: middle; }",
+            ".legend span.blue { border-color: blue; }",
+            ".legend span.green { border-color: green; }",
+            ".legend span.red { border-color: red; }",
+            "</style></head><body>",
+            "<h1>Full Face Diagnosis Report</h1>"]
+
+    # 图例
+    html.append("<div class='legend'>")
+    html.append("<strong>图例：</strong><br>")
+    html.append("<span class='legend-dot solid'></span> 独占顶点（仅被当前面引用）<br>")
+    html.append("<span class='legend-dot hollow'></span> 共享顶点（被多个面引用）<br>")
+    html.append("<span class='legend-line blue'></span> 开放边（仅属于当前面）<br>")
+    html.append("<span class='legend-line green'></span> 流形边（被两面共享）<br>")
+    html.append("<span class='legend-line red'></span> 非流形边（被三面或更多共享）<br>")
+    html.append("</div>")
+
+    html.append("<h2>Topology Classes</h2>")
+
+    classes = data.get("classes", {})
+    if not classes:
+        html.append("<p>No abnormal classes found.</p>")
+    else:
+        for hex_code, cls_data in classes.items():
+            # 生成 SVG 图
+            diagram_path = diagrams_dir / f"diagram_{hex_code}.svg"
+            try:
+                code_arr = hex_to_code(hex_code)
+                _generate_topology_diagram(code_arr, str(diagram_path))
+            except Exception as e:
+                print(f"  [WARN] Diagram generation for {hex_code} failed: {e}")
+                diagram_path = None
+
+            svg_content = ""
+            if diagram_path and diagram_path.exists():
+                svg_content = diagram_path.read_text(encoding="utf-8")
+            if not svg_content:
+                svg_content = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='170'><text x='10' y='80'>Diagram not generated</text></svg>"
+
+            html.append("<div class='class-block'>")
+            html.append(f"<h3>Class {hex_code}</h3>")
+            html.append("<div class='diagram-container'>")
+            html.append(svg_content)
+            html.append("</div>")
+            html.append("<div style='display: inline-block; vertical-align: top;'>")
+
+            # 面积统计表
+            area = cls_data.get("area_stats", {})
+            if area:
+                html.append("<table>")
+                html.append("<tr><th>面积统计</th><th>值</th></tr>")
+                rows = [
+                    ("count", "面片数"),
+                    ("mean", "平均"),
+                    ("min", "最小值"),
+                    ("p1", "p1"),
+                    ("p5", "p5"),
+                    ("p10", "p10"),
+                    ("p25", "p25"),
+                    ("p50", "p50"),
+                    ("p75", "p75"),
+                    ("p90", "p90"),
+                    ("p95", "p95"),
+                    ("p99", "p99"),
+                    ("max", "最大值"),
+                ]
+                for key, label in rows:
+                    if key in area:
+                        html.append(f"<tr><td>{label}</td><td>{area[key]:.6f}</td></tr>")
+                    else:
+                        html.append(f"<tr><td>{label}</td><td>N/A</td></tr>")
+                html.append("</table>")
+
+            # 邻接统计
+            pc = cls_data.get("point_counts", {})
+            ec = cls_data.get("edge_counts", {})
+            if pc and ec:
+                html.append("<table>")
+                html.append("<tr><th></th><th>流形</th><th>开放</th><th>非流形</th></tr>")
+                html.append("<tr><th>点邻（合计）</th>"
+                            f"<td>{pc.get('normal', 0)}</td><td>{pc.get('open', 0)}</td><td>{pc.get('nonmanifold', 0)}</td></tr>")
+                html.append("<tr><th>边邻（合计）</th>"
+                            f"<td>{ec.get('normal', 0)}</td><td>{ec.get('open', 0)}</td><td>{ec.get('nonmanifold', 0)}</td></tr>")
+                html.append("</table>")
+
+            # 代表面逐顶点/逐边统计（可选展示）
+            v_stats = cls_data.get("representative_vertex_stats")
+            e_stats = cls_data.get("representative_edge_stats")
+            if v_stats:
+                html.append("<table>")
+                html.append("<tr><th>代表面-顶点</th><th>流形</th><th>开放</th><th>非流形</th></tr>")
+                for idx, vs in enumerate(v_stats):
+                    html.append(f"<tr><td>V{idx}</td>"
+                                f"<td>{vs.get('normal', 0)}</td><td>{vs.get('open', 0)}</td><td>{vs.get('nonmanifold', 0)}</td></tr>")
+                html.append("</table>")
+            if e_stats:
+                html.append("<table>")
+                html.append("<tr><th>代表面-边</th><th>流形</th><th>开放</th><th>非流形</th></tr>")
+                for idx, es in enumerate(e_stats):
+                    html.append(f"<tr><td>E{idx}</td>"
+                                f"<td>{es.get('normal', 0)}</td><td>{es.get('open', 0)}</td><td>{es.get('nonmanifold', 0)}</td></tr>")
+                html.append("</table>")
+
+            html.append("</div>")  # 关闭右侧容器
+            html.append("</div>")  # 关闭 class-block
+
+    html.append("</body></html>")
+    html_path.write_text("\n".join(html), encoding="utf-8")
+    print(f"HTML 报告已保存: {html_path}")
+
+
 def perform_full_diagnosis(mesh, args):
     """
     Full Diagnosis 入口，协调 Pass 1 和 Pass 2。
@@ -1110,54 +1265,36 @@ def perform_full_diagnosis(mesh, args):
     _, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
 
     resume_checkpoint = output_dir / "checkpoint.json"
-    classes_data_path = output_dir / "classes_data.json"
+    classes_json_path = output_dir / "abnormal_truncated_classes.json"
 
-    if args.resume and resume_checkpoint.exists() and classes_data_path.exists():
-        with open(classes_data_path, "r") as f:
-            data = json.load(f)
-        class_faces = {int(k): v for k, v in data["class_faces"].items()}
-        # 将 hex 字符串转换回 bytes 列表
-        id_to_code = [bytes(hex_to_code(s)) for s in data["id_to_code"]]
-        print("Resume: loading existing classification from Pass 1.")
+    if args.resume and resume_checkpoint.exists() and classes_json_path.exists():
+        with open(classes_json_path, "r") as f:
+            classes_data = json.load(f)
+        class_faces = {hex_code: np.asarray(entry["face_indices"], dtype=np.int64)
+                       for hex_code, entry in classes_data.get("classes", {}).items()}
+        print("Resume: loading existing classifications from Pass 1.")
     else:
-        class_faces, id_to_code, _ = run_full_diagnosis_pass1(mesh, output_dir)
+        class_faces, _ = run_full_diagnosis_pass1(mesh, output_dir)
 
     results = run_full_diagnosis_pass2(
-        mesh, output_dir, class_faces, id_to_code,
+        mesh, output_dir, class_faces,
         open_face_mask, nonmanifold_face_mask,
         resume=args.resume
     )
 
     if args.diagnosis_format == "html":
-        generate_html_report(output_dir, id_to_code, results)
+        generate_html_report_from_json(output_dir)
     else:
-        generate_latex_report(output_dir, id_to_code, results)
+        # 新的架构中以 JSON 为单一数据源，暂未适配 LaTeX 生成，这里回退到 HTML
+        print("[WARN] LaTeX report generation is not yet adapted to the new architecture.")
+        print("Falling back to HTML report generation.")
+        generate_html_report_from_json(output_dir)
 
-    # 计算异常面总数（用于 meta）
+    # 计算异常面总数（用于 meta；不再单独生成 diagnosis_results.json）
     abnormal_mask = open_face_mask | nonmanifold_face_mask
     abnormal_count = int(abnormal_mask.sum())
-
-    # 保存 JSON 诊断报告（机器可读格式）
-    json_path = output_dir / "diagnosis_results.json"
-    # 将 id_to_code 转换为 hex 字符串列表，避免 JSON 无法序列化 bytes
-    id_to_code_hex = [code_to_hex(b) for b in id_to_code]
-    diagnosis_json = {
-        "meta": {
-            "mesh_file": args.input_file,
-            "abnormal_count": abnormal_count,
-            "total_classes": len(id_to_code),
-            "classes_completed": len(results),
-            "format_version": 1,
-            "generated_by": "meshinspect.py --full-diagnosis",
-        },
-        "id_to_code": id_to_code_hex,
-        "classes": {str(class_id): res for class_id, res in results.items()},
-    }
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(diagnosis_json, f, indent=2, ensure_ascii=False)
-    print(f"JSON 诊断报告已保存: {json_path}")
-
-    print(f"\nFull Diagnosis 完成，报告已生成到 {output_dir}")
+    print(f"\nFull Diagnosis 完成，异常面总数：{abnormal_count}，"
+          f"报告已生成到 {output_dir}")
 
 
 def print_separator(title=None):
