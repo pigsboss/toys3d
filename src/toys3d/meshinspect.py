@@ -634,6 +634,80 @@ def add_boundary_projection_to_scene(scene, boundary_mesh, proxy_mesh,
         print(f"  Projected {len(loops)} boundary loops onto proxy mesh.")
 
 
+def load_uncovered_edge_data(data_dir):
+    """
+    从 hole diagnosis 输出目录加载未覆盖开放边数据。
+
+    返回:
+        uncovered_ids : (U,) int64，未覆盖开放边 ID
+        all_vertex_pairs : (E,2) int64，所有开放边的顶点对
+        categories : (U,) int8，未覆盖开放边的分类
+    """
+    data_dir = Path(data_dir)
+    npz_path = data_dir / "hole_diagnosis_data.npz"
+    if not npz_path.exists():
+        raise FileNotFoundError(f"未找到 {npz_path}")
+    npz = np.load(npz_path)
+    uncovered_ids = npz["uncovered_edge_ids"]
+    all_vertex_pairs = npz["open_edge_vertex_pairs"]
+    categories = npz["uncovered_category"]
+    return uncovered_ids, all_vertex_pairs, categories
+
+
+def add_uncovered_edges_to_scene(scene, mesh, data_dir,
+                                 radius=None, verbose=False):
+    """
+    将 hole diagnosis 中未覆盖的开放边高亮添加到场景。
+
+    分类颜色：
+        0: 孤立开放链 -> 蓝色
+        1: 悬空开放边 -> 黄色
+        2: 分支内部开放边 -> 橙色
+        4: 非流形关联开放边 -> 红色
+        5: 其他复杂开放边 -> 灰色
+    """
+    try:
+        uncovered_ids, all_vertex_pairs, categories = load_uncovered_edge_data(data_dir)
+    except FileNotFoundError as e:
+        if verbose:
+            print(f"[WARNING] {e}")
+        return
+
+    if len(uncovered_ids) == 0:
+        if verbose:
+            print("没有未覆盖开放边。")
+        return
+
+    uncovered_vertex_pairs = all_vertex_pairs[uncovered_ids]
+
+    category_colors = {
+        0: (0, 0, 255, 255),       # 孤立开放链 -> 蓝色
+        1: (255, 255, 0, 255),     # 悬空开放边 -> 黄色
+        2: (255, 128, 0, 255),     # 分支内部开放边 -> 橙色
+        4: (255, 0, 0, 255),       # 非流形关联开放边 -> 红色
+        5: (128, 128, 128, 255),   # 其他复杂开放边 -> 灰色
+    }
+
+    if radius is None or radius <= 0:
+        bounds = mesh.bounds
+        diag = np.linalg.norm(bounds[1] - bounds[0])
+        radius = max(diag * 0.0005, 1e-6)
+
+    if verbose:
+        print(f"高亮未覆盖开放边 {len(uncovered_vertex_pairs)} 条")
+
+    for i, (v0, v1) in enumerate(uncovered_vertex_pairs):
+        cat = int(categories[i])
+        color = category_colors.get(cat, (255, 255, 255, 255))
+        seg = trimesh.creation.cylinder(
+            radius=radius,
+            segment=[mesh.vertices[v0], mesh.vertices[v1]],
+            sections=4,
+        )
+        seg.visual.face_colors = color
+        scene.add_geometry(seg)
+
+
 def load_proxy_mesh(args):
     """根据参数加载代理网格，返回代理网格或 None。"""
     if not args.overlay_proxy:
@@ -1800,6 +1874,15 @@ def inspect_mesh(mesh, args):
 
     if scene is not None and proxy_mesh is not None:
         add_proxy_overlay_to_scene(scene, args, proxy_mesh)
+
+    if args.highlight_uncovered_edges and scene is not None:
+        add_uncovered_edges_to_scene(
+            scene, mesh,
+            data_dir=args.uncovered_data_dir,
+            radius=args.uncovered_radius,
+            verbose=True,
+        )
+
     return scene
 
 
@@ -1852,6 +1935,14 @@ def main():
                         help="线框 RGBA 颜色，默认 '0,0,0,255'")
     parser.add_argument("--highlight-holes", action="store_true",
                         help="高亮显示闭合孔洞边界，相邻孔洞使用不同高饱和度颜色")
+    parser.add_argument("--highlight-uncovered-edges", action="store_true",
+                        help="在 --show 或 --output 时高亮 hole diagnosis 中未覆盖的开放边")
+    parser.add_argument("--uncovered-data-dir", type=str,
+                        default="hole_diagnosis_report",
+                        help="hole diagnosis 输出目录，用于加载未覆盖开放边数据 "
+                             "（默认 hole_diagnosis_report）")
+    parser.add_argument("--uncovered-radius", type=float, default=None,
+                        help="未覆盖开放边圆柱半径（默认自动计算，略粗于普通线框）")
     parser.add_argument("--highlight-reliable", action="store_true",
                         help="高亮显示可靠邻域（绿色=可靠，黄色=缺陷邻域，红色=不可靠）")
     parser.add_argument("--keep-reliable-only", action="store_true",
