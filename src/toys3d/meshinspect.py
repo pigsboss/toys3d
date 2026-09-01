@@ -906,6 +906,220 @@ def _build_vertex_face_csr(mesh):
     return csr_matrix((data, (row_idx, col_idx)), shape=(n_vertices, n_faces))
 
 
+def expand_face_neighborhood(mesh, seed_faces, depth):
+    """
+    从种子面片出发，返回拓扑邻域扩展 depth 层后的面片索引集合。
+    depth=0 返回空集合；depth=1 返回 seed_faces 本身；
+    depth>=2 依次加入直接邻居、邻居的邻居等。
+    """
+    if depth <= 0:
+        return set()
+    seed_faces = set(map(int, seed_faces))
+    if depth == 1:
+        return seed_faces.copy()
+
+    n_faces = len(mesh.faces)
+    adjacency = [[] for _ in range(n_faces)]
+    for f0, f1 in mesh.face_adjacency:
+        adjacency[int(f0)].append(int(f1))
+        adjacency[int(f1)].append(int(f0))
+
+    # 初始层就是种子面片
+    current = list(seed_faces)
+    visited = set(seed_faces)
+
+    # 已经占用了 depth=1，因此需要再向外扩展 depth-1 层
+    for _ in range(depth - 1):
+        next_layer = []
+        for f in current:
+            for nb in adjacency[f]:
+                if nb not in visited:
+                    visited.add(nb)
+                    next_layer.append(nb)
+        current = next_layer
+        if not current:
+            break
+    return visited
+
+
+def load_boundary_component_data(data_dir, boundary_id, boundary_type="uncovered"):
+    """
+    从 hole diagnosis 输出目录加载指定边界组件或健康孔洞的数据。
+
+    boundary_type:
+        "uncovered" : 未覆盖开放边分量
+        "healthy"   : 健康孔洞
+
+    返回统一的组件字典，包含边、面、端点、分支点、候选断裂等信息。
+    """
+    data_dir = Path(data_dir)
+
+    if boundary_type == "uncovered":
+        component_json = data_dir / "uncovered_component_analysis.json"
+        if not component_json.exists():
+            raise FileNotFoundError(f"未找到 {component_json}")
+        with open(component_json, "r") as f:
+            comp_data = json.load(f)
+        components = comp_data.get("components", [])
+        if boundary_id < 0 or boundary_id >= len(components):
+            raise ValueError(
+                f"无效的未覆盖分量 ID: {boundary_id}，共 {len(components)} 个分量"
+            )
+        comp = components[boundary_id]
+        # 确保字段以 list 形式存在
+        comp.setdefault("endpoints", [])
+        comp.setdefault("branch_vertices", [])
+        comp.setdefault("candidate_breaks", [])
+        return comp
+
+    elif boundary_type == "healthy":
+        npz_path = data_dir / "hole_diagnosis_data.npz"
+        json_path = data_dir / "hole_diagnosis.json"
+        if not npz_path.exists() or not json_path.exists():
+            raise FileNotFoundError(f"未找到 {npz_path} 或 {json_path}")
+
+        npz = np.load(npz_path)
+        with open(json_path, "r") as f:
+            diag_json = json.load(f)
+
+        healthy_holes = diag_json.get("healthy_holes", [])
+        if boundary_id < 0 or boundary_id >= len(healthy_holes):
+            raise ValueError(
+                f"无效的健康孔洞 ID: {boundary_id}，共 {len(healthy_holes)} 个孔洞"
+            )
+
+        hole_vertex_list = healthy_holes[boundary_id]["vertex_indices"]
+        hole_ids_per_edge = npz["hole_ids_per_edge"]
+        open_edge_vertex_pairs = npz["open_edge_vertex_pairs"]
+        open_edge_face_ids = npz["open_edge_face_ids"]
+
+        # 筛选属于该孔洞的开放边
+        edge_mask = hole_ids_per_edge == boundary_id
+        edge_indices = np.where(edge_mask)[0]
+        comp_edges = open_edge_vertex_pairs[edge_indices]
+        comp_face_ids = np.unique(open_edge_face_ids[edge_indices])
+
+        # 构造统一结构
+        vertices_set = set()
+        for v0, v1 in comp_edges:
+            vertices_set.add(int(v0))
+            vertices_set.add(int(v1))
+
+        component = {
+            "component_id": boundary_id,
+            "num_edges": int(len(comp_edges)),
+            "num_vertices": int(len(vertices_set)),
+            "vertices": sorted(vertices_set),
+            "edge_vertex_pairs": comp_edges.tolist(),
+            "endpoints": [],
+            "branch_vertices": [],
+            "is_cycle": True,      # 健康孔洞本质上是闭合环
+            "face_ids": comp_face_ids.tolist(),
+            "open_face_count": int(len(comp_face_ids)),
+            "nonmanifold_face_count": 0,
+            "candidate_breaks": [],
+            "healthy_hole_vertex_indices": hole_vertex_list,
+        }
+        return component
+
+    else:
+        raise ValueError(f"未知的边界类型: {boundary_type}")
+
+
+def visualize_boundary_component(mesh, args):
+    """
+    可视化健康孔洞或未覆盖开放边分量及其局部三角面片。
+    默认不显示整个网格，只显示目标边界和指定邻域深度内的面片。
+    """
+    comp = load_boundary_component_data(
+        args.boundary_data_dir,
+        args.boundary_id,
+        args.boundary_type,
+    )
+
+    scene = trimesh.Scene()
+
+    # 可选：显示半透明原始网格
+    if args.boundary_show_original:
+        vis_mesh = mesh.copy()
+        set_face_alpha(vis_mesh, 0.3)
+        scene.add_geometry(vis_mesh)
+
+    # 根据邻域深度显示相关三角面片
+    if args.boundary_neighborhood_depth > 0:
+        face_ids = comp.get("face_ids", [])
+        if face_ids:
+            expanded_faces = expand_face_neighborhood(
+                mesh, face_ids, args.boundary_neighborhood_depth
+            )
+            if expanded_faces:
+                sub = mesh.submesh(
+                    [np.array(list(expanded_faces), dtype=np.int64)]
+                )[0]
+                if args.boundary_type == "uncovered":
+                    sub.visual.face_colors = [255, 165, 0, 255]  # 橙色
+                else:
+                    sub.visual.face_colors = [144, 238, 144, 255]  # 浅绿
+                scene.add_geometry(sub)
+
+    # 计算默认圆柱半径
+    radius = args.boundary_radius
+    if radius is None or radius <= 0:
+        bounds = mesh.bounds
+        diag = np.linalg.norm(bounds[1] - bounds[0])
+        radius = max(diag * 0.0005, 1e-6)
+
+    # 绘制边界边
+    if args.boundary_type == "uncovered":
+        edge_color = [0, 128, 255, 255]   # 蓝色
+    else:
+        edge_color = [0, 255, 255, 255]   # 青色
+
+    for v0, v1 in comp["edge_vertex_pairs"]:
+        seg = trimesh.creation.cylinder(
+            radius=radius,
+            segment=[mesh.vertices[v0], mesh.vertices[v1]],
+            sections=4,
+        )
+        seg.visual.face_colors = edge_color
+        scene.add_geometry(seg)
+
+    # 端点（绿色球）
+    for v in comp.get("endpoints", []):
+        sphere = trimesh.creation.icosphere(subdivisions=1, radius=radius * 2.0)
+        sphere.apply_translation(mesh.vertices[v])
+        sphere.visual.face_colors = [0, 255, 0, 255]
+        scene.add_geometry(sphere)
+
+    # 分支点（红色球）
+    for v in comp.get("branch_vertices", []):
+        sphere = trimesh.creation.icosphere(subdivisions=1, radius=radius * 2.0)
+        sphere.apply_translation(mesh.vertices[v])
+        sphere.visual.face_colors = [255, 0, 0, 255]
+        scene.add_geometry(sphere)
+
+    # 候选断裂点对（橙色虚线，用细圆柱表示）
+    for cand in comp.get("candidate_breaks", []):
+        p0 = mesh.vertices[cand["v0"]]
+        p1 = mesh.vertices[cand["v1"]]
+        seg = trimesh.creation.cylinder(
+            radius=radius * 0.8,
+            segment=[p0, p1],
+            sections=4,
+        )
+        seg.visual.face_colors = [255, 165, 0, 255]
+        scene.add_geometry(seg)
+
+    if args.output:
+        scene.export(args.output)
+        print(
+            f"边界组件 {args.boundary_id} 可视化已保存至: {args.output}"
+        )
+    if args.show:
+        os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
+        scene.show()
+
+
 def run_full_diagnosis_pass1(mesh, output_dir, valence_threshold=5):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2154,6 +2368,23 @@ def main():
                         help="执行 Full Diagnosis（2-Pass），生成异常面拓扑分类报告")
     parser.add_argument("--hole-diagnosis", action="store_true",
                         help="执行孔洞诊断（健康孔洞提取及未覆盖开放边分类）")
+    # 新增：局部边界组件可视化参数（在 --hole-diagnosis 后插入）
+    parser.add_argument("--visualize-boundary-component", action="store_true",
+                        help="可视化特定孔洞/开放边分量及其三角面片")
+    parser.add_argument("--boundary-type", choices=["uncovered", "healthy"],
+                        default="uncovered",
+                        help="要可视化的边界类型：uncovered（未覆盖开放边分量）或 healthy（健康孔洞）")
+    parser.add_argument("--boundary-id", type=int, default=0,
+                        help="边界组件或孔洞的 ID（默认 0）")
+    parser.add_argument("--boundary-data-dir", type=str, default="hole_diagnosis_report",
+                        help="hole diagnosis 输出目录（默认 hole_diagnosis_report）")
+    parser.add_argument("--boundary-neighborhood-depth", type=int, default=1,
+                        help="边界邻域深度：0 仅边界，1 边界所在面片，"
+                             "2 边界面片+直接邻居，依此类推（默认 1）")
+    parser.add_argument("--boundary-radius", type=float, default=None,
+                        help="边界圆柱半径（默认自动计算）")
+    parser.add_argument("--boundary-show-original", action="store_true",
+                        help="同时显示原始网格（半透明背景）")
     parser.add_argument("--hole-diagnosis-output", type=str, default="hole_diagnosis_report",
                         help="孔洞诊断输出目录（默认 hole_diagnosis_report）")
     parser.add_argument("--diagnosis-output", type=str, default="diagnosis_report",
@@ -2192,6 +2423,11 @@ def main():
     if not isinstance(mesh, trimesh.Trimesh):
         mesh = mesh.dump(concatenate=True)
         print("Multiple meshes detected, merged.")
+
+    # 新增：局部边界组件可视化入口
+    if args.visualize_boundary_component:
+        visualize_boundary_component(mesh, args)
+        return
 
     if args.hole_diagnosis:
         perform_hole_diagnosis(mesh, args)
