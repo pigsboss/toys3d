@@ -1042,7 +1042,16 @@ def visualize_boundary_component(mesh, args):
     # 可选：显示半透明原始网格
     if args.boundary_show_original:
         vis_mesh = mesh.copy()
-        set_face_alpha(vis_mesh, 0.3)
+        # 赋予统一半透明颜色（确保存在 face_colors）
+        alpha_uint8 = int(0.3 * 255)
+        vis_mesh.visual.face_colors = np.full(
+            (len(vis_mesh.faces), 4),
+            [200, 200, 200, alpha_uint8],
+            dtype=np.uint8,
+        )
+        # 双面显示原始网格背景
+        if args.double_sided:
+            vis_mesh = make_double_sided(vis_mesh)
         scene.add_geometry(vis_mesh)
 
     # 根据邻域深度显示相关三角面片
@@ -1060,6 +1069,11 @@ def visualize_boundary_component(mesh, args):
                     sub.visual.face_colors = [255, 165, 0, 255]  # 橙色
                 else:
                     sub.visual.face_colors = [144, 238, 144, 255]  # 浅绿
+
+                # 双面显示相关三角面片
+                if args.double_sided:
+                    sub = make_double_sided(sub)
+
                 scene.add_geometry(sub)
 
     # 计算默认圆柱半径
