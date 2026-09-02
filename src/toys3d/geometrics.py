@@ -1890,6 +1890,7 @@ def fit_watertight_patch_from_component(
     poisson_depth=8,
     density_quantile=0.2,
     alpha=1.5,
+    allow_non_genus0=False,
 ):
     """
     从边界组件的邻域点云生成水密包络曲面，并返回曲面及交线。
@@ -1963,14 +1964,21 @@ def fit_watertight_patch_from_component(
                 print(f"  [DEBUG] 修复后: is_watertight={watertight_mesh.is_watertight}, "
                       f"euler={watertight_mesh.euler_number}")
                 if not _check_watertight_genus0(watertight_mesh):
-                    return {
-                        'success': False,
-                        'message': '泊松重建结果未通过水密/亏格0检查',
-                        'watertight_mesh': None,
-                        'intersection_vertices': [],
-                        'intersection_edges': [],
-                    }
-            message = '泊松重建成功'
+                    if not allow_non_genus0:
+                        return {
+                            'success': False,
+                            'message': '泊松重建结果未通过水密/亏格0检查',
+                            'watertight_mesh': None,
+                            'intersection_vertices': [],
+                            'intersection_edges': [],
+                        }
+                    else:
+                        print("  [WARN] 允许非亏格0水密曲面（allow_non_genus0=True）")
+                        message = '泊松重建成功（水密但亏格非0）'
+                else:
+                    message = '泊松重建成功'
+            else:
+                message = '泊松重建成功'
 
             # 修正绕序一致性
             flipped, fixed_mesh = fix_winding_consistency(watertight_mesh)
@@ -2041,14 +2049,21 @@ def fit_watertight_patch_from_component(
                 print(f"  [DEBUG] 修复后: is_watertight={watertight_mesh.is_watertight}, "
                       f"euler={watertight_mesh.euler_number}")
                 if not _check_watertight_genus0(watertight_mesh):
-                    return {
-                        'success': False,
-                        'message': '凹包结果未通过水密/亏格0检查',
-                        'watertight_mesh': None,
-                        'intersection_vertices': [],
-                        'intersection_edges': [],
-                    }
-            message = '凹包生成成功'
+                    if not allow_non_genus0:
+                        return {
+                            'success': False,
+                            'message': '凹包结果未通过水密/亏格0检查',
+                            'watertight_mesh': None,
+                            'intersection_vertices': [],
+                            'intersection_edges': [],
+                        }
+                    else:
+                        print("  [WARN] 允许非亏格0水密曲面（allow_non_genus0=True）")
+                        message = '凹包生成成功（水密但亏格非0）'
+                else:
+                    message = '凹包生成成功'
+            else:
+                message = '凹包生成成功'
 
             # 修正绕序一致性
             flipped, fixed_mesh = fix_winding_consistency(watertight_mesh)
