@@ -1138,7 +1138,12 @@ def visualize_boundary_component(mesh, args):
             intersection_edges = patch_result["intersection_edges"]
 
             # 显示拟合曲面（半透明青色）
-            watertight_mesh.visual.face_colors = [0, 200, 200, 80]
+            # 修改点：使用 np.full 生成正确形状的颜色数组，避免因 n_faces 不匹配导致的渲染问题
+            watertight_mesh.visual.face_colors = np.full(
+                (len(watertight_mesh.faces), 4),
+                [0, 200, 200, 80],
+                dtype=np.uint8,
+            )
             scene.add_geometry(watertight_mesh)
 
             # 显示交线（洋红色圆柱）

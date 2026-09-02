@@ -1834,6 +1834,9 @@ def fit_watertight_patch_from_component(
     points, normals = _extract_component_point_cloud(
         mesh, component, neighborhood_depth
     )
+    print(f"  [DEBUG] 点云点数: {len(points)}")
+    if len(points) > 0:
+        print(f"  [DEBUG] 点云坐标范围: min={points.min(axis=0)}, max={points.max(axis=0)}")
     if len(points) < 4:
         return {
             'success': False,
@@ -1865,6 +1868,9 @@ def fit_watertight_patch_from_component(
             mesh_poisson, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
                 pcd, depth=poisson_depth, scale=1.1, linear_fit=False
             )
+            print(f"  [DEBUG] Open3D 泊松重建完成，输出顶点数: {np.asarray(mesh_poisson.vertices).shape[0]}, "
+                  f"面数: {np.asarray(mesh_poisson.triangles).shape[0]}")
+
             densities = np.asarray(densities)
             if density_quantile > 0 and len(densities) > 0:
                 threshold = np.quantile(densities, density_quantile)
@@ -1876,8 +1882,14 @@ def fit_watertight_patch_from_component(
                 faces=np.asarray(mesh_poisson.triangles),
                 process=False,
             )
+            print(f"  [DEBUG] 密度过滤后顶点数: {len(watertight_mesh.vertices)}, 面数: {len(watertight_mesh.faces)}")
+            print(f"  [DEBUG] 水密性: {watertight_mesh.is_watertight}, 欧拉数: {watertight_mesh.euler_number}")
             if not _check_watertight_genus0(watertight_mesh):
+                print(f"  [DEBUG] 原始结果: is_watertight={watertight_mesh.is_watertight}, "
+                      f"euler={watertight_mesh.euler_number}")
                 watertight_mesh = _repair_to_watertight_mesh(watertight_mesh)
+                print(f"  [DEBUG] 修复后: is_watertight={watertight_mesh.is_watertight}, "
+                      f"euler={watertight_mesh.euler_number}")
                 if not _check_watertight_genus0(watertight_mesh):
                     return {
                         'success': False,
@@ -1926,13 +1938,22 @@ def fit_watertight_patch_from_component(
             mesh_alpha = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(
                 pcd, alpha
             )
+            print(f"  [DEBUG] Open3D Alpha Shape 完成，输出顶点数: {np.asarray(mesh_alpha.vertices).shape[0]}, "
+                  f"面数: {np.asarray(mesh_alpha.triangles).shape[0]}")
+
             watertight_mesh = trimesh.Trimesh(
                 vertices=np.asarray(mesh_alpha.vertices),
                 faces=np.asarray(mesh_alpha.triangles),
                 process=False,
             )
+            print(f"  [DEBUG] 凹包结果顶点数: {len(watertight_mesh.vertices)}, 面数: {len(watertight_mesh.faces)}")
+            print(f"  [DEBUG] 水密性: {watertight_mesh.is_watertight}, 欧拉数: {watertight_mesh.euler_number}")
             if not _check_watertight_genus0(watertight_mesh):
+                print(f"  [DEBUG] 原始结果: is_watertight={watertight_mesh.is_watertight}, "
+                      f"euler={watertight_mesh.euler_number}")
                 watertight_mesh = _repair_to_watertight_mesh(watertight_mesh)
+                print(f"  [DEBUG] 修复后: is_watertight={watertight_mesh.is_watertight}, "
+                      f"euler={watertight_mesh.euler_number}")
                 if not _check_watertight_genus0(watertight_mesh):
                     return {
                         'success': False,
@@ -1969,6 +1990,7 @@ def fit_watertight_patch_from_component(
         expanded = seed_faces
     submesh = mesh.submesh([np.asarray(sorted(expanded), dtype=np.int64)])[0]
     boundary_loops = extract_boundary_loops(submesh)
+    print(f"  [DEBUG] 邻域子网格边界环数量: {len(boundary_loops)}")
 
     intersection_vertices = []
     intersection_edges = []
@@ -1985,6 +2007,7 @@ def fit_watertight_patch_from_component(
             v1 = start_idx + (i + 1) % len(loop)
             intersection_edges.append([v0, v1])
 
+    print(f"  [DEBUG] 提取交线顶点数: {len(intersection_vertices)}, 边数: {len(intersection_edges)}")
     if not intersection_vertices:
         return {
             'success': False,
