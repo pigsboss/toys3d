@@ -3,18 +3,12 @@
 网格检查工具，包含孔洞诊断、未覆盖组件分析、最小包络边界等。
 """
 
-import sys
-from pathlib import Path
-
-# 支持直接运行脚本：将 src/ 加入路径
-if __name__ == "__main__" and __package__ is None:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 import json
+from pathlib import Path
 
 import numpy as np
 
-from toys3d import geometrics
+from . import geometrics
 
 
 # 未覆盖开放边分类中文名
