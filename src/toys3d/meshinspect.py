@@ -1788,6 +1788,29 @@ def perform_hole_diagnosis(mesh, args):
         }, f, indent=2, ensure_ascii=False)
     print(f"未覆盖开放边分量分析已保存: {component_json_path}")
 
+    # 计算最小包络流形边界（可选）
+    if getattr(args, 'compute_enclosing_boundaries', False):
+        print("计算最小包络流形边界...")
+        for comp in components:
+            comp_id = comp['component_id']
+            bound = find_minimal_enclosing_manifold_boundary_greedy(mesh, comp)
+            comp['minimal_enclosing_boundary'] = bound
+            if bound['success']:
+                print(f"  Component {comp_id}: 包络边界深度 {bound['depth']}, "
+                      f"内部面片 {len(bound['enclosed_faces'])}, "
+                      f"边界边 {len(bound['boundary_edges'])}")
+            else:
+                print(f"  Component {comp_id}: 未找到包络边界 "
+                      f"(最大深度 {bound['depth']})")
+
+        # 更新 JSON 文件
+        with open(component_json_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "total_components": len(components),
+                "components": components,
+            }, f, indent=2, ensure_ascii=False)
+        print(f"已更新包含包络边界信息的: {component_json_path}")
+
     # 3. 构造 JSON 报告
     print("生成孔洞诊断 JSON...")
     total_open_edges = len(open_edge_ids)
