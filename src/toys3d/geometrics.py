@@ -1795,6 +1795,9 @@ def _check_watertight_genus0(mesh):
 def _repair_to_watertight_mesh(mesh, voxel_size=None):
     """
     对非水密网格进行体素化+Marching Cubes修复，返回水密网格。
+
+    重要：体素化/行进立方体是在体素网格局部坐标下完成的，
+    返回前必须将结果变换回输入网格的世界坐标，否则会产生偏移。
     """
     if mesh.is_watertight:
         return mesh
@@ -1802,12 +1805,25 @@ def _repair_to_watertight_mesh(mesh, voxel_size=None):
         bounds = mesh.bounds
         diag = np.linalg.norm(bounds[1] - bounds[0])
         voxel_size = diag / 128
+
     vox = mesh.voxelized(voxel_size)
     try:
         vox = vox.fill()
     except Exception:
         pass
-    return vox.marching_cubes
+
+    repaired = vox.marching_cubes
+
+    # 将体素网格局部坐标变换回输入网格的世界坐标
+    if hasattr(vox, 'transform') and vox.transform is not None:
+        repaired.apply_transform(vox.transform)
+    else:
+        # 某些 trimesh 版本可能没有 transform 属性，尝试用 origin/pitch 修正
+        print("  [DEBUG] VoxelGrid 没有 transform 属性，尝试使用 origin/pitch 修正")
+        if hasattr(vox, 'origin') and hasattr(vox, 'pitch'):
+            repaired.vertices = repaired.vertices * vox.pitch + vox.origin
+
+    return repaired
 
 
 def fix_winding_consistency(mesh):
