@@ -1460,3 +1460,246 @@ def analyze_uncovered_open_edge_components(mesh, hole_data, spatial_threshold=No
         components.append(component_info)
 
     return components
+
+
+def build_manifold_face_adjacency(mesh):
+    """
+    基于流形边构建面片邻接表。
+
+    只保留被恰好两个面共享的边（流形边）；
+    开放边和非流形边不参与面片邻接。
+
+    返回:
+        list[list[int]]，长度为 n_faces，每个元素为该面片的流形邻接面片索引列表。
+    """
+    n_faces = len(mesh.faces)
+    adj = [[] for _ in range(n_faces)]
+
+    _, edge_faces = compute_edge_to_faces(mesh)
+    for faces in edge_faces:
+        if len(faces) == 2:
+            f0, f1 = int(faces[0]), int(faces[1])
+            adj[f0].append(f1)
+            adj[f1].append(f0)
+
+    return adj
+
+
+def is_manifold_closed_boundary(mesh, face_set):
+    """
+    检查给定面片集合的边界是否满足“最小包络流形边界”条件：
+
+    1. 所有边界边均为流形边（恰好被两个面共享）；
+    2. 边界首尾相连，所有顶点度数为 2（可包含多个闭合环）。
+
+    返回:
+        bool
+    """
+    face_set = set(map(int, face_set))
+    if not face_set:
+        return False
+
+    n_vertices = len(mesh.vertices)
+    face_edge_keys = compute_face_edge_keys(mesh)
+
+    # 构建边 key -> 顶点对 映射
+    edge_key_to_vertex_pair = {}
+    faces_all = np.asarray(mesh.faces, dtype=np.int64)
+    for fid in range(len(faces_all)):
+        verts = faces_all[fid]
+        for j in range(3):
+            key = int(face_edge_keys[fid, j])
+            if key not in edge_key_to_vertex_pair:
+                v0 = int(verts[j])
+                v1 = int(verts[(j + 1) % 3])
+                edge_key_to_vertex_pair[key] = (v0, v1)
+
+    # 构建边 key -> 共享面列表 映射（仅非开放边）
+    edge_keys, edge_faces = compute_edge_to_faces(mesh)
+    edge_to_faces = {}
+    for key, faces_list in zip(edge_keys, edge_faces):
+        edge_to_faces[int(key)] = faces_list
+
+    # 收集面集的边界边，同时检查是否为流形边
+    boundary_edge_keys = []
+    for fid in face_set:
+        for j in range(3):
+            key = int(face_edge_keys[fid, j])
+            shared = edge_to_faces.get(key, [])
+            inner_count = sum(1 for f in shared if int(f) in face_set)
+            if inner_count == 1:
+                # 该边为该面集的边界边
+                if len(shared) != 2:
+                    return False   # 不是流形边
+                boundary_edge_keys.append(key)
+
+    if not boundary_edge_keys:
+        return False
+
+    # 构建边界边的顶点邻接，检查度数
+    degree = {}
+    for key in boundary_edge_keys:
+        v0, v1 = edge_key_to_vertex_pair[key]
+        degree[v0] = degree.get(v0, 0) + 1
+        degree[v1] = degree.get(v1, 0) + 1
+
+    # 所有顶点度数必须为 2
+    for d in degree.values():
+        if d != 2:
+            return False
+
+    # 边数等于顶点数（欧拉环条件）
+    return len(degree) == len(boundary_edge_keys)
+
+
+def find_minimal_enclosing_manifold_boundary_greedy(
+    mesh, component, max_depth=12
+):
+    """
+    从组件面片出发，逐层沿流形边扩展，直到找到满足流形闭合边界的最小区域。
+
+    返回:
+        dict:
+            success          : bool  是否找到包络边界
+            depth            : int   使用的扩展深度
+            enclosed_faces    : list[int] 包络内部面片索引
+            boundary_vertices : list[list[int]] 边界顶点环列表
+            boundary_edges    : list[int] 包络边界边 key
+    """
+    seed_faces = set(map(int, component.get('face_ids', [])))
+    if not seed_faces:
+        return {
+            'success': False,
+            'depth': 0,
+            'enclosed_faces': [],
+            'boundary_vertices': [],
+            'boundary_edges': [],
+        }
+
+    adj = build_manifold_face_adjacency(mesh)
+    current = set(seed_faces)
+
+    for depth in range(1, max_depth + 1):
+        if is_manifold_closed_boundary(mesh, current):
+            # 提取边界信息
+            face_edge_keys = compute_face_edge_keys(mesh)
+            edge_keys, edge_faces = compute_edge_to_faces(mesh)
+            edge_to_faces = {}
+            for key, faces_list in zip(edge_keys, edge_faces):
+                edge_to_faces[int(key)] = faces_list
+
+            # 收集边界边 key
+            boundary_edge_keys = []
+            for fid in current:
+                for j in range(3):
+                    key = int(face_edge_keys[fid, j])
+                    shared = edge_to_faces.get(key, [])
+                    inner_count = sum(
+                        1 for f in shared if int(f) in current
+                    )
+                    if inner_count == 1:
+                        boundary_edge_keys.append(key)
+
+            # 构建边界顶点环
+            boundary_vertices = _extract_boundary_loops_from_edge_keys(
+                mesh, boundary_edge_keys
+            )
+
+            return {
+                'success': True,
+                'depth': depth,
+                'enclosed_faces': sorted(current),
+                'boundary_vertices': boundary_vertices,
+                'boundary_edges': boundary_edge_keys,
+            }
+
+        # 扩展到下一层（仅沿流形边）
+        next_faces = set(current)
+        for f in current:
+            for nb in adj[f]:
+                if nb not in next_faces:
+                    next_faces.add(nb)
+
+        if len(next_faces) == len(current):
+            break   # 没有新的面片，无法继续扩展
+        current = next_faces
+
+    return {
+        'success': False,
+        'depth': max_depth,
+        'enclosed_faces': [],
+        'boundary_vertices': [],
+        'boundary_edges': [],
+    }
+
+
+def _extract_boundary_loops_from_edge_keys(mesh, edge_keys):
+    """
+    从边界边 key 列表（流形边界边）提取闭合顶点环列表。
+
+    返回:
+        list of list[int]，每个内层列表是一个闭合环的顶点索引序列。
+    """
+    # 构建边 key -> 顶点对
+    faces_all = np.asarray(mesh.faces, dtype=np.int64)
+    face_edge_keys = compute_face_edge_keys(mesh)
+    edge_key_to_vertex_pair = {}
+    for fid in range(len(faces_all)):
+        verts = faces_all[fid]
+        for j in range(3):
+            key = int(face_edge_keys[fid, j])
+            if key not in edge_key_to_vertex_pair:
+                edge_key_to_vertex_pair[key] = (
+                    int(verts[j]), int(verts[(j + 1) % 3])
+                )
+
+    # 构建顶点邻接（无向图）
+    adj = {}
+    used_edges = set()
+    for key in edge_keys:
+        key = int(key)
+        if key in used_edges:
+            continue
+        used_edges.add(key)
+        v0, v1 = edge_key_to_vertex_pair[key]
+        adj.setdefault(v0, []).append(v1)
+        adj.setdefault(v1, []).append(v0)
+
+    # 使用 BFS 提取所有简单环
+    visited_edges = set()
+    loops = []
+
+    for start in list(adj.keys()):
+        if start not in adj:
+            continue
+        loop = []
+        cur = start
+        prev = None
+
+        while True:
+            loop.append(cur)
+            candidates = [n for n in adj[cur] if n != prev and n in adj]
+            nxt = None
+            for cand in candidates:
+                ekey = (cur, cand) if cur < cand else (cand, cur)
+                if ekey not in visited_edges:
+                    nxt = cand
+                    break
+
+            if nxt is None:
+                break
+
+            ekey = (cur, nxt) if cur < nxt else (nxt, cur)
+            visited_edges.add(ekey)
+
+            if nxt == start and len(loop) >= 3:
+                loop.append(nxt)
+                loops.append(loop)
+                break
+
+            prev, cur = cur, nxt
+
+            if len(loop) > len(adj):
+                break
+
+    return loops

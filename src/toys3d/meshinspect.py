@@ -52,6 +52,9 @@ from toys3d.geometrics import (
     group_faces_by_topology_codes,
     build_hole_diagnosis_data,
     analyze_uncovered_open_edge_components,
+    build_manifold_face_adjacency,
+    is_manifold_closed_boundary,
+    find_minimal_enclosing_manifold_boundary_greedy,
 )
 
 
@@ -1097,6 +1100,24 @@ def visualize_boundary_component(mesh, args):
         )
         seg.visual.face_colors = edge_color
         scene.add_geometry(seg)
+
+    # 绘制最小包络流形边界（若存在）
+    enclosing = comp.get("minimal_enclosing_boundary", {})
+    if enclosing.get("success"):
+        enclosing_vertices = enclosing.get("boundary_vertices", [])
+        enclosing_radius = radius * 1.5   # 稍粗，更醒目
+
+        for loop_verts in enclosing_vertices:
+            for i in range(len(loop_verts) - 1):
+                v0 = loop_verts[i]
+                v1 = loop_verts[i + 1]
+                seg = trimesh.creation.cylinder(
+                    radius=enclosing_radius,
+                    segment=[mesh.vertices[v0], mesh.vertices[v1]],
+                    sections=6,
+                )
+                seg.visual.face_colors = [255, 0, 255, 255]  # 洋红色
+                scene.add_geometry(seg)
 
     # 端点（绿色球）
     for v in comp.get("endpoints", []):
@@ -2382,6 +2403,8 @@ def main():
                         help="执行 Full Diagnosis（2-Pass），生成异常面拓扑分类报告")
     parser.add_argument("--hole-diagnosis", action="store_true",
                         help="执行孔洞诊断（健康孔洞提取及未覆盖开放边分类）")
+    parser.add_argument("--compute-enclosing-boundaries", action="store_true",
+                        help="在 hole diagnosis 中计算每个未覆盖开放边组件的最小包络流形边界")
     # 新增：局部边界组件可视化参数（在 --hole-diagnosis 后插入）
     parser.add_argument("--visualize-boundary-component", action="store_true",
                         help="可视化特定孔洞/开放边分量及其三角面片")
