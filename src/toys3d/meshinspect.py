@@ -1138,12 +1138,15 @@ def visualize_boundary_component(mesh, args):
             intersection_edges = patch_result["intersection_edges"]
 
             # 显示拟合曲面（半透明青色）
-            # 修改点：使用 np.full 生成正确形状的颜色数组，避免因 n_faces 不匹配导致的渲染问题
+            # 使用用户指定的不透明度，并支持双面渲染避免背面剔除导致的结构透视
+            alpha = int(np.clip(args.patch_opacity, 0.0, 1.0) * 255)
             watertight_mesh.visual.face_colors = np.full(
                 (len(watertight_mesh.faces), 4),
-                [0, 200, 200, 80],
+                [0, 200, 200, alpha],
                 dtype=np.uint8,
             )
+            if args.double_sided:
+                watertight_mesh = make_double_sided(watertight_mesh)
             scene.add_geometry(watertight_mesh)
 
             # 显示交线（洋红色圆柱）
@@ -2503,6 +2506,8 @@ def main():
                         help="泊松密度过滤分位（默认 0.2）")
     parser.add_argument("--patch-alpha", type=float, default=1.5,
                         help="凹包算法的 alpha 参数（默认 1.5）")
+    parser.add_argument("--patch-opacity", type=float, default=0.3,
+                        help="拟合水密曲面的不透明度，范围 0~1，默认 0.3")
     parser.add_argument("--hole-diagnosis-output", type=str, default="hole_diagnosis_report",
                         help="孔洞诊断输出目录（默认 hole_diagnosis_report）")
     parser.add_argument("--diagnosis-output", type=str, default="diagnosis_report",
