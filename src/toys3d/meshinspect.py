@@ -1131,6 +1131,7 @@ def visualize_boundary_component(mesh, args):
             poisson_depth=args.patch_poisson_depth,
             density_quantile=args.patch_density_quantile,
             alpha=args.patch_alpha,
+            allow_non_genus0=args.allow_non_genus0,
         )
         if patch_result["success"]:
             watertight_mesh = patch_result["watertight_mesh"]
@@ -2508,6 +2509,8 @@ def main():
                         help="凹包算法的 alpha 参数（默认 1.5）")
     parser.add_argument("--patch-opacity", type=float, default=0.3,
                         help="拟合水密曲面的不透明度，范围 0~1，默认 0.3")
+    parser.add_argument("--allow-non-genus0", action="store_true",
+                        help="允许水密但亏格非0的拟合曲面通过（用于可视化调试）")
     parser.add_argument("--hole-diagnosis-output", type=str, default="hole_diagnosis_report",
                         help="孔洞诊断输出目录（默认 hole_diagnosis_report）")
     parser.add_argument("--diagnosis-output", type=str, default="diagnosis_report",
