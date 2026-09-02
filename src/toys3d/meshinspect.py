@@ -858,14 +858,14 @@ def _generate_component_3d_diagram(component, mesh, output_path):
     if endpoints:
         ep = vertices[endpoints]
         ax.scatter(ep[:, 0], ep[:, 1], ep[:, 2],
-                   c='green', marker='o', s=20, label='端点')
+                   c='green', marker='o', s=20, label='Endpoints')
 
     # 分支点
     branch_vertices = component.get('branch_vertices', [])
     if branch_vertices:
         bv = vertices[branch_vertices]
         ax.scatter(bv[:, 0], bv[:, 1], bv[:, 2],
-                   c='red', marker='s', s=30, label='分支点')
+                   c='red', marker='s', s=30, label='Branch vertices')
 
     # 候选断裂点对
     candidate_breaks = component.get('candidate_breaks', [])
