@@ -1810,6 +1810,78 @@ def _repair_to_watertight_mesh(mesh, voxel_size=None):
     return vox.marching_cubes
 
 
+def fix_winding_consistency(mesh):
+    """
+    修正三角形网格的面片绕序，使相邻面片在共享边上的方向相反。
+    适用于流形网格（每条边最多被两个面片共享）。
+
+    返回:
+        (flipped_count, fixed_mesh)
+    """
+    m = mesh.copy()
+    faces = np.asarray(m.faces, dtype=np.int64)
+    n_faces = len(faces)
+    if n_faces == 0:
+        return 0, m
+
+    # 建立边 -> 面片索引列表
+    edge_map = {}
+    for fid, face in enumerate(faces):
+        for i in range(3):
+            v0, v1 = face[i], face[(i + 1) % 3]
+            key = (v0, v1) if v0 < v1 else (v1, v0)
+            edge_map.setdefault(key, []).append(fid)
+
+    # 构建面片邻接信息，同时记录共享边在每个面片中的局部索引
+    adjacency = [[] for _ in range(n_faces)]
+    for key, face_list in edge_map.items():
+        if len(face_list) != 2:
+            continue
+        f0, f1 = face_list
+        # 查找面片中该边的局部索引
+        i0 = next(i for i in range(3) if
+                  (faces[f0][i], faces[f0][(i+1)%3]) == key or
+                  (faces[f0][(i+1)%3], faces[f0][i]) == key)
+        i1 = next(i for i in range(3) if
+                  (faces[f1][i], faces[f1][(i+1)%3]) == key or
+                  (faces[f1][(i+1)%3], faces[f1][i]) == key)
+        adjacency[f0].append((f1, key, i0, i1))
+        adjacency[f1].append((f0, key, i1, i0))
+
+    visited = np.zeros(n_faces, dtype=bool)
+    flip = np.zeros(n_faces, dtype=bool)
+
+    for start in range(n_faces):
+        if visited[start]:
+            continue
+        queue = deque([start])
+        visited[start] = True
+        while queue:
+            fid = queue.popleft()
+            for neighbor, key, local_idx, neighbor_local_idx in adjacency[fid]:
+                if visited[neighbor]:
+                    continue
+                face_fid = faces[fid]
+                dir1 = (face_fid[local_idx], face_fid[(local_idx + 1) % 3])
+                face_neighbor = faces[neighbor]
+                dir2 = (face_neighbor[neighbor_local_idx],
+                        face_neighbor[(neighbor_local_idx + 1) % 3])
+                # 若两个方向相同，则绕序相反
+                same_orientation = (dir1[0] == dir2[0] and dir1[1] == dir2[1])
+                flip[neighbor] = flip[fid] if same_orientation else not flip[fid]
+                visited[neighbor] = True
+                queue.append(neighbor)
+
+    flipped_count = 0
+    for fid in range(n_faces):
+        if flip[fid]:
+            faces[fid] = faces[fid][::-1]
+            flipped_count += 1
+
+    m = trimesh.Trimesh(vertices=m.vertices, faces=faces, process=False)
+    return flipped_count, m
+
+
 def fit_watertight_patch_from_component(
     mesh,
     component,
@@ -1900,6 +1972,13 @@ def fit_watertight_patch_from_component(
                     }
             message = '泊松重建成功'
 
+            # 修正绕序一致性
+            flipped, fixed_mesh = fix_winding_consistency(watertight_mesh)
+            watertight_mesh = fixed_mesh
+            print(f"  [DEBUG] 泊松重建绕序修正：翻转 {flipped} 个面片")
+            print(f"  [DEBUG] 修正后水密性: {watertight_mesh.is_watertight}, "
+                  f"欧拉数: {watertight_mesh.euler_number}")
+
         elif method == 'convex_hull':
             try:
                 from scipy.spatial import ConvexHull
@@ -1918,6 +1997,13 @@ def fit_watertight_patch_from_component(
                 process=False,
             )
             message = '凸包生成成功'
+
+            # 修正绕序一致性
+            flipped, fixed_mesh = fix_winding_consistency(watertight_mesh)
+            watertight_mesh = fixed_mesh
+            print(f"  [DEBUG] 凸包绕序修正：翻转 {flipped} 个面片")
+            print(f"  [DEBUG] 修正后水密性: {watertight_mesh.is_watertight}, "
+                  f"欧拉数: {watertight_mesh.euler_number}")
 
         elif method == 'concave_hull':
             try:
@@ -1963,6 +2049,13 @@ def fit_watertight_patch_from_component(
                         'intersection_edges': [],
                     }
             message = '凹包生成成功'
+
+            # 修正绕序一致性
+            flipped, fixed_mesh = fix_winding_consistency(watertight_mesh)
+            watertight_mesh = fixed_mesh
+            print(f"  [DEBUG] 凹包绕序修正：翻转 {flipped} 个面片")
+            print(f"  [DEBUG] 修正后水密性: {watertight_mesh.is_watertight}, "
+                  f"欧拉数: {watertight_mesh.euler_number}")
 
         else:
             return {
