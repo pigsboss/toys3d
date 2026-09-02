@@ -1487,22 +1487,16 @@ def build_manifold_face_adjacency(mesh):
 
 def is_manifold_closed_boundary(mesh, face_set):
     """
-    检查给定面片集合的边界是否满足“最小包络流形边界”条件：
-
-    1. 所有边界边均为流形边（恰好被两个面共享）；
-    2. 边界首尾相连，所有顶点度数为 2（可包含多个闭合环）。
-
-    返回:
-        bool
+    检查给定面片集合的边界中，是否存在由流形边构成的闭合环。
+    内部开放边（孔洞）和非流形边不影响判定。
     """
     face_set = set(map(int, face_set))
     if not face_set:
         return False
 
-    n_vertices = len(mesh.vertices)
     face_edge_keys = compute_face_edge_keys(mesh)
 
-    # 构建边 key -> 顶点对 映射
+    # 构建边 key -> 顶点对
     edge_key_to_vertex_pair = {}
     faces_all = np.asarray(mesh.faces, dtype=np.int64)
     for fid in range(len(faces_all)):
@@ -1510,46 +1504,39 @@ def is_manifold_closed_boundary(mesh, face_set):
         for j in range(3):
             key = int(face_edge_keys[fid, j])
             if key not in edge_key_to_vertex_pair:
-                v0 = int(verts[j])
-                v1 = int(verts[(j + 1) % 3])
-                edge_key_to_vertex_pair[key] = (v0, v1)
+                edge_key_to_vertex_pair[key] = (
+                    int(verts[j]), int(verts[(j + 1) % 3])
+                )
 
-    # 构建边 key -> 共享面列表 映射（仅非开放边）
     edge_keys, edge_faces = compute_edge_to_faces(mesh)
     edge_to_faces = {}
     for key, faces_list in zip(edge_keys, edge_faces):
         edge_to_faces[int(key)] = faces_list
 
-    # 收集面集的边界边，同时检查是否为流形边
-    boundary_edge_keys = []
+    # 收集面集边界中所有流形边（全局共享 ==2）
+    manifold_boundary_vertices = {}
+    manifold_boundary_edges = []
     for fid in face_set:
         for j in range(3):
             key = int(face_edge_keys[fid, j])
             shared = edge_to_faces.get(key, [])
             inner_count = sum(1 for f in shared if int(f) in face_set)
-            if inner_count == 1:
-                # 该边为该面集的边界边
-                if len(shared) != 2:
-                    return False   # 不是流形边
-                boundary_edge_keys.append(key)
+            if inner_count == 1 and len(shared) == 2:
+                # 面集边界上的流形边
+                manifold_boundary_edges.append(key)
+                v0, v1 = edge_key_to_vertex_pair[key]
+                manifold_boundary_vertices.setdefault(v0, []).append(v1)
+                manifold_boundary_vertices.setdefault(v1, []).append(v0)
 
-    if not boundary_edge_keys:
+    if not manifold_boundary_edges:
         return False
 
-    # 构建边界边的顶点邻接，检查度数
-    degree = {}
-    for key in boundary_edge_keys:
-        v0, v1 = edge_key_to_vertex_pair[key]
-        degree[v0] = degree.get(v0, 0) + 1
-        degree[v1] = degree.get(v1, 0) + 1
-
-    # 所有顶点度数必须为 2
-    for d in degree.values():
-        if d != 2:
+    # 检查流形边界子图是否所有顶点度数为2，且边数等于顶点数（一个或多个环）
+    for v, nbrs in manifold_boundary_vertices.items():
+        if len(nbrs) != 2:
             return False
 
-    # 边数等于顶点数（欧拉环条件）
-    return len(degree) == len(boundary_edge_keys)
+    return len(manifold_boundary_vertices) == len(manifold_boundary_edges)
 
 
 def find_minimal_enclosing_manifold_boundary_greedy(
