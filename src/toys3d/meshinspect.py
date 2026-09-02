@@ -55,6 +55,7 @@ from toys3d.geometrics import (
     build_manifold_face_adjacency,
     is_manifold_closed_boundary,
     find_minimal_enclosing_manifold_boundary_greedy,
+    fit_watertight_patch_from_component,
 )
 
 
@@ -1118,6 +1119,44 @@ def visualize_boundary_component(mesh, args):
                 )
                 seg.visual.face_colors = [255, 0, 255, 255]  # 洋红色
                 scene.add_geometry(seg)
+
+    # 拟合水密包络曲面并显示交线
+    if args.fit_watertight_patch:
+        print("拟合水密包络曲面...")
+        patch_result = fit_watertight_patch_from_component(
+            mesh,
+            comp,
+            method=args.patch_method,
+            neighborhood_depth=args.patch_neighborhood_depth,
+            poisson_depth=args.patch_poisson_depth,
+            density_quantile=args.patch_density_quantile,
+            alpha=args.patch_alpha,
+        )
+        if patch_result["success"]:
+            watertight_mesh = patch_result["watertight_mesh"]
+            intersection_vertices = patch_result["intersection_vertices"]
+            intersection_edges = patch_result["intersection_edges"]
+
+            # 显示拟合曲面（半透明青色）
+            watertight_mesh.visual.face_colors = [0, 200, 200, 80]
+            scene.add_geometry(watertight_mesh)
+
+            # 显示交线（洋红色圆柱）
+            for edge in intersection_edges:
+                p0 = intersection_vertices[edge[0]]
+                p1 = intersection_vertices[edge[1]]
+                seg = trimesh.creation.cylinder(
+                    radius=radius * 1.2,
+                    segment=[p0, p1],
+                    sections=5,
+                )
+                seg.visual.face_colors = [255, 0, 255, 255]
+                scene.add_geometry(seg)
+
+            print(f"  拟合成功：交线 {len(intersection_vertices)} 个顶点，"
+                  f"{len(intersection_edges)} 条边")
+        else:
+            print(f"  [WARN] 水密包络拟合失败: {patch_result['message']}")
 
     # 端点（绿色球）
     for v in comp.get("endpoints", []):
@@ -2445,6 +2484,20 @@ def main():
                         help="边界圆柱半径（默认自动计算）")
     parser.add_argument("--boundary-show-original", action="store_true",
                         help="同时显示原始网格（半透明背景）")
+    parser.add_argument("--fit-watertight-patch", action="store_true",
+                        help="在可视化边界组件时，拟合亏格0水密曲面并显示包络交线")
+    parser.add_argument("--patch-method",
+                        choices=["poisson", "convex_hull", "concave_hull"],
+                        default="poisson",
+                        help="水密包络曲面生成算法（默认 poisson）")
+    parser.add_argument("--patch-neighborhood-depth", type=int, default=2,
+                        help="点云提取的邻域深度（默认 2）")
+    parser.add_argument("--patch-poisson-depth", type=int, default=8,
+                        help="泊松重建深度（默认 8）")
+    parser.add_argument("--patch-density-quantile", type=float, default=0.2,
+                        help="泊松密度过滤分位（默认 0.2）")
+    parser.add_argument("--patch-alpha", type=float, default=1.5,
+                        help="凹包算法的 alpha 参数（默认 1.5）")
     parser.add_argument("--hole-diagnosis-output", type=str, default="hole_diagnosis_report",
                         help="孔洞诊断输出目录（默认 hole_diagnosis_report）")
     parser.add_argument("--diagnosis-output", type=str, default="diagnosis_report",
