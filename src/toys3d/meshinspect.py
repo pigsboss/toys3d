@@ -1370,16 +1370,17 @@ def visualize_boundary_component(mesh, args):
         scene.add_geometry(sphere)
 
     # 候选断裂点对（橙色虚线，用细圆柱表示）
-    for cand in comp.get("candidate_breaks", []):
-        p0 = mesh.vertices[cand["v0"]]
-        p1 = mesh.vertices[cand["v1"]]
-        seg = trimesh.creation.cylinder(
-            radius=radius * 0.8,
-            segment=[p0, p1],
-            sections=4,
-        )
-        seg.visual.face_colors = [255, 165, 0, 255]
-        scene.add_geometry(seg)
+    if args.show_candidate_breaks:
+        for cand in comp.get("candidate_breaks", []):
+            p0 = mesh.vertices[cand["v0"]]
+            p1 = mesh.vertices[cand["v1"]]
+            seg = trimesh.creation.cylinder(
+                radius=radius * 0.8,
+                segment=[p0, p1],
+                sections=4,
+            )
+            seg.visual.face_colors = [255, 165, 0, 255]
+            scene.add_geometry(seg)
 
     if args.output:
         scene.export(args.output)
@@ -2699,6 +2700,8 @@ def main():
                         help="拟合水密曲面的不透明度，范围 0~1，默认 0.3")
     parser.add_argument("--allow-non-genus0", action="store_true",
                         help="允许水密但亏格非0的拟合曲面通过（用于可视化调试）")
+    parser.add_argument("--show-candidate-breaks", action="store_true",
+                        help="显示候选断裂点对连线（默认关闭，避免飞线干扰）")
     # 提取组件局部包
     parser.add_argument("--extract-component-package", action="store_true",
                         help="提取指定的未覆盖开放边组件及其邻域，保存为局部网格文件")
