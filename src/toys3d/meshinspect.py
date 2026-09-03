@@ -1030,16 +1030,130 @@ def load_boundary_component_data(data_dir, boundary_id, boundary_type="uncovered
         raise ValueError(f"未知的边界类型: {boundary_type}")
 
 
-def visualize_boundary_component(mesh, args):
+def extract_component_package(mesh, args):
     """
-    可视化健康孔洞或未覆盖开放边分量及其局部三角面片。
-    默认不显示整个网格，只显示目标边界和指定邻域深度内的面片。
+    提取指定未覆盖开放边分量及其邻域，保存为局部网格文件和组件 JSON。
     """
+    if args.component_output is None or args.component_json is None:
+        print("[ERROR] 必须同时指定 --component-output 和 --component-json")
+        return
+
+    # 加载组件数据
     comp = load_boundary_component_data(
         args.boundary_data_dir,
         args.boundary_id,
         args.boundary_type,
     )
+
+    # 扩展邻域面片集合
+    expanded_faces = sorted(list(expand_face_neighborhood(
+        mesh, comp.get('face_ids', []), args.boundary_neighborhood_depth
+    )))
+    if not expanded_faces:
+        print("[ERROR] 组件邻域扩展结果为空")
+        return
+
+    # 构建旧顶点索引到新顶点索引的映射
+    old_face_array = mesh.faces[np.array(expanded_faces, dtype=np.int64)]
+    old_verts = np.unique(old_face_array.ravel())
+    old_to_new_vertex = {int(old_v): new_v for new_v, old_v in enumerate(old_verts)}
+    new_faces = np.array([
+        [old_to_new_vertex[int(v)] for v in face]
+        for face in old_face_array
+    ], dtype=np.int64)
+    submesh = trimesh.Trimesh(
+        vertices=mesh.vertices[old_verts],
+        faces=new_faces,
+        process=False,
+    )
+
+    # 辅助函数：重映射旧顶点索引
+    def remap_v(old_idx):
+        return old_to_new_vertex.get(int(old_idx), -1)
+
+    # 转换组件数据为局部索引
+    comp_new = comp.copy()
+
+    # face_ids 更新：子网格中的面片索引顺序与 expanded_faces 一致
+    comp_new['face_ids'] = list(range(len(expanded_faces)))
+
+    # 顶点相关字段
+    comp_new['vertices'] = [remap_v(v) for v in comp.get('vertices', []) if remap_v(v) >= 0]
+    comp_new['edge_vertex_pairs'] = [
+        [remap_v(v0), remap_v(v1)]
+        for v0, v1 in comp.get('edge_vertex_pairs', [])
+        if remap_v(v0) >= 0 and remap_v(v1) >= 0
+    ]
+    comp_new['endpoints'] = [remap_v(v) for v in comp.get('endpoints', []) if remap_v(v) >= 0]
+    comp_new['branch_vertices'] = [remap_v(v) for v in comp.get('branch_vertices', []) if remap_v(v) >= 0]
+    comp_new['candidate_breaks'] = [
+        {
+            'v0': remap_v(c['v0']),
+            'v1': remap_v(c['v1']),
+            'distance': c.get('distance', 0.0)
+        }
+        for c in comp.get('candidate_breaks', [])
+        if remap_v(c['v0']) >= 0 and remap_v(c['v1']) >= 0
+    ]
+
+    # 添加元数据
+    component_package = {
+        "source_file": args.input_file,
+        "boundary_type": args.boundary_type,
+        "boundary_id": args.boundary_id,
+        "neighborhood_depth": args.boundary_neighborhood_depth,
+        "component": comp_new,
+    }
+
+    # 保存局部网格
+    output_mesh_path = Path(args.component_output)
+    output_mesh_path.parent.mkdir(parents=True, exist_ok=True)
+
+    file_type = args.component_format
+    if file_type is None:
+        # 根据扩展名推断
+        ext = output_mesh_path.suffix.lower().lstrip('.')
+        if ext in {"stl", "glb", "gltf", "ply", "obj"}:
+            file_type = ext
+        else:
+            file_type = 'ply'  # 默认
+
+    submesh.export(str(output_mesh_path), file_type=file_type)
+    print(f"局部网格已保存: {output_mesh_path}")
+
+    # 保存组件 JSON
+    json_path = Path(args.component_json)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(component_package, f, indent=2, ensure_ascii=False)
+    print(f"组件数据已保存: {json_path}")
+
+    print(f"提取完成：局部面片数 {len(expanded_faces)}，局部顶点数 {len(submesh.vertices)}")
+
+
+def visualize_boundary_component(mesh, args):
+    """
+    可视化健康孔洞或未覆盖开放边分量及其局部三角面片。
+    默认不显示整个网格，只显示目标边界和指定邻域深度内的面片。
+    """
+    if args.component_package:
+        # 从组件 JSON 加载数据
+        component_json = Path(args.component_package)
+        if not component_json.exists():
+            raise FileNotFoundError(f"未找到组件数据文件: {component_json}")
+        with open(component_json, "r") as f:
+            package_data = json.load(f)
+        comp = package_data["component"]
+        # 确保字段存在
+        comp.setdefault("endpoints", [])
+        comp.setdefault("branch_vertices", [])
+        comp.setdefault("candidate_breaks", [])
+    else:
+        comp = load_boundary_component_data(
+            args.boundary_data_dir,
+            args.boundary_id,
+            args.boundary_type,
+        )
 
     scene = trimesh.Scene()
 
@@ -2511,6 +2625,19 @@ def main():
                         help="拟合水密曲面的不透明度，范围 0~1，默认 0.3")
     parser.add_argument("--allow-non-genus0", action="store_true",
                         help="允许水密但亏格非0的拟合曲面通过（用于可视化调试）")
+    # 提取组件局部包
+    parser.add_argument("--extract-component-package", action="store_true",
+                        help="提取指定的未覆盖开放边组件及其邻域，保存为局部网格文件")
+    parser.add_argument("--component-output", type=str, default=None,
+                        help="提取的局部网格输出路径（如 component_0.glb）")
+    parser.add_argument("--component-json", type=str, default=None,
+                        help="提取的组件数据 JSON 输出路径（如 component_0.json）")
+    parser.add_argument("--component-format", type=str,
+                        choices=["ply", "stl", "glb", "obj"],
+                        default=None,
+                        help="局部网格文件格式（默认从输出路径扩展名推断）")
+    parser.add_argument("--component-package", type=str, default=None,
+                        help="从本地组件 JSON 加载组件数据，配合局部网格文件使用调试")
     parser.add_argument("--hole-diagnosis-output", type=str, default="hole_diagnosis_report",
                         help="孔洞诊断输出目录（默认 hole_diagnosis_report）")
     parser.add_argument("--diagnosis-output", type=str, default="diagnosis_report",
@@ -2549,6 +2676,11 @@ def main():
     if not isinstance(mesh, trimesh.Trimesh):
         mesh = mesh.dump(concatenate=True)
         print("Multiple meshes detected, merged.")
+
+    # 提取组件局部包
+    if args.extract_component_package:
+        extract_component_package(mesh, args)
+        return
 
     # 新增：局部边界组件可视化入口
     if args.visualize_boundary_component:
