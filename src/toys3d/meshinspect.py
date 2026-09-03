@@ -1074,8 +1074,17 @@ def extract_component_package(mesh, args):
     # 转换组件数据为局部索引
     comp_new = comp.copy()
 
-    # face_ids 更新：子网格中的面片索引顺序与 expanded_faces 一致
-    comp_new['face_ids'] = list(range(len(expanded_faces)))
+    # face_ids 更新：将原始组件种子面片映射到子网格中的新索引
+    expanded_faces_sorted = sorted(expanded_faces)
+    old_to_new_face = {
+        int(old_fid): new_fid
+        for new_fid, old_fid in enumerate(expanded_faces_sorted)
+    }
+    comp_new['face_ids'] = [
+        old_to_new_face[int(fid)]
+        for fid in comp.get('face_ids', [])
+        if int(fid) in old_to_new_face
+    ]
 
     # 顶点相关字段
     comp_new['vertices'] = [remap_v(v) for v in comp.get('vertices', []) if remap_v(v) >= 0]
@@ -1148,6 +1157,7 @@ def visualize_boundary_component(mesh, args):
         comp.setdefault("endpoints", [])
         comp.setdefault("branch_vertices", [])
         comp.setdefault("candidate_breaks", [])
+        comp.setdefault("face_ids", [])
     else:
         comp = load_boundary_component_data(
             args.boundary_data_dir,
@@ -2412,14 +2422,6 @@ def inspect_mesh(mesh, args):
                 print(f"\nColored defect mesh saved to: {args.output}")
 
         # 再叠加线框到场景用于可视化
-        if args.wireframe:
-            add_wireframe_to_scene(
-                scene, vis,
-                color=args.wireframe_color,
-                radius=args.wireframe_radius
-            )
-
-        # 高亮显示闭合孔洞边界
         if args.highlight_holes:
             add_hole_boundaries_to_scene(
                 scene, mesh,
@@ -2438,6 +2440,14 @@ def inspect_mesh(mesh, args):
                 print_enclosed_vertices=args.print_shell_enclosed_vertices,
                 max_report_loops=args.max_report_boundary_loops,
                 max_report_vertices=args.max_report_shell_vertices,
+            )
+
+        # 再叠加线框到场景用于可视化
+        if args.wireframe:
+            add_wireframe_to_scene(
+                scene, vis,
+                color=args.wireframe_color,
+                radius=args.wireframe_radius
             )
 
     if scene is not None and proxy_mesh is not None:
