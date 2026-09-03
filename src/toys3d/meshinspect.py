@@ -2686,8 +2686,8 @@ def main():
                         help="在可视化边界组件时，拟合亏格0水密曲面并显示包络交线")
     parser.add_argument("--patch-method",
                         choices=["poisson", "convex_hull", "concave_hull"],
-                        default="poisson",
-                        help="水密包络曲面生成算法（默认 poisson）")
+                        default="concave_hull",
+                        help="水密包络曲面生成算法（默认 concave_hull）")
     parser.add_argument("--patch-neighborhood-depth", type=int, default=2,
                         help="点云提取的邻域深度（默认 2）")
     parser.add_argument("--patch-poisson-depth", type=int, default=8,
@@ -2698,8 +2698,12 @@ def main():
                         help="凹包算法的 alpha 参数（默认 1.5）")
     parser.add_argument("--patch-opacity", type=float, default=0.3,
                         help="拟合水密曲面的不透明度，范围 0~1，默认 0.3")
-    parser.add_argument("--allow-non-genus0", action="store_true",
-                        help="允许水密但亏格非0的拟合曲面通过（用于可视化调试）")
+    parser.add_argument("--allow-non-genus0", dest='allow_non_genus0',
+                        action='store_true', default=True,
+                        help="允许水密但亏格非0的拟合曲面通过（默认开启）")
+    parser.add_argument("--no-allow-non-genus0", dest='allow_non_genus0',
+                        action='store_false',
+                        help="严格要求拟合曲面亏格为0，亏格非0则判定拟合失败")
     parser.add_argument("--show-candidate-breaks", action="store_true",
                         help="显示候选断裂点对连线（默认关闭，避免飞线干扰）")
     # 提取组件局部包
