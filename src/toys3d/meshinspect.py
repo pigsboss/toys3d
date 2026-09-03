@@ -1030,6 +1030,60 @@ def load_boundary_component_data(data_dir, boundary_id, boundary_type="uncovered
         raise ValueError(f"未知的边界类型: {boundary_type}")
 
 
+def print_component_diagnostics(mesh, comp, label):
+    """打印边界组件的详细诊断信息，用于对照两种可视化路径的差异。"""
+    print(f"\n[DIAGNOSTICS] {label}")
+    edge_pairs = comp.get('edge_vertex_pairs', [])
+    num_edges = len(edge_pairs)
+
+    # 统计顶点度分布（基于边界边的图）
+    degree_dict = {}
+    vertex_set = set()
+    for v0, v1 in edge_pairs:
+        vertex_set.add(int(v0))
+        vertex_set.add(int(v1))
+        degree_dict[int(v0)] = degree_dict.get(int(v0), 0) + 1
+        degree_dict[int(v1)] = degree_dict.get(int(v1), 0) + 1
+
+    num_vertices = len(vertex_set)
+    deg1 = sum(1 for d in degree_dict.values() if d == 1)
+    deg2 = sum(1 for d in degree_dict.values() if d == 2)
+    deg3plus = sum(1 for d in degree_dict.values() if d >= 3)
+
+    print(f"  边界边数: {num_edges}")
+    print(f"  边界顶点数: {num_vertices}")
+    print(f"  度为1的顶点数: {deg1}")
+    print(f"  度为2的顶点数: {deg2}")
+    print(f"  度为3及以上的顶点数: {deg3plus}")
+
+    face_ids = comp.get('face_ids', [])
+    print(f"  种子面片数: {len(face_ids)}")
+
+    if len(face_ids) == 0:
+        return
+
+    # 以种子面片为源，计算所有面的拓扑距离
+    try:
+        source_mask = np.zeros(len(mesh.faces), dtype=bool)
+        valid_face_ids = [int(fid) for fid in face_ids if 0 <= int(fid) < len(mesh.faces)]
+        if not valid_face_ids:
+            print("  警告: 没有有效的种子面片索引，无法计算距离分布")
+            return
+
+        source_mask[np.array(valid_face_ids, dtype=np.int64)] = True
+        distances = compute_face_distances(mesh, source_mask)
+        max_dist = 20
+        dist_counts = np.bincount(distances[distances >= 0], minlength=max_dist + 1)
+
+        print("  邻域面片距离分布（距离0=种子面片）:")
+        for d in range(max_dist + 1):
+            cnt = dist_counts[d] if d < len(dist_counts) else 0
+            if cnt > 0 or d == 0:
+                print(f"    距离 {d}: {cnt}")
+    except Exception as e:
+        print(f"  [WARN] 计算距离分布失败: {e}")
+
+
 def extract_component_package(mesh, args):
     """
     提取指定未覆盖开放边分量及其邻域，保存为局部网格文件和组件 JSON。
@@ -1044,6 +1098,9 @@ def extract_component_package(mesh, args):
         args.boundary_id,
         args.boundary_type,
     )
+
+    # 输出原始组件诊断信息
+    print_component_diagnostics(mesh, comp, f"提取组件包 (boundary_id={args.boundary_id}, type={args.boundary_type})")
 
     # 扩展邻域面片集合
     expanded_faces = sorted(list(expand_face_neighborhood(
@@ -1164,6 +1221,13 @@ def visualize_boundary_component(mesh, args):
             args.boundary_id,
             args.boundary_type,
         )
+
+    # 输出组件诊断信息
+    if args.component_package:
+        label = f"可视化局部包 (component_package={args.component_package})"
+    else:
+        label = f"可视化原始网格组件 (boundary_id={args.boundary_id}, type={args.boundary_type})"
+    print_component_diagnostics(mesh, comp, label)
 
     scene = trimesh.Scene()
 
