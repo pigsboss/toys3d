@@ -1152,7 +1152,7 @@ def extract_component_package(mesh, args):
     )
 
     # 输出原始组件诊断信息
-    print_component_diagnostics(mesh, comp, f"提取组件包 (boundary_id={args.boundary_id}, type={args.boundary_type})")
+    print_component_diagnostics(mesh, comp, "提取组件包")
 
     # 扩展邻域面片集合
     expanded_faces = sorted(list(expand_face_neighborhood(
@@ -1214,6 +1214,14 @@ def extract_component_package(mesh, args):
         if remap_v(c['v0']) >= 0 and remap_v(c['v1']) >= 0
     ]
 
+    # 如果存在健康孔洞顶点索引，同样转换到局部索引
+    if 'healthy_hole_vertex_indices' in comp:
+        comp_new['healthy_hole_vertex_indices'] = [
+            remap_v(v)
+            for v in comp.get('healthy_hole_vertex_indices', [])
+            if remap_v(v) >= 0
+        ]
+
     # 添加元数据
     component_package = {
         "source_file": args.input_file,
@@ -1267,18 +1275,21 @@ def visualize_boundary_component(mesh, args):
         comp.setdefault("branch_vertices", [])
         comp.setdefault("candidate_breaks", [])
         comp.setdefault("face_ids", [])
+        # 优先使用包内保存的 boundary_type，若缺失则回退到命令行参数
+        effective_boundary_type = package_data.get("boundary_type", args.boundary_type)
     else:
         comp = load_boundary_component_data(
             args.boundary_data_dir,
             args.boundary_id,
             args.boundary_type,
         )
+        effective_boundary_type = args.boundary_type
 
     # 输出组件诊断信息
     if args.component_package:
-        label = f"可视化局部包 (component_package={args.component_package})"
+        label = f"可视化局部包 (component_package={args.component_package}, boundary_type={effective_boundary_type})"
     else:
-        label = f"可视化原始网格组件 (boundary_id={args.boundary_id}, type={args.boundary_type})"
+        label = f"可视化原始网格组件 (boundary_id={args.boundary_id}, type={effective_boundary_type})"
     print_component_diagnostics(mesh, comp, label)
 
     scene = trimesh.Scene()
@@ -1309,7 +1320,7 @@ def visualize_boundary_component(mesh, args):
                 sub = mesh.submesh(
                     [np.array(list(expanded_faces), dtype=np.int64)]
                 )[0]
-                if args.boundary_type == "uncovered":
+                if effective_boundary_type == "uncovered":
                     sub.visual.face_colors = [255, 165, 0, 255]  # 橙色
                 else:
                     sub.visual.face_colors = [144, 238, 144, 255]  # 浅绿
@@ -1328,7 +1339,7 @@ def visualize_boundary_component(mesh, args):
         radius = max(diag * 0.0005, 1e-6)
 
     # 绘制边界边
-    if args.boundary_type == "uncovered":
+    if effective_boundary_type == "uncovered":
         edge_color = [0, 128, 255, 255]   # 蓝色
     else:
         edge_color = [0, 255, 255, 255]   # 青色
