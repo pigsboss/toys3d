@@ -589,24 +589,9 @@ def _generate_initial_seifert_disk(mesh, loop_vertices):
         )
         return disk, boundary_indices
 
-    except Exception:
-        # 回退到质心扇形三角化
-        boundary_points = pts
-        center = boundary_points.mean(axis=0)
-
-        vertices = np.vstack([center, boundary_points])
-        faces = []
-        n = len(loop_vertices)
-        for i in range(n):
-            faces.append([0, 1 + i, 1 + ((i + 1) % n)])
-
-        disk = trimesh.Trimesh(
-            vertices=vertices,
-            faces=np.array(faces, dtype=np.int64),
-            process=False,
-        )
-        boundary_indices = list(range(1, n + 1))
-        return disk, boundary_indices
+    except Exception as e:
+        print(f"  [WARN] 初始 Seifert 圆盘生成失败: {e}")
+        return None, []
 
 
 def _build_cotangent_laplacian(mesh):
@@ -696,11 +681,21 @@ def _build_cotangent_laplacian(mesh):
     return L
 
 
-def _laplacian_smooth_fixed_boundary(mesh, boundary_vertex_indices, iterations=200, step_size=0.1, tol=1e-7):
+def _laplacian_smooth_fixed_boundary(
+    mesh,
+    boundary_vertex_indices,
+    iterations=200,
+    step_size=1.0,
+    tol=1e-7,
+):
     """
-    固定边界顶点，内部顶点按离散平均曲率法向移动，逼近极小曲面。
-    使用余切权重 Laplacian，并除以顶点面积。
+    固定边界顶点，内部顶点按离散 Plateau 问题迭代求解：
+    每次根据当前几何构建余切 Laplacian，然后求解
+        L[interior, interior] * X_int = -L[interior, boundary] * X_boundary
+    并对解做松弛更新。
     """
+    from scipy.sparse.linalg import spsolve
+
     faces = np.asarray(mesh.faces, dtype=np.int64)
     vertices = mesh.vertices.copy()
     n_vertices = len(vertices)
@@ -709,30 +704,40 @@ def _laplacian_smooth_fixed_boundary(mesh, boundary_vertex_indices, iterations=2
     if n_vertices == 0 or len(faces) == 0:
         return mesh.copy()
 
+    all_indices = np.arange(n_vertices, dtype=np.int64)
+    interior_indices = np.array(
+        [i for i in all_indices if int(i) not in boundary_set],
+        dtype=np.int64,
+    )
+    boundary_indices = np.array(sorted(boundary_set), dtype=np.int64)
+
+    if len(interior_indices) == 0:
+        return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    step_size = float(np.clip(step_size, 0.0, 1.0))
+
     for it in range(iterations):
         current = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
         L = _build_cotangent_laplacian(current)
 
-        # 顶点面积（相邻三角形面积的 1/3）
-        area_faces = current.area_faces
-        vertex_areas = np.bincount(
-            faces.ravel(),
-            weights=np.repeat(area_faces, 3),
-            minlength=n_vertices,
-        ) / 3.0
-        vertex_areas[vertex_areas < 1e-12] = 1.0
+        Lint = L[interior_indices, :][:, interior_indices].tocsr()
+        Lbnd = L[interior_indices, :][:, boundary_indices].tocsr()
 
-        # Laplacian 向量
-        LS = L @ vertices  # (n,3)
+        rhs = -Lbnd @ vertices[boundary_indices]
+        sol = spsolve(Lint, rhs)
 
-        max_move = 0.0
-        for i in range(n_vertices):
-            if i in boundary_set:
-                continue
-            # 平均曲率法向近似 = LS[i] / (2 * vertex_area)
-            move = -step_size * LS[i] / (2.0 * vertex_areas[i])
-            vertices[i] += move
-            max_move = max(max_move, float(np.linalg.norm(move)))
+        new_vertices = vertices.copy()
+        new_vertices[interior_indices] = (
+            vertices[interior_indices]
+            + step_size * (sol - vertices[interior_indices])
+        )
+
+        moves = np.linalg.norm(
+            new_vertices[interior_indices] - vertices[interior_indices],
+            axis=1,
+        )
+        max_move = float(np.max(moves)) if len(moves) > 0 else 0.0
+        vertices = new_vertices
 
         if max_move < tol:
             print(f"    Seifert 优化在第 {it+1} 次迭代收敛，最大位移 {max_move:.6e}")
@@ -3156,8 +3161,8 @@ def main():
     parser.add_argument(
         "--seifert-step-size",
         type=float,
-        default=0.1,
-        help="Seifert 曲面优化步长（默认 0.1）"
+        default=1.0,
+        help="Seifert 曲面 Dirichlet 求解松弛系数（默认 1.0）"
     )
     parser.add_argument(
         "--seifert-tolerance",
