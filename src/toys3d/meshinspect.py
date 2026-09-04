@@ -451,6 +451,58 @@ def _point_in_polygon_2d(pt, poly):
     return inside
 
 
+def extract_intersection_faces_by_vertex_state(W, N, eps=None):
+    """
+    基于顶点内外状态，提取邻域网格 N 中与水密包络 W 相交的面片。
+
+    返回:
+        face_mask : (len(N.faces),) bool
+        face_ids  : 相交面片索引
+        vertex_state : (len(N.vertices),) int8
+                       0 = inside, 1 = outside, 2 = on_surface
+    """
+    n_verts = len(N.vertices)
+    n_faces = len(N.faces)
+
+    if n_verts == 0 or n_faces == 0:
+        return np.zeros(n_faces, dtype=bool), np.array([], dtype=np.int64), np.zeros(n_verts, dtype=np.int8)
+
+    # 1. 顶点在 W 表面上的距离与内外状态
+    closest, dist, _ = W.nearest.on_surface(N.vertices)
+
+    # trimesh 的 contains 内部使用射线奇偶判定
+    inside = W.contains(N.vertices)
+
+    if eps is None:
+        median_w = np.median(W.edges_unique_length) if len(W.edges_unique) else 0.0
+        median_n = np.median(N.edges_unique_length) if len(N.edges_unique) else 0.0
+        eps = max(median_w, median_n) * 1e-6
+
+    on_surface = dist <= eps
+    outside = (~inside) & (~on_surface)
+    inside_only = inside & (~on_surface)
+
+    vertex_state = np.zeros(n_verts, dtype=np.int8)
+    vertex_state[inside_only] = 0
+    vertex_state[outside] = 1
+    vertex_state[on_surface] = 2
+
+    # 2. 逐面判定
+    face_mask = np.zeros(n_faces, dtype=bool)
+
+    faces = np.asarray(N.faces, dtype=np.int64)
+    for fid, tri in enumerate(faces):
+        vs = vertex_state[tri]
+        has_inside = np.any(vs == 0)
+        has_outside = np.any(vs == 1)
+        has_surface = np.any(vs == 2)
+
+        if has_surface or (has_inside and has_outside):
+            face_mask[fid] = True
+
+    return face_mask, np.where(face_mask)[0], vertex_state
+
+
 def _print_projected_boundary_diagnostics(
     loops,
     vertex_to_projected,
@@ -1352,6 +1404,38 @@ def visualize_boundary_component(mesh, args):
 
             print(f"  拟合成功：交线 {len(intersection_vertices)} 个顶点，"
                   f"{len(intersection_edges)} 条边")
+
+            if args.show_intersecting_neighborhood_faces:
+                print("提取与水密包络相交的邻域面片...")
+                # 邻域网格 sub 在前面已经构建（取决于 boundary_type 和显示逻辑）
+                # 但为了确保有可用的邻域网格，先获取它。
+                if args.boundary_neighborhood_depth > 0:
+                    face_ids_neigh = comp.get("face_ids", [])
+                    expanded_faces = expand_face_neighborhood(
+                        mesh, face_ids_neigh, args.boundary_neighborhood_depth
+                    )
+                    if expanded_faces:
+                        neighborhood_mesh = mesh.submesh(
+                            [np.array(list(expanded_faces), dtype=np.int64)]
+                        )[0]
+                        # 调用简化相交检测
+                        face_mask, hit_ids, _ = extract_intersection_faces_by_vertex_state(
+                            watertight_mesh,
+                            neighborhood_mesh,
+                        )
+                        print(f"  相交邻域面片数: {len(hit_ids)} / {len(neighborhood_mesh.faces)}")
+                        if len(hit_ids) > 0:
+                            # 提取相交面片子网格
+                            intersect_mesh = neighborhood_mesh.submesh([hit_ids])[0]
+                            intersect_mesh.visual.face_colors = [255, 0, 0, 255]   # 红色高亮
+                            if args.double_sided:
+                                intersect_mesh = make_double_sided(intersect_mesh)
+                            scene.add_geometry(intersect_mesh)
+                    else:
+                        print("  警告: 邻域扩展结果为空，无法提取相交面片")
+                else:
+                    print("  警告: --boundary-neighborhood-depth 必须 > 0 才能提取相交面片")
+
         else:
             print(f"  [WARN] 水密包络拟合失败: {patch_result['message']}")
 
@@ -2684,6 +2768,11 @@ def main():
                         help="同时显示原始网格（半透明背景）")
     parser.add_argument("--fit-watertight-patch", action="store_true",
                         help="在可视化边界组件时，拟合亏格0水密曲面并显示包络交线")
+    parser.add_argument(
+        "--show-intersecting-neighborhood-faces",
+        action="store_true",
+        help="在 --fit-watertight-patch 成功后，高亮显示邻域中与水密包络相交的面片（基于顶点内外状态判定）"
+    )
     parser.add_argument("--patch-method",
                         choices=["poisson", "convex_hull", "concave_hull"],
                         default="concave_hull",
