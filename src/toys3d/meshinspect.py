@@ -537,31 +537,76 @@ def _reconstruct_loop_from_edges(edge_vertex_pairs):
 def _generate_initial_seifert_disk(mesh, loop_vertices):
     """
     以健康孔洞边界环为边界生成初始拓扑圆盘。
-    使用质心扇形三角化，得到一个中心顶点和围绕中心的面片。
+
+    优先使用 SVD 平面投影 + 多边形三角化，得到一个几何更自然的初始盘。
+    返回 (disk_mesh, boundary_indices)：
+        disk_mesh        : trimesh.Trimesh 或 None
+        boundary_indices : 边界顶点在 disk_mesh.vertices 中按 loop 顺序排列的索引
     """
     loop_vertices = [int(v) for v in loop_vertices]
     if len(loop_vertices) < 3:
-        return None
+        return None, []
 
-    boundary_points = np.asarray(mesh.vertices[loop_vertices], dtype=np.float64)
-    center = boundary_points.mean(axis=0)
+    pts = np.asarray(mesh.vertices[loop_vertices], dtype=np.float64)
 
-    vertices = np.vstack([center, boundary_points])
-    # 中心顶点索引为 0，边界顶点按传入顺序排列，索引 1..n
-    faces = []
-    n = len(loop_vertices)
-    for i in range(n):
-        a = 0
-        b = 1 + i
-        c = 1 + ((i + 1) % n)
-        faces.append([a, b, c])
+    try:
+        from shapely.geometry import Polygon
 
-    disk = trimesh.Trimesh(
-        vertices=vertices,
-        faces=np.array(faces, dtype=np.int64),
-        process=False,
-    )
-    return disk
+        centroid = pts.mean(axis=0)
+        _, _, vh = np.linalg.svd(pts - centroid)
+        u = vh[0]
+        v = vh[1]
+
+        poly2d = np.column_stack([
+            (pts - centroid) @ u,
+            (pts - centroid) @ v,
+        ])
+
+        polygon = Polygon(poly2d)
+        if not polygon.is_valid:
+            polygon = polygon.buffer(0)
+
+        tri = trimesh.creation.triangulate_polygon(polygon)
+        if tri is None or len(tri.faces) == 0:
+            raise ValueError("triangulate_polygon returned empty")
+
+        tri_vertices_2d = np.asarray(tri.vertices, dtype=np.float64)
+        v3d = centroid + tri_vertices_2d[:, 0:1] * u + tri_vertices_2d[:, 1:2] * v
+
+        # 找到每个原始边界点在三角化结果中的索引，保持 loop 顺序
+        boundary_indices = []
+        for p2d in poly2d:
+            dists = np.linalg.norm(tri_vertices_2d - p2d, axis=1)
+            idx = int(np.argmin(dists))
+            if dists[idx] > 1e-8:
+                raise ValueError("boundary point not found in triangulation")
+            boundary_indices.append(idx)
+
+        disk = trimesh.Trimesh(
+            vertices=v3d,
+            faces=np.asarray(tri.faces, dtype=np.int64),
+            process=False,
+        )
+        return disk, boundary_indices
+
+    except Exception:
+        # 回退到质心扇形三角化
+        boundary_points = pts
+        center = boundary_points.mean(axis=0)
+
+        vertices = np.vstack([center, boundary_points])
+        faces = []
+        n = len(loop_vertices)
+        for i in range(n):
+            faces.append([0, 1 + i, 1 + ((i + 1) % n)])
+
+        disk = trimesh.Trimesh(
+            vertices=vertices,
+            faces=np.array(faces, dtype=np.int64),
+            process=False,
+        )
+        boundary_indices = list(range(1, n + 1))
+        return disk, boundary_indices
 
 
 def _build_cotangent_laplacian(mesh):
@@ -1630,13 +1675,14 @@ def visualize_boundary_component(mesh, args):
 
             if loop and len(loop) >= 3:
                 print("生成严格 Seifert 曲面...")
-                initial = _generate_initial_seifert_disk(mesh, loop)
-                if initial is None:
-                    print("  [WARN] 无法生成初始圆盘")
+                disk_mesh, boundary_indices = _generate_initial_seifert_disk(
+                    mesh, loop
+                )
+                if disk_mesh is None or len(boundary_indices) != len(loop):
+                    print("  [WARN] 无法生成初始圆盘或边界映射")
                 else:
-                    boundary_indices = list(range(1, 1 + len(loop)))
                     seifert_mesh = _laplacian_smooth_fixed_boundary(
-                        initial,
+                        disk_mesh,
                         boundary_indices,
                         iterations=args.seifert_optimize_iterations,
                         step_size=args.seifert_step_size,
