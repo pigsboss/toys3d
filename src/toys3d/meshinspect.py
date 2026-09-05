@@ -1628,6 +1628,9 @@ def visualize_boundary_component(mesh, args):
 
     scene = trimesh.Scene()
 
+    # 用于将相机对准局部组件
+    local_visualization_vertices = None
+
     # 可选：显示半透明原始网格
     if args.boundary_show_original:
         vis_mesh = mesh.copy()
@@ -1654,6 +1657,11 @@ def visualize_boundary_component(mesh, args):
                 sub = mesh.submesh(
                     [np.array(list(expanded_faces), dtype=np.int64)]
                 )[0]
+
+                local_visualization_vertices = np.asarray(
+                    sub.vertices, dtype=np.float64
+                )
+
                 if effective_boundary_type == "uncovered":
                     sub.visual.face_colors = [255, 165, 0, 255]  # 橙色
                 else:
@@ -1868,12 +1876,22 @@ def visualize_boundary_component(mesh, args):
     if args.show:
         try:
             os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
+            try:
+                if local_visualization_vertices is not None and len(local_visualization_vertices) > 0:
+                    scene.camera.look_at(local_visualization_vertices)
+            except Exception as cam_err:
+                print(f"[WARN] vedo 相机自动取景失败: {cam_err}")
             scene.show()
         except Exception as e:
             print(f"[WARN] vedo 显示失败: {e}")
             print("尝试回退到 trimesh 默认 viewer...")
             os.environ['TRIMESH_DEFAULT_VIEWER'] = 'pyglet'
             try:
+                try:
+                    if local_visualization_vertices is not None and len(local_visualization_vertices) > 0:
+                        scene.camera.look_at(local_visualization_vertices)
+                except Exception as cam_err:
+                    print(f"[WARN] trimesh 相机自动取景失败: {cam_err}")
                 scene.show()
             except Exception as e2:
                 print(f"[ERROR] 所有 viewer 尝试均失败: {e2}")
