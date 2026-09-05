@@ -1334,6 +1334,74 @@ def _print_boundary_component_diagnostics(mesh, comp, boundary_type, boundary_id
             prev_set = cur_set
 
 
+def print_scene_debug_info(scene, title="Scene Debug Info"):
+    """
+    打印场景中所有几何对象的名称、类型、尺寸与包围盒。
+    """
+    print_separator(title)
+
+    geometry_items = list(scene.geometry.items())
+    if not geometry_items:
+        print("  scene is empty")
+        return
+
+    print(f"  geometry count: {len(geometry_items)}")
+
+    scene_bounds = None
+    for i, (name, geom) in enumerate(geometry_items):
+        geom_type = type(geom).__name__
+
+        n_vertices = len(getattr(geom, "vertices", [])) if hasattr(geom, "vertices") else 0
+        n_faces = len(getattr(geom, "faces", [])) if hasattr(geom, "faces") else 0
+
+        try:
+            bounds = geom.bounds
+        except Exception:
+            bounds = None
+
+        if bounds is not None:
+            bmin = bounds[0]
+            bmax = bounds[1]
+            extents = bmax - bmin
+            center = (bmin + bmax) / 2.0
+            diag = float(np.linalg.norm(extents))
+        else:
+            bmin = np.zeros(3)
+            bmax = np.zeros(3)
+            extents = np.zeros(3)
+            center = np.zeros(3)
+            diag = 0.0
+
+        print(f"  [{i}] name={name}")
+        print(f"      type={geom_type}")
+        print(f"      vertices={n_vertices}, faces={n_faces}")
+        print(f"      bounds.min=[{bmin[0]:.6f}, {bmin[1]:.6f}, {bmin[2]:.6f}]")
+        print(f"      bounds.max=[{bmax[0]:.6f}, {bmax[1]:.6f}, {bmax[2]:.6f}]")
+        print(f"      extents=[{extents[0]:.6f}, {extents[1]:.6f}, {extents[2]:.6f}]")
+        print(f"      center=[{center[0]:.6f}, {center[1]:.6f}, {center[2]:.6f}]")
+        print(f"      diagonal={diag:.6f}")
+
+        if bounds is not None:
+            if scene_bounds is None:
+                scene_bounds = bounds.copy()
+            else:
+                scene_bounds[0] = np.minimum(scene_bounds[0], bmin)
+                scene_bounds[1] = np.maximum(scene_bounds[1], bmax)
+
+    if scene_bounds is not None:
+        sbmin = scene_bounds[0]
+        sbmax = scene_bounds[1]
+        sext = sbmax - sbmin
+        scent = (sbmin + sbmax) / 2.0
+        sdiag = float(np.linalg.norm(sext))
+        print("  [scene]")
+        print(f"      bounds.min=[{sbmin[0]:.6f}, {sbmin[1]:.6f}, {sbmin[2]:.6f}]")
+        print(f"      bounds.max=[{sbmax[0]:.6f}, {sbmax[1]:.6f}, {sbmax[2]:.6f}]")
+        print(f"      extents=[{sext[0]:.6f}, {sext[1]:.6f}, {sext[2]:.6f}]")
+        print(f"      center=[{scent[0]:.6f}, {scent[1]:.6f}, {scent[2]:.6f}]")
+        print(f"      diagonal={sdiag:.6f}")
+
+
 def visualize_boundary_component(mesh, args):
     """
     可视化健康孔洞或未覆盖开放边分量及其局部三角面片。
@@ -1565,6 +1633,9 @@ def visualize_boundary_component(mesh, args):
                             print(f"    {k}: {v:.6f}")
             else:
                 print("  [WARN] 未找到有效的健康孔洞边界环")
+
+    if getattr(args, "debug_scene", False):
+        print_scene_debug_info(scene, title="Boundary Component Scene Debug Info")
 
     if args.output:
         scene.export(args.output)
@@ -2871,6 +2942,8 @@ def main():
                         help="边界圆柱半径（默认自动计算）")
     parser.add_argument("--boundary-show-original", action="store_true",
                         help="同时显示原始网格（半透明背景）")
+    parser.add_argument("--debug-scene", action="store_true",
+                        help="在显示或导出边界组件场景前，打印场景内所有几何对象的位置与大小")
     parser.add_argument("--fit-watertight-patch", action="store_true",
                         help="在可视化边界组件时，拟合亏格0水密曲面并显示包络交线")
     parser.add_argument("--patch-method",
