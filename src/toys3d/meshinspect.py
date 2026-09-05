@@ -1277,14 +1277,6 @@ def _build_cotangent_laplacian(mesh):
         beta = angle_at(b, c, a)
         gamma = angle_at(c, a, b)
 
-        edge0 = (int(face[1]), int(face[2])) if face[1] < face[2] else (int(face[2]), int(face[1]))
-        edge1 = (int(face[2]), int(face[0])) if face[2] < face[0] else (int(face[0]), int(face[2]))
-        edge2 = (int(face[0]), int(face[1])) if face[0] < face[1] else (int(face[1]), int(face[0]))
-
-        cot_alpha = 1.0 / np.tan(alpha) if abs(np.tan(alpha)) > 1e-12 else 0.0
-        cot_beta = 1.0 / np.tan(beta) if abs(np.tan(beta)) > 1e-12 else 0.0
-        cot_gamma = 1.0 / np.tan(gamma) if abs(np.tan(gamma)) > 1e-12 else 0.0
-
         def add_weight(e0, e1, w):
             if w == 0:
                 return
@@ -1295,9 +1287,19 @@ def _build_cotangent_laplacian(mesh):
             col.append(e0)
             data.append(w)
 
-        add_weight(edge0[0], edge0[1], cot_alpha)
-        add_weight(edge1[0], edge1[1], cot_beta)
-        add_weight(edge2[0], edge2[1], cot_gamma)
+        # edges are (v0,v1), (v1,v2), (v2,v0)
+        e0 = (int(face[1]), int(face[2])) if face[1] < face[2] else (int(face[2]), int(face[1]))
+        e1 = (int(face[2]), int(face[0])) if face[2] < face[0] else (int(face[0]), int(face[2]))
+        e2 = (int(face[0]), int(face[1])) if face[0] < face[1] else (int(face[1]), int(face[0]))
+
+        cot_alpha = 1.0 / np.tan(alpha) if abs(np.tan(alpha)) > 1e-12 else 0.0
+        cot_beta = 1.0 / np.tan(beta) if abs(np.tan(beta)) > 1e-12 else 0.0
+        cot_gamma = 1.0 / np.tan(gamma) if abs(np.tan(gamma)) > 1e-12 else 0.0
+
+        # Cot weight for edge opposite to alpha (AC?)
+        add_weight(e0[0], e0[1], cot_alpha)
+        add_weight(e1[0], e1[1], cot_beta)
+        add_weight(e2[0], e2[1], cot_gamma)
 
     if not row:
         return csr_matrix((n_vertices, n_vertices))
@@ -1551,6 +1553,148 @@ def print_scene_debug_info(scene, title="Scene Debug Info"):
         print(f"      extents=[{sext[0]:.6f}, {sext[1]:.6f}, {sext[2]:.6f}]")
         print(f"      center=[{scent[0]:.6f}, {scent[1]:.6f}, {scent[2]:.6f}]")
         print(f"      diagonal={sdiag:.6f}")
+
+
+def _normalize_vector(v):
+    v = np.asarray(v, dtype=np.float64)
+    n = np.linalg.norm(v)
+    return v if n < 1e-12 else v / n
+
+
+def _print_camera_info(info):
+    """命令行打印摄像机信息。"""
+    print("\n[Camera Info]")
+    ws = info.get("window_size")
+    if ws:
+        print(f"  window_size:        {ws[0]} x {ws[1]}")
+
+    if "camera_position_display" in info:
+        c = info["camera_position_display"]
+        print(f"  camera_position (display): [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
+    if "focal_point_display" in info:
+        c = info["focal_point_display"]
+        print(f"  focal_point (display):     [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
+    if "view_up" in info:
+        c = info["view_up"]
+        print(f"  view_up:            [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
+    if "view_direction" in info:
+        c = info["view_direction"]
+        print(f"  view_direction:     [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
+    if "camera_distance" in info:
+        print(f"  camera_distance:    {info['camera_distance']:.6f}")
+    if "clipping_range" in info:
+        c = info["clipping_range"]
+        print(f"  clipping_range:     [{c[0]:.6f}, {c[1]:.6f}]")
+
+    if "scene_translation" in info:
+        c = info["scene_translation"]
+        print(f"  scene_translation:  [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
+
+    if "camera_position_world" in info:
+        c = info["camera_position_world"]
+        print(f"  camera_position (world):   [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
+    if "focal_point_world" in info:
+        c = info["focal_point_world"]
+        print(f"  focal_point (world):       [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
+
+    err = info.get("error")
+    if err:
+        print(f"  [ERROR] {err}")
+
+
+def _capture_vedo_camera_info(viewer):
+    """从 trimesh 的 vedo viewer 中捕获相机/窗口信息。"""
+    info = {}
+    try:
+        plt = getattr(viewer, "plotter", None)
+        if plt is None:
+            return {"error": "viewer has no plotter"}
+
+        win = getattr(plt, "window", None)
+        if win is not None:
+            sz = win.GetSize()
+            info["window_size"] = [int(sz[0]), int(sz[1])]
+
+        cam = getattr(plt, "camera", None)
+        if cam is None:
+            return {"error": "plotter has no camera"}
+
+        pos = np.asarray(cam.GetPosition(), dtype=np.float64)
+        focal = np.asarray(cam.GetFocalPoint(), dtype=np.float64)
+        up = np.asarray(cam.GetUp(), dtype=np.float64)
+        view_dir = focal - pos
+        dist = float(np.linalg.norm(view_dir))
+
+        info["camera_position_display"] = pos.tolist()
+        info["focal_point_display"] = focal.tolist()
+        info["view_up"] = up.tolist()
+        info["view_direction"] = _normalize_vector(view_dir).tolist()
+        info["camera_distance"] = dist
+
+        cr = cam.GetClippingRange()
+        info["clipping_range"] = [float(cr[0]), float(cr[1])]
+
+    except Exception as e:
+        info["error"] = str(e)
+
+    return info
+
+
+def _show_scene_with_camera_info(scene, args, scene_translation=None):
+    """
+    统一封装 scene.show()，支持在窗口关闭后捕获并打印相机信息。
+    """
+    if not (args.print_camera_info or args.camera_info_output):
+        scene.show()
+        return
+
+    if os.environ.get("TRIMESH_DEFAULT_VIEWER") != "vedo":
+        print("[WARN] --print-camera-info 仅在 TRIMESH_DEFAULT_VIEWER=vedo 时有效")
+        scene.show()
+        return
+
+    try:
+        from trimesh.viewers.vedo_viewer import VedoViewer
+    except Exception as e:
+        print(f"[WARN] 无法导入 trimesh vedo viewer: {e}")
+        scene.show()
+        return
+
+    class _CameraInfoViewer(VedoViewer):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.camera_info = None
+
+        def show(self, **kw):
+            result = super().show(**kw)
+            self.camera_info = _capture_vedo_camera_info(self)
+            return result
+
+    viewer = _CameraInfoViewer(scene)
+    viewer.show()
+    info = viewer.camera_info or {}
+
+    if scene_translation is not None and "error" not in info:
+        t = np.asarray(scene_translation, dtype=np.float64)
+        if "camera_position_display" in info:
+            info["camera_position_world"] = (
+                np.asarray(info["camera_position_display"]) - t
+            ).tolist()
+        if "focal_point_display" in info:
+            info["focal_point_world"] = (
+                np.asarray(info["focal_point_display"]) - t
+            ).tolist()
+        info["scene_translation"] = t.tolist()
+
+    if info:
+        _print_camera_info(info)
+        if args.camera_info_output:
+            out = Path(args.camera_info_output)
+            out.write_text(
+                json.dumps(info, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            print(f"相机信息已保存: {out}")
 
 
 def _filter_camera_core_points(points):
@@ -1845,6 +1989,8 @@ def visualize_boundary_component(mesh, args):
         print(
             f"边界组件 {boundary_id} 可视化已保存至: {args.output}"
         )
+
+    camera_center = None
     if args.show:
         show_scene = scene
 
@@ -1866,7 +2012,11 @@ def visualize_boundary_component(mesh, args):
                 print(f"[WARN] 场景中心平移失败: {e}")
 
         os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
-        show_scene.show()
+        _show_scene_with_camera_info(
+            show_scene,
+            args,
+            scene_translation=camera_center,
+        )
 
 
 def run_full_diagnosis_pass1(mesh, output_dir, valence_threshold=5):
@@ -3236,6 +3386,17 @@ def main():
         action="store_true",
         help="打印 Seifert 曲面曲率统计信息"
     )
+    parser.add_argument(
+        "--print-camera-info",
+        action="store_true",
+        help="在可视化窗口关闭后输出窗口大小、摄像机位置/朝向等参数"
+    )
+    parser.add_argument(
+        "--camera-info-output",
+        type=str,
+        default=None,
+        help="将摄像机信息保存为 JSON 文件（可选）"
+    )
     parser.add_argument("--hole-diagnosis-output", type=str, default="hole_diagnosis_report",
                         help="孔洞诊断输出目录（默认 hole_diagnosis_report）")
     parser.add_argument("--diagnosis-output", type=str, default="diagnosis_report",
@@ -3301,7 +3462,7 @@ def main():
     if args.show and scene is not None:
         try:
             os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
-            scene.show()
+            _show_scene_with_camera_info(scene, args)
         except Exception as e:
             print(f"\n[ERROR] Visualization failed: {e}")
             import traceback
