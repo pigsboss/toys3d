@@ -1602,13 +1602,12 @@ def _print_camera_info(info):
         print(f"  [ERROR] {err}")
 
 
-def _capture_vedo_camera_info(viewer):
-    """从 trimesh 的 vedo viewer 中捕获相机/窗口信息。"""
+def _capture_vedo_camera_info(plotter_or_viewer):
+    """从 vedo Plotter 或 trimesh vedo viewer 捕获相机/窗口信息。"""
     info = {}
     try:
-        plt = getattr(viewer, "plotter", None)
-        if plt is None:
-            return {"error": "viewer has no plotter"}
+        # 兼容 trimesh VedoViewer（有 .plotter）和 vedo Plotter 本身
+        plt = getattr(plotter_or_viewer, "plotter", plotter_or_viewer)
 
         win = getattr(plt, "window", None)
         if win is not None:
@@ -1640,6 +1639,35 @@ def _capture_vedo_camera_info(viewer):
     return info
 
 
+def _try_get_trimesh_vedo_viewer():
+    """尝试导入 trimesh 内置的 VedoViewer（旧版本才有）。"""
+    for module_path in ("trimesh.viewers.vedo_viewer", "trimesh.viewer.vedo_viewer"):
+        try:
+            mod = __import__(module_path, fromlist=["VedoViewer"])
+            return getattr(mod, "VedoViewer", None)
+        except Exception:
+            continue
+    return None
+
+
+def _show_scene_with_vedo(scene):
+    """使用 vedo 直接显示 trimesh.Scene，并返回相机信息。"""
+    import vedo
+
+    merged = scene.dump(concatenate=True)
+    actor = vedo.Mesh(merged)
+
+    if (hasattr(merged.visual, "face_colors") and
+            merged.visual.face_colors.shape[0] == len(merged.faces)):
+        colors = np.asarray(merged.visual.face_colors)
+        actor.cellcolors = colors[:, :3]
+
+    plt = vedo.Plotter()
+    plt.show(actor, interactive=True)
+
+    return _capture_vedo_camera_info(plt)
+
+
 def _show_scene_with_camera_info(scene, args, scene_translation=None):
     """
     统一封装 scene.show()，支持在窗口关闭后捕获并打印相机信息。
@@ -1648,33 +1676,39 @@ def _show_scene_with_camera_info(scene, args, scene_translation=None):
         scene.show()
         return
 
-    if os.environ.get("TRIMESH_DEFAULT_VIEWER") != "vedo":
-        print("[WARN] --print-camera-info 仅在 TRIMESH_DEFAULT_VIEWER=vedo 时有效")
-        scene.show()
-        return
+    info = None
 
-    try:
-        from trimesh.viewers.vedo_viewer import VedoViewer
-    except Exception as e:
-        print(f"[WARN] 无法导入 trimesh vedo viewer: {e}")
-        scene.show()
-        return
+    # 1. 旧版 trimesh 有 VedoViewer，优先使用
+    VedoViewer = _try_get_trimesh_vedo_viewer()
+    if VedoViewer is not None:
+        class _CameraInfoViewer(VedoViewer):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.camera_info = None
 
-    class _CameraInfoViewer(VedoViewer):
-        def __init__(self, *a, **kw):
-            super().__init__(*a, **kw)
-            self.camera_info = None
+            def show(self, **kw):
+                result = super().show(**kw)
+                self.camera_info = _capture_vedo_camera_info(self)
+                return result
 
-        def show(self, **kw):
-            result = super().show(**kw)
-            self.camera_info = _capture_vedo_camera_info(self)
-            return result
+        viewer = _CameraInfoViewer(scene)
+        viewer.show()
+        info = viewer.camera_info or {}
 
-    viewer = _CameraInfoViewer(scene)
-    viewer.show()
-    info = viewer.camera_info or {}
+    # 2. trimesh 4.x 没有 viewer 模块，直接用 vedo
+    else:
+        try:
+            info = _show_scene_with_vedo(scene)
+        except ImportError as e:
+            print(f"[WARN] vedo 未安装，无法捕获相机信息: {e}")
+            scene.show()
+            return
+        except Exception as e:
+            print(f"[WARN] vedo 直接显示失败: {e}")
+            scene.show()
+            return
 
-    if scene_translation is not None and "error" not in info:
+    if info and scene_translation is not None and "error" not in info:
         t = np.asarray(scene_translation, dtype=np.float64)
         if "camera_position_display" in info:
             info["camera_position_world"] = (
@@ -2015,7 +2049,7 @@ def visualize_boundary_component(mesh, args):
         _show_scene_with_camera_info(
             show_scene,
             args,
-            scene_translation=camera_center,
+            scene_translation=-camera_center,
         )
 
 
