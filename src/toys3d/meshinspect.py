@@ -1,3 +1,4 @@
+# src/toys3d/meshinspect.py
 import sys
 import os
 
@@ -595,6 +596,19 @@ def _generate_initial_seifert_disk(mesh, loop_vertices):
             faces=tri_faces,
             process=False,
         )
+
+        # 合并重复顶点并删除孤立点，避免后续 Laplacian 矩阵奇异
+        disk.merge_vertices()
+        disk.remove_unreferenced_vertices()
+
+        # 重建边界索引：通过最近点匹配原始三维边界点
+        from scipy.spatial import cKDTree
+        tree = cKDTree(np.asarray(disk.vertices, dtype=np.float64))
+        distances, hit_indices = tree.query(pts)
+        if np.any(distances > 1e-8):
+            raise ValueError("boundary vertex not preserved after merge")
+
+        boundary_indices = [int(i) for i in hit_indices]
         return disk, boundary_indices
 
     except Exception as e:
@@ -730,6 +744,13 @@ def _laplacian_smooth_fixed_boundary(
 
         Lint = L[interior_indices, :][:, interior_indices].tocsr()
         Lbnd = L[interior_indices, :][:, boundary_indices].tocsr()
+
+        # 增加极小对角正则项，防止因退化三角形导致奇异
+        n_int = len(interior_indices)
+        eps_reg = 1e-10
+        Lint = Lint + csr_matrix(
+            np.eye(n_int, dtype=np.float64) * eps_reg
+        )
 
         rhs = -Lbnd @ vertices[boundary_indices]
         sol = spsolve(Lint, rhs)
@@ -1853,8 +1874,21 @@ def visualize_boundary_component(mesh, args):
             f"边界组件 {args.boundary_id} 可视化已保存至: {args.output}"
         )
     if args.show:
-        os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
-        scene.show()
+        try:
+            os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
+            scene.show()
+        except Exception as e:
+            print(f"[WARN] vedo 显示失败: {e}")
+            print("尝试回退到 trimesh 默认 viewer...")
+            os.environ['TRIMESH_DEFAULT_VIEWER'] = 'pyglet'
+            try:
+                scene.show()
+            except Exception as e2:
+                print(f"[ERROR] 所有 viewer 尝试均失败: {e2}")
+                if args.output:
+                    print(f"请查看已导出的场景文件: {args.output}")
+                else:
+                    print("建议使用 --output 导出场景进行观察")
 
 
 def run_full_diagnosis_pass1(mesh, output_dir, valence_threshold=5):
