@@ -1030,6 +1030,267 @@ def load_boundary_component_data(data_dir, boundary_id, boundary_type="uncovered
         raise ValueError(f"未知的边界类型: {boundary_type}")
 
 
+def _generate_initial_seifert_disk(mesh, loop_vertices):
+    """
+    以健康孔洞边界环为边界生成初始拓扑圆盘。
+    使用 SVD 平面投影 + 多边形三角化，避免退化扇形。
+    """
+    loop_vertices = [int(v) for v in loop_vertices]
+    if len(loop_vertices) < 3:
+        return None, []
+
+    pts = np.asarray(mesh.vertices[loop_vertices], dtype=np.float64)
+
+    try:
+        from shapely.geometry import Polygon
+
+        centroid = pts.mean(axis=0)
+        _, _, vh = np.linalg.svd(pts - centroid)
+        u = vh[0]
+        v = vh[1]
+
+        poly2d = np.column_stack([
+            (pts - centroid) @ u,
+            (pts - centroid) @ v,
+        ])
+
+        polygon = Polygon(poly2d)
+        if not polygon.is_valid:
+            polygon = polygon.buffer(0)
+
+        triangulated = trimesh.creation.triangulate_polygon(polygon)
+        if triangulated is None:
+            raise ValueError("triangulate_polygon returned None")
+
+        tri_vertices_2d, tri_faces = triangulated
+        tri_vertices_2d = np.asarray(tri_vertices_2d, dtype=np.float64)
+        tri_faces = np.asarray(tri_faces, dtype=np.int64)
+
+        if tri_vertices_2d.ndim != 2 or tri_vertices_2d.shape[1] != 2:
+            raise ValueError("invalid 2D vertices")
+        if tri_faces.ndim != 2 or tri_faces.shape[1] != 3 or len(tri_faces) == 0:
+            raise ValueError("empty or invalid faces")
+
+        v3d = centroid + tri_vertices_2d[:, 0:1] * u + tri_vertices_2d[:, 1:2] * v
+
+        boundary_indices = []
+        for p2d in poly2d:
+            dists = np.linalg.norm(tri_vertices_2d - p2d, axis=1)
+            idx = int(np.argmin(dists))
+            if dists[idx] > 1e-8:
+                raise ValueError("boundary point not found")
+            boundary_indices.append(idx)
+
+        disk = trimesh.Trimesh(
+            vertices=v3d,
+            faces=tri_faces,
+            process=False,
+        )
+
+        return disk, boundary_indices
+
+    except Exception as e:
+        print(f"  [WARN] 初始 Seifert 圆盘生成失败: {e}")
+        return None, []
+
+
+def _build_cotangent_laplacian(mesh):
+    """
+    构建当前网格的余切权重 Laplacian 矩阵。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    n_vertices = len(vertices)
+    if n_vertices == 0:
+        return csr_matrix((0, 0))
+
+    row = []
+    col = []
+    data = []
+
+    for fid, face in enumerate(faces):
+        tri = vertices[face]
+        a, b, c = tri[0], tri[1], tri[2]
+
+        def angle_at(p, q, r):
+            v1 = q - p
+            v2 = r - p
+            dot = np.dot(v1, v2)
+            denom = np.linalg.norm(v1) * np.linalg.norm(v2)
+            if denom < 1e-12:
+                return 0.0
+            cos_angle = np.clip(dot / denom, -1.0, 1.0)
+            return float(np.arccos(cos_angle))
+
+        alpha = angle_at(a, b, c)
+        beta = angle_at(b, c, a)
+        gamma = angle_at(c, a, b)
+
+        edge0 = (int(face[1]), int(face[2])) if face[1] < face[2] else (int(face[2]), int(face[1]))
+        edge1 = (int(face[2]), int(face[0])) if face[2] < face[0] else (int(face[0]), int(face[2]))
+        edge2 = (int(face[0]), int(face[1])) if face[0] < face[1] else (int(face[1]), int(face[0]))
+
+        cot_alpha = 1.0 / np.tan(alpha) if abs(np.tan(alpha)) > 1e-12 else 0.0
+        cot_beta = 1.0 / np.tan(beta) if abs(np.tan(beta)) > 1e-12 else 0.0
+        cot_gamma = 1.0 / np.tan(gamma) if abs(np.tan(gamma)) > 1e-12 else 0.0
+
+        def add_weight(e0, e1, w):
+            if w == 0:
+                return
+            row.append(e0)
+            col.append(e1)
+            data.append(w)
+            row.append(e1)
+            col.append(e0)
+            data.append(w)
+
+        add_weight(edge0[0], edge0[1], cot_alpha)
+        add_weight(edge1[0], edge1[1], cot_beta)
+        add_weight(edge2[0], edge2[1], cot_gamma)
+
+    if not row:
+        return csr_matrix((n_vertices, n_vertices))
+
+    L = csr_matrix(
+        (np.array(data, dtype=np.float64), (np.array(row, dtype=np.int64), np.array(col, dtype=np.int64))),
+        shape=(n_vertices, n_vertices),
+    )
+
+    row_sums = np.asarray(L.sum(axis=1)).ravel()
+    L = L - csr_matrix(
+        (row_sums, (np.arange(n_vertices), np.arange(n_vertices))),
+        shape=(n_vertices, n_vertices),
+    )
+
+    return L
+
+
+def _laplacian_smooth_fixed_boundary(mesh, boundary_vertex_indices, iterations=200, step_size=1.0, tol=1e-7):
+    """
+    固定边界顶点，内部顶点按离散 Plateau 问题迭代求解。
+    """
+    from scipy.sparse.linalg import spsolve
+
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    vertices = mesh.vertices.copy()
+    n_vertices = len(vertices)
+    boundary_set = set(int(v) for v in boundary_vertex_indices)
+
+    if n_vertices == 0 or len(faces) == 0:
+        return mesh.copy()
+
+    all_indices = np.arange(n_vertices, dtype=np.int64)
+    interior_indices = np.array(
+        [i for i in all_indices if int(i) not in boundary_set],
+        dtype=np.int64,
+    )
+    boundary_indices = np.array(sorted(boundary_set), dtype=np.int64)
+
+    if len(interior_indices) == 0:
+        return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    step_size = float(np.clip(step_size, 0.0, 1.0))
+
+    for it in range(iterations):
+        current = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        L = _build_cotangent_laplacian(current)
+
+        Lint = L[interior_indices, :][:, interior_indices].tocsr()
+        Lbnd = L[interior_indices, :][:, boundary_indices].tocsr()
+
+        n_int = len(interior_indices)
+        eps_reg = 1e-10
+        Lint = Lint + csr_matrix(np.eye(n_int, dtype=np.float64) * eps_reg)
+
+        rhs = -Lbnd @ vertices[boundary_indices]
+        sol = spsolve(Lint, rhs)
+
+        new_vertices = vertices.copy()
+        new_vertices[interior_indices] = (
+            vertices[interior_indices] + step_size * (sol - vertices[interior_indices])
+        )
+
+        moves = np.linalg.norm(
+            new_vertices[interior_indices] - vertices[interior_indices],
+            axis=1,
+        )
+        max_move = float(np.max(moves)) if len(moves) > 0 else 0.0
+        vertices = new_vertices
+
+        if max_move < tol:
+            print(f"    Seifert 优化在第 {it+1} 次迭代收敛，最大位移 {max_move:.6e}")
+            break
+
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+
+def _compute_curvature_statistics(mesh, boundary_vertex_indices):
+    """
+    计算 Seifert 曲面内部顶点的离散曲率统计。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    n_vertices = len(vertices)
+    boundary_set = set(int(v) for v in boundary_vertex_indices)
+
+    L = _build_cotangent_laplacian(mesh)
+
+    area_faces = mesh.area_faces
+    vertex_areas = np.bincount(
+        faces.ravel(),
+        weights=np.repeat(area_faces, 3),
+        minlength=n_vertices,
+    ) / 3.0
+    vertex_areas[vertex_areas < 1e-12] = 1.0
+
+    Hn = L @ vertices
+    H_mag = np.linalg.norm(Hn, axis=1) / (2.0 * vertex_areas)
+
+    angle_sum = np.zeros(n_vertices, dtype=np.float64)
+    for face in faces:
+        tri = vertices[face]
+        for j in range(3):
+            v_idx = int(face[j])
+            p = tri[j]
+            q = tri[(j + 1) % 3]
+            r = tri[(j + 2) % 3]
+            v1 = q - p
+            v2 = r - p
+            dot = np.dot(v1, v2)
+            denom = np.linalg.norm(v1) * np.linalg.norm(v2)
+            if denom < 1e-12:
+                angle = 0.0
+            else:
+                cos_angle = np.clip(dot / denom, -1.0, 1.0)
+                angle = float(np.arccos(cos_angle))
+            angle_sum[v_idx] += angle
+    K = (2.0 * np.pi - angle_sum) / vertex_areas
+
+    interior_mask = np.array([i not in boundary_set for i in range(n_vertices)], dtype=bool)
+    if not np.any(interior_mask):
+        interior_mask = np.ones(n_vertices, dtype=bool)
+
+    H_int = H_mag[interior_mask]
+    K_int = K[interior_mask]
+
+    stats = {
+        "mean_abs_mean_curvature": float(np.mean(H_int)),
+        "median_abs_mean_curvature": float(np.median(H_int)),
+        "max_abs_mean_curvature": float(np.max(H_int)),
+        "p95_abs_mean_curvature": float(np.percentile(H_int, 95)),
+        "std_abs_mean_curvature": float(np.std(H_int)),
+        "mean_gaussian_curvature": float(np.mean(K_int)),
+        "median_gaussian_curvature": float(np.median(K_int)),
+        "max_gaussian_curvature": float(np.max(K_int)),
+        "min_gaussian_curvature": float(np.min(K_int)),
+        "area": float(mesh.area),
+        "perimeter": float(np.sum(np.linalg.norm(
+            vertices[boundary_vertex_indices] -
+            np.roll(vertices[boundary_vertex_indices], -1, axis=0), axis=1))),
+    }
+    return stats
+
+
 def visualize_boundary_component(mesh, args):
     """
     可视化健康孔洞或未覆盖开放边分量及其局部三角面片。
@@ -1042,6 +1303,7 @@ def visualize_boundary_component(mesh, args):
     )
 
     scene = trimesh.Scene()
+    local_visualization_vertices = None
 
     # 可选：显示半透明原始网格
     if args.boundary_show_original:
@@ -1069,6 +1331,8 @@ def visualize_boundary_component(mesh, args):
                 sub = mesh.submesh(
                     [np.array(list(expanded_faces), dtype=np.int64)]
                 )[0]
+                local_visualization_vertices = np.asarray(sub.vertices, dtype=np.float64)
+
                 if args.boundary_type == "uncovered":
                     sub.visual.face_colors = [255, 165, 0, 255]  # 橙色
                 else:
@@ -1193,12 +1457,65 @@ def visualize_boundary_component(mesh, args):
         seg.visual.face_colors = [255, 165, 0, 255]
         scene.add_geometry(seg)
 
+    # Seifert 曲面
+    if getattr(args, 'generate_seifert_surface_strict', False):
+        if args.boundary_type != "healthy":
+            print("  警告: --generate-seifert-surface-strict 仅适用于 healthy 孔洞")
+        else:
+            loop = comp.get("healthy_hole_vertex_indices")
+            if not loop:
+                # 从 edge_vertex_pairs 恢复环
+                edge_pairs = comp.get("edge_vertex_pairs", [])
+                if edge_pairs:
+                    import warnings
+                    # 简化恢复：取所有边的顶点并排序？但这里直接用边构建邻接并遍历
+                    # 可以省略，因为健康孔洞 JSON 中应已有 vertex_indices
+                    print("  [WARN] 未找到 healthy_hole_vertex_indices")
+                else:
+                    print("  [WARN] 未找到任何边界信息")
+                loop = []
+            if loop and len(loop) >= 3:
+                print("生成严格 Seifert 曲面...")
+                disk_mesh, boundary_indices = _generate_initial_seifert_disk(mesh, loop)
+                if disk_mesh is None:
+                    print("  [WARN] 无法生成初始圆盘")
+                else:
+                    seifert_mesh = _laplacian_smooth_fixed_boundary(
+                        disk_mesh,
+                        boundary_indices,
+                        iterations=args.seifert_optimize_iterations,
+                        step_size=args.seifert_step_size,
+                        tol=args.seifert_tolerance,
+                    )
+                    color = np.array(args.seifert_color, dtype=np.uint8)
+                    seifert_mesh.visual.face_colors = np.tile(
+                        color, (len(seifert_mesh.faces), 1)
+                    )
+                    if args.double_sided:
+                        seifert_mesh = make_double_sided(seifert_mesh)
+                    scene.add_geometry(seifert_mesh)
+                    print(f"  Seifert 曲面已生成: {len(seifert_mesh.faces)} 个三角面片")
+                    if args.seifert_curvature_report:
+                        stats = _compute_curvature_statistics(
+                            seifert_mesh, boundary_indices
+                        )
+                        print("  Seifert 曲面曲率统计:")
+                        for k, v in stats.items():
+                            print(f"    {k}: {v:.6f}")
+            else:
+                print("  [WARN] 未找到有效的健康孔洞边界环")
+
     if args.output:
         scene.export(args.output)
         print(
             f"边界组件 {args.boundary_id} 可视化已保存至: {args.output}"
         )
     if args.show:
+        if local_visualization_vertices is not None:
+            try:
+                scene.camera.look_at(local_visualization_vertices)
+            except Exception as e:
+                print(f"[WARN] 相机自动取景失败: {e}")
         os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
         scene.show()
 
@@ -2511,6 +2828,40 @@ def main():
                         help="拟合水密曲面的不透明度，范围 0~1，默认 0.3")
     parser.add_argument("--allow-non-genus0", action="store_true",
                         help="允许水密但亏格非0的拟合曲面通过（用于可视化调试）")
+    parser.add_argument(
+        "--generate-seifert-surface-strict",
+        action="store_true",
+        help="在可视化健康孔洞时，生成并显示严格 Seifert 曲面（固定边界极小曲面优化）"
+    )
+    parser.add_argument(
+        "--seifert-optimize-iterations",
+        type=int,
+        default=200,
+        help="Seifert 曲面内部顶点优化迭代次数（默认 200）"
+    )
+    parser.add_argument(
+        "--seifert-step-size",
+        type=float,
+        default=1.0,
+        help="Seifert 曲面 Dirichlet 求解松弛系数（默认 1.0）"
+    )
+    parser.add_argument(
+        "--seifert-tolerance",
+        type=float,
+        default=1e-7,
+        help="Seifert 曲面优化收敛容差（默认 1e-7）"
+    )
+    parser.add_argument(
+        "--seifert-color",
+        type=str,
+        default="255,215,0,255",
+        help="Seifert 曲面显示颜色，格式 'R,G,B,A'，默认金色"
+    )
+    parser.add_argument(
+        "--seifert-curvature-report",
+        action="store_true",
+        help="打印 Seifert 曲面曲率统计信息"
+    )
     parser.add_argument("--hole-diagnosis-output", type=str, default="hole_diagnosis_report",
                         help="孔洞诊断输出目录（默认 hole_diagnosis_report）")
     parser.add_argument("--diagnosis-output", type=str, default="diagnosis_report",
@@ -2543,6 +2894,9 @@ def main():
 
     if args.proxy_color is not None:
         args.proxy_color = _parse_color_string_flexible(args.proxy_color)
+
+    if args.seifert_color is not None:
+        args.seifert_color = _parse_color_string(args.seifert_color)
 
     print(f"Hey! Loading {args.input_file}")
     mesh = trimesh.load(args.input_file, force="mesh")
