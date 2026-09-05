@@ -1428,9 +1428,13 @@ def visualize_boundary_component(mesh, args):
     elif comp.get("endpoints"):
         focus_indices = comp["endpoints"]
 
+    # 核心取景点集：优先为健康孔洞边界顶点，其次组件顶点/端点
+    camera_core_points = []
     camera_focus = None
+
     if focus_indices:
         focus_points = mesh.vertices[np.asarray(focus_indices, dtype=np.int64)]
+        camera_core_points = focus_points.copy()
         camera_focus = focus_points.mean(axis=0)
 
     scene = trimesh.Scene()
@@ -1616,6 +1620,17 @@ def visualize_boundary_component(mesh, args):
                         step_size=args.seifert_step_size,
                         tol=args.seifert_tolerance,
                     )
+                    # 将 Seifert 曲面顶点加入相机核心取景点集
+                    if len(camera_core_points) == 0:
+                        camera_core_points = np.asarray(
+                            seifert_mesh.vertices, dtype=np.float64
+                        ).copy()
+                    else:
+                        camera_core_points = np.vstack([
+                            camera_core_points,
+                            np.asarray(seifert_mesh.vertices, dtype=np.float64),
+                        ])
+
                     color = np.array(args.seifert_color, dtype=np.uint8)
                     seifert_mesh.visual.face_colors = np.tile(
                         color, (len(seifert_mesh.faces), 1)
@@ -1643,11 +1658,52 @@ def visualize_boundary_component(mesh, args):
             f"边界组件 {args.boundary_id} 可视化已保存至: {args.output}"
         )
     if args.show:
-        if camera_focus is not None:
+        if len(camera_core_points) > 0:
             try:
-                scene.camera.look_at(np.array([camera_focus], dtype=np.float64))
+                core_pts = np.asarray(camera_core_points, dtype=np.float64)
+                core_center = core_pts.mean(axis=0)
+                core_radius = float(
+                    np.linalg.norm(core_pts - core_center, axis=1).max()
+                )
+                if core_radius < 1e-8:
+                    core_radius = 0.1
+
+                distance = max(core_radius * 5.0, 1e-6)
+
+                if getattr(args, "debug_scene", False):
+                    print("  [camera] core point count:", len(core_pts))
+                    print(
+                        "           center=({:.6f}, {:.6f}, {:.6f})".format(
+                            core_center[0], core_center[1], core_center[2]
+                        )
+                    )
+                    print(
+                        "           radius={:.6f}, distance={:.6f}".format(
+                            core_radius, distance
+                        )
+                    )
+
+                # 优先使用显式 center/distance；不支持时回退到旧 API
+                try:
+                    scene.camera.look_at(
+                        core_pts,
+                        center=core_center,
+                        distance=distance,
+                    )
+                except TypeError:
+                    scene.camera.look_at(core_pts)
+
             except Exception as e:
                 print(f"[WARN] 相机自动取景失败: {e}")
+
+        elif camera_focus is not None:
+            try:
+                scene.camera.look_at(
+                    np.array([camera_focus], dtype=np.float64)
+                )
+            except Exception as e:
+                print(f"[WARN] 相机自动取景失败: {e}")
+
         os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
         scene.show()
 
