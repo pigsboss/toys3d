@@ -1,3 +1,4 @@
+# src/toys3d/meshinspect.py
 import sys
 import os
 
@@ -1845,74 +1846,27 @@ def visualize_boundary_component(mesh, args):
             f"边界组件 {boundary_id} 可视化已保存至: {args.output}"
         )
     if args.show:
-        # 相机中心固定为孔洞边界中心
+        show_scene = scene
+
         if len(boundary_camera_points) > 0:
             try:
                 boundary_pts = np.asarray(boundary_camera_points, dtype=np.float64)
                 camera_center = boundary_pts.mean(axis=0)
 
-                # 取景半径点：边界点 + Seifert 顶点
-                if len(seifert_camera_points) > 0:
-                    radius_points = np.vstack([
-                        boundary_pts,
-                        seifert_camera_points,
-                    ])
-                else:
-                    radius_points = boundary_pts
-
-                # 过滤明显离群点，避免个别错误点影响取景
-                radius_points = _filter_camera_core_points(radius_points)
-
-                core_radius = float(
-                    np.linalg.norm(radius_points - camera_center, axis=1).max()
-                )
-                if core_radius < 1e-8:
-                    core_radius = 0.1
-
-                distance = max(core_radius * 5.0, 1e-6)
+                # 将孔洞中心平移到原点，让 viewer 的默认旋转中心固定为原点
+                show_scene = scene.copy()
+                show_scene.apply_translation(-camera_center)
 
                 if getattr(args, "debug_scene", False):
-                    print("  [camera] boundary point count:", len(boundary_pts))
-                    if len(seifert_camera_points) > 0:
-                        print("  [camera] seifert point count:", len(seifert_camera_points))
-                    print(
-                        "           center=({:.6f}, {:.6f}, {:.6f})".format(
-                            camera_center[0], camera_center[1], camera_center[2]
-                        )
-                    )
-                    print(
-                        "           radius={:.6f}, distance={:.6f}".format(
-                            core_radius, distance
-                        )
-                    )
-
-                try:
-                    scene.set_camera(
-                        center=camera_center,
-                        distance=distance,
-                    )
-                except (AttributeError, TypeError):
-                    try:
-                        scene.camera.look_at(
-                            boundary_pts,
-                            center=camera_center,
-                            distance=distance,
-                        )
-                    except TypeError:
-                        scene.camera.look_at(boundary_pts)
-
-                if getattr(args, "debug_scene", False):
-                    print("  [camera] scene.camera.transform:")
-                    try:
-                        print("    ", scene.camera.transform)
-                    except Exception as e:
-                        print("    unavailable:", e)
+                    print("  [camera] translated scene center:",
+                          f"({camera_center[0]:.6f}, {camera_center[1]:.6f}, {camera_center[2]:.6f})")
+                    print("  [camera] using origin-centered scene for viewer")
 
             except Exception as e:
-                print(f"[WARN] 相机自动取景失败: {e}")
+                print(f"[WARN] 场景中心平移失败: {e}")
 
         os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
-        scene.show()
+        show_scene.show()
 
 
 def run_full_diagnosis_pass1(mesh, output_dir, valence_threshold=5):
