@@ -566,11 +566,19 @@ def _generate_initial_seifert_disk(mesh, loop_vertices):
         if not polygon.is_valid:
             polygon = polygon.buffer(0)
 
-        tri = trimesh.creation.triangulate_polygon(polygon)
-        if tri is None or len(tri.faces) == 0:
-            raise ValueError("triangulate_polygon returned empty")
+        triangulated = trimesh.creation.triangulate_polygon(polygon)
+        if triangulated is None:
+            raise ValueError("triangulate_polygon returned None")
 
-        tri_vertices_2d = np.asarray(tri.vertices, dtype=np.float64)
+        tri_vertices_2d, tri_faces = triangulated
+        tri_vertices_2d = np.asarray(tri_vertices_2d, dtype=np.float64)
+        tri_faces = np.asarray(tri_faces, dtype=np.int64)
+
+        if tri_vertices_2d.ndim != 2 or tri_vertices_2d.shape[1] != 2:
+            raise ValueError("triangulate_polygon returned invalid 2D vertices")
+        if tri_faces.ndim != 2 or tri_faces.shape[1] != 3 or len(tri_faces) == 0:
+            raise ValueError("triangulate_polygon returned empty or invalid faces")
+
         v3d = centroid + tri_vertices_2d[:, 0:1] * u + tri_vertices_2d[:, 1:2] * v
 
         # 找到每个原始边界点在三角化结果中的索引，保持 loop 顺序
@@ -584,7 +592,7 @@ def _generate_initial_seifert_disk(mesh, loop_vertices):
 
         disk = trimesh.Trimesh(
             vertices=v3d,
-            faces=np.asarray(tri.faces, dtype=np.int64),
+            faces=tri_faces,
             process=False,
         )
         return disk, boundary_indices
