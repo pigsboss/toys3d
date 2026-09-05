@@ -1291,6 +1291,49 @@ def _compute_curvature_statistics(mesh, boundary_vertex_indices):
     return stats
 
 
+def _print_boundary_component_diagnostics(mesh, comp, boundary_type, boundary_id, neighborhood_depth):
+    """
+    打印指定边界组件/健康孔洞的基础诊断信息。
+    """
+    print(f"\n[DIAGNOSTICS] 可视化原始网格组件 (boundary_id={boundary_id}, type={boundary_type})")
+
+    edges = comp.get("edge_vertex_pairs", [])
+    vertices_set = set()
+    for v0, v1 in edges:
+        vertices_set.add(int(v0))
+        vertices_set.add(int(v1))
+
+    print(f"  边界边数: {len(edges)}")
+    print(f"  边界顶点数: {len(vertices_set)}")
+
+    # 顶点度数分布
+    degree = Counter()
+    for v0, v1 in edges:
+        degree[int(v0)] += 1
+        degree[int(v1)] += 1
+
+    deg1 = sum(1 for d in degree.values() if d == 1)
+    deg2 = sum(1 for d in degree.values() if d == 2)
+    deg3plus = sum(1 for d in degree.values() if d >= 3)
+    print(f"  度为1的顶点数: {deg1}")
+    print(f"  度为2的顶点数: {deg2}")
+    print(f"  度为3及以上的顶点数: {deg3plus}")
+
+    seed_faces = comp.get("face_ids", [])
+    print(f"  种子面片数: {len(seed_faces)}")
+
+    if neighborhood_depth > 0:
+        print("  邻域面片距离分布（距离0=种子面片）:")
+        max_display = min(neighborhood_depth, 20)  # 最多显示到20层
+        prev_set = set(seed_faces)
+        print(f"    距离 0: {len(prev_set)}")
+        for d in range(1, max_display + 1):
+            cur_set = expand_face_neighborhood(mesh, seed_faces, d + 1)
+            new_count = len(cur_set - prev_set)
+            print(f"    距离 {d}: {new_count}")
+            prev_set = cur_set
+
+
 def visualize_boundary_component(mesh, args):
     """
     可视化健康孔洞或未覆盖开放边分量及其局部三角面片。
@@ -1302,8 +1345,27 @@ def visualize_boundary_component(mesh, args):
         args.boundary_type,
     )
 
+    # 打印组件诊断信息
+    _print_boundary_component_diagnostics(
+        mesh, comp, args.boundary_type, args.boundary_id,
+        args.boundary_neighborhood_depth
+    )
+
+    # 计算相机焦点：优先使用健康孔洞边界环，其次组件顶点，最后端点
+    focus_indices = []
+    if "healthy_hole_vertex_indices" in comp:
+        focus_indices = comp["healthy_hole_vertex_indices"]
+    elif comp.get("vertices"):
+        focus_indices = comp["vertices"]
+    elif comp.get("endpoints"):
+        focus_indices = comp["endpoints"]
+
+    camera_focus = None
+    if focus_indices:
+        focus_points = mesh.vertices[np.asarray(focus_indices, dtype=np.int64)]
+        camera_focus = focus_points.mean(axis=0)
+
     scene = trimesh.Scene()
-    local_visualization_vertices = None
 
     # 可选：显示半透明原始网格
     if args.boundary_show_original:
@@ -1331,7 +1393,6 @@ def visualize_boundary_component(mesh, args):
                 sub = mesh.submesh(
                     [np.array(list(expanded_faces), dtype=np.int64)]
                 )[0]
-                local_visualization_vertices = np.asarray(sub.vertices, dtype=np.float64)
 
                 if args.boundary_type == "uncovered":
                     sub.visual.face_colors = [255, 165, 0, 255]  # 橙色
@@ -1511,9 +1572,9 @@ def visualize_boundary_component(mesh, args):
             f"边界组件 {args.boundary_id} 可视化已保存至: {args.output}"
         )
     if args.show:
-        if local_visualization_vertices is not None:
+        if camera_focus is not None:
             try:
-                scene.camera.look_at(local_visualization_vertices)
+                scene.camera.look_at(np.array([camera_focus], dtype=np.float64))
             except Exception as e:
                 print(f"[WARN] 相机自动取景失败: {e}")
         os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
