@@ -597,18 +597,10 @@ def _generate_initial_seifert_disk(mesh, loop_vertices):
             process=False,
         )
 
-        # 合并重复顶点并删除孤立点，避免后续 Laplacian 矩阵奇异
-        disk.merge_vertices()
-        disk.remove_unreferenced_vertices()
+        # 直接使用之前二维三角化得到的边界索引，不再合并顶点
+        if len(boundary_indices) != len(poly2d):
+            raise ValueError("boundary indices mismatch")
 
-        # 重建边界索引：通过最近点匹配原始三维边界点
-        from scipy.spatial import cKDTree
-        tree = cKDTree(np.asarray(disk.vertices, dtype=np.float64))
-        distances, hit_indices = tree.query(pts)
-        if np.any(distances > 1e-8):
-            raise ValueError("boundary vertex not preserved after merge")
-
-        boundary_indices = [int(i) for i in hit_indices]
         return disk, boundary_indices
 
     except Exception as e:
