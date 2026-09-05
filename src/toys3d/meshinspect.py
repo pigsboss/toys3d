@@ -1402,6 +1402,26 @@ def print_scene_debug_info(scene, title="Scene Debug Info"):
         print(f"      diagonal={sdiag:.6f}")
 
 
+def _filter_camera_core_points(points):
+    """
+    根据中位数绝对偏差过滤离群点，避免个别原点/错误点拉偏相机。
+    """
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3 or len(points) < 4:
+        return points
+
+    med = np.median(points, axis=0)
+    dist = np.linalg.norm(points - med, axis=1)
+    med_dist = np.median(dist)
+
+    if med_dist < 1e-12:
+        return points
+
+    ratio = dist / med_dist
+    kept = ratio <= 3.0
+    return points[kept]
+
+
 def visualize_boundary_component(mesh, args):
     """
     可视化健康孔洞或未覆盖开放边分量及其局部三角面片。
@@ -1419,14 +1439,14 @@ def visualize_boundary_component(mesh, args):
         args.boundary_neighborhood_depth
     )
 
-    # 计算相机焦点：优先使用健康孔洞边界环，其次组件顶点，最后端点
-    focus_indices = []
-    if "healthy_hole_vertex_indices" in comp:
-        focus_indices = comp["healthy_hole_vertex_indices"]
-    elif comp.get("vertices"):
-        focus_indices = comp["vertices"]
-    elif comp.get("endpoints"):
-        focus_indices = comp["endpoints"]
+    # 优先使用当前边集导出的顶点，避免 hole_diagnosis.json 中旧索引/异常索引
+    focus_indices = comp.get("vertices")
+
+    if not focus_indices:
+        focus_indices = comp.get("healthy_hole_vertex_indices", [])
+
+    if not focus_indices:
+        focus_indices = comp.get("endpoints", [])
 
     # 核心取景点集：优先为健康孔洞边界顶点，其次组件顶点/端点
     camera_core_points = []
@@ -1660,6 +1680,7 @@ def visualize_boundary_component(mesh, args):
     if args.show:
         if len(camera_core_points) > 0:
             try:
+                camera_core_points = _filter_camera_core_points(camera_core_points)
                 core_pts = np.asarray(camera_core_points, dtype=np.float64)
                 core_center = core_pts.mean(axis=0)
                 core_radius = float(
