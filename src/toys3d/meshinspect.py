@@ -1704,15 +1704,29 @@ def visualize_boundary_component(mesh, args):
                         )
                     )
 
-                # 优先使用显式 center/distance；不支持时回退到旧 API
+                # 使用 Scene.set_camera 显式设置相机，比 camera.look_at 对 viewer 更可靠
                 try:
-                    scene.camera.look_at(
-                        core_pts,
+                    scene.set_camera(
                         center=core_center,
                         distance=distance,
                     )
-                except TypeError:
-                    scene.camera.look_at(core_pts)
+                except (AttributeError, TypeError):
+                    # 旧版 trimesh：回退到 camera.look_at
+                    try:
+                        scene.camera.look_at(
+                            core_pts,
+                            center=core_center,
+                            distance=distance,
+                        )
+                    except TypeError:
+                        scene.camera.look_at(core_pts)
+
+                if getattr(args, "debug_scene", False):
+                    print("  [camera] scene.camera.transform:")
+                    try:
+                        print("    ", scene.camera.transform)
+                    except Exception as e:
+                        print("    unavailable:", e)
 
             except Exception as e:
                 print(f"[WARN] 相机自动取景失败: {e}")
