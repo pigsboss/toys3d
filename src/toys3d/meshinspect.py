@@ -1620,7 +1620,11 @@ def _capture_vedo_camera_info(plotter_or_viewer):
 
         pos = np.asarray(cam.GetPosition(), dtype=np.float64)
         focal = np.asarray(cam.GetFocalPoint(), dtype=np.float64)
-        up = np.asarray(cam.GetUp(), dtype=np.float64)
+        # vtkOpenGLCamera (vedo 2026+) 没有 GetUp，使用 GetViewUp
+        if hasattr(cam, "GetViewUp"):
+            up = np.asarray(cam.GetViewUp(), dtype=np.float64)
+        else:
+            up = np.asarray(cam.GetUp(), dtype=np.float64)
         view_dir = focal - pos
         dist = float(np.linalg.norm(view_dir))
 
@@ -1654,7 +1658,7 @@ def _show_scene_with_vedo(scene):
     """使用 vedo 直接显示 trimesh.Scene，并返回相机信息。"""
     import vedo
 
-    merged = scene.dump(concatenate=True)
+    merged = scene.to_geometry()
     actor = vedo.Mesh(merged)
 
     if (hasattr(merged.visual, "face_colors") and
