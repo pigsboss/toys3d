@@ -1577,15 +1577,39 @@ def visualize_boundary_component(mesh, args):
     可视化健康孔洞或未覆盖开放边分量及其局部三角面片。
     默认不显示整个网格，只显示目标边界和指定邻域深度内的面片。
     """
-    comp = load_boundary_component_data(
-        args.boundary_data_dir,
-        args.boundary_id,
-        args.boundary_type,
-    )
+    boundary_id = args.boundary_id
+
+    if args.component_package:
+        package_path = Path(args.component_package)
+        if not package_path.exists():
+            raise FileNotFoundError(f"未找到组件包文件: {package_path}")
+
+        with open(package_path, "r", encoding="utf-8") as f:
+            package_data = json.load(f)
+
+        comp = package_data.get("component", {})
+        effective_boundary_type = package_data.get("boundary_type", args.boundary_type)
+        boundary_id = package_data.get("boundary_id", args.boundary_id)
+
+        # 确保必要字段存在
+        comp.setdefault("edge_vertex_pairs", [])
+        comp.setdefault("vertices", [])
+        comp.setdefault("face_ids", [])
+        comp.setdefault("endpoints", [])
+        comp.setdefault("branch_vertices", [])
+        comp.setdefault("candidate_breaks", [])
+        comp.setdefault("healthy_hole_vertex_indices", [])
+    else:
+        comp = load_boundary_component_data(
+            args.boundary_data_dir,
+            args.boundary_id,
+            args.boundary_type,
+        )
+        effective_boundary_type = args.boundary_type
 
     # 打印组件诊断信息
     _print_boundary_component_diagnostics(
-        mesh, comp, args.boundary_type, args.boundary_id,
+        mesh, comp, effective_boundary_type, boundary_id,
         args.boundary_neighborhood_depth
     )
 
@@ -1636,7 +1660,7 @@ def visualize_boundary_component(mesh, args):
                     [np.array(list(expanded_faces), dtype=np.int64)]
                 )[0]
 
-                if args.boundary_type == "uncovered":
+                if effective_boundary_type == "uncovered":
                     sub.visual.face_colors = [255, 165, 0, 255]  # 橙色
                 else:
                     sub.visual.face_colors = [144, 238, 144, 255]  # 浅绿
@@ -1655,7 +1679,7 @@ def visualize_boundary_component(mesh, args):
         radius = max(diag * 0.0005, 1e-6)
 
     # 绘制边界边
-    if args.boundary_type == "uncovered":
+    if effective_boundary_type == "uncovered":
         edge_color = [0, 128, 255, 255]   # 蓝色
     else:
         edge_color = [0, 255, 255, 255]   # 青色
@@ -1762,7 +1786,7 @@ def visualize_boundary_component(mesh, args):
 
     # Seifert 曲面
     if getattr(args, 'generate_seifert_surface_strict', False):
-        if args.boundary_type != "healthy":
+        if effective_boundary_type != "healthy":
             print("  警告: --generate-seifert-surface-strict 仅适用于 healthy 孔洞")
         else:
             loop = comp.get("healthy_hole_vertex_indices")
@@ -1825,7 +1849,7 @@ def visualize_boundary_component(mesh, args):
     if args.output:
         scene.export(args.output)
         print(
-            f"边界组件 {args.boundary_id} 可视化已保存至: {args.output}"
+            f"边界组件 {boundary_id} 可视化已保存至: {args.output}"
         )
     if args.show:
         if len(camera_core_points) > 0:
@@ -3182,6 +3206,12 @@ def main():
         type=str,
         default=None,
         help="提取的组件 JSON 输出路径（默认：<输入文件名>_component_<boundary_id>.json）"
+    )
+    parser.add_argument(
+        "--component-package",
+        type=str,
+        default=None,
+        help="加载已提取的组件包 JSON（与 --visualize-boundary-component 配合使用）"
     )
     # 新增：局部边界组件可视化参数（在 --hole-diagnosis 后插入）
     parser.add_argument("--visualize-boundary-component", action="store_true",
