@@ -1245,6 +1245,133 @@ def _generate_initial_seifert_disk(mesh, loop_vertices):
         return None, []
 
 
+def _get_component_neighborhood_mesh(mesh, comp, depth):
+    """获取指定组件邻域子网格（未双面化）。"""
+    face_ids = comp.get("face_ids", [])
+    if not face_ids:
+        return None
+
+    expanded = expand_face_neighborhood(mesh, face_ids, depth)
+    if not expanded:
+        expanded = set(face_ids)
+
+    return mesh.submesh([np.array(sorted(expanded), dtype=np.int64)])[0]
+
+
+def _classify_mesh_edges_and_faces(mesh):
+    """
+    统计网格中的边与面片缺陷类型。
+
+    返回字典：
+        total_edges, open_edges, manifold_edges, nonmanifold_edges
+        total_faces, open_faces, manifold_faces, nonmanifold_faces
+    """
+    defect_stats, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+
+    total_edges = len(mesh.edges_unique)
+    open_edges = defect_stats["open_edges"]
+    nonmanifold_edges = defect_stats["nonmanifold_edges"]
+    manifold_edges = total_edges - open_edges - nonmanifold_edges
+
+    total_faces = len(mesh.faces)
+    open_faces = int(open_face_mask.sum())
+    nonmanifold_faces = int(nonmanifold_face_mask.sum())
+    union_mask = open_face_mask | nonmanifold_face_mask
+    manifold_faces = total_faces - int(union_mask.sum())
+
+    return {
+        "total_edges": total_edges,
+        "open_edges": open_edges,
+        "manifold_edges": manifold_edges,
+        "nonmanifold_edges": nonmanifold_edges,
+        "total_faces": total_faces,
+        "open_faces": open_faces,
+        "manifold_faces": manifold_faces,
+        "nonmanifold_faces": nonmanifold_faces,
+    }
+
+
+def _build_filled_mesh(neighborhood_mesh, seifert_mesh, loop_original_indices,
+                       seifert_boundary_indices):
+    """
+    将邻域网格与 Seifert 曲面合并，使孔洞边界共享同一组顶点。
+
+    loop_original_indices : 孔洞边界在原邻域网格中的顶点索引
+    seifert_boundary_indices : Seifert 曲面中对应 loop 顺序的边界顶点索引
+    """
+    if len(loop_original_indices) != len(seifert_boundary_indices):
+        print("  [WARN] Seifert 边界映射长度不一致，跳过填充对比")
+        return None
+
+    # Seifert 边界顶点 -> 原邻域网格对应顶点
+    seifert_to_orig = {
+        int(seifert_boundary_indices[i]): int(loop_original_indices[i])
+        for i in range(len(loop_original_indices))
+    }
+
+    orig_n = len(neighborhood_mesh.vertices)
+    seifert_faces = np.asarray(seifert_mesh.faces, dtype=np.int64)
+    remapped_faces = []
+
+    for tri in seifert_faces:
+        new_tri = []
+        for vid in tri:
+            vid = int(vid)
+            if vid in seifert_to_orig:
+                new_tri.append(seifert_to_orig[vid])
+            else:
+                new_tri.append(orig_n + vid)
+        remapped_faces.append(new_tri)
+
+    remapped_faces = np.array(remapped_faces, dtype=np.int64)
+    combined_vertices = np.vstack([neighborhood_mesh.vertices, seifert_mesh.vertices])
+    combined_faces = np.vstack([neighborhood_mesh.faces, remapped_faces])
+
+    filled_mesh = trimesh.Trimesh(
+        vertices=combined_vertices,
+        faces=combined_faces,
+        process=False,
+    )
+    return filled_mesh
+
+
+def _print_seifert_fill_comparison(mesh, comp, depth, seifert_mesh,
+                                   loop_original_indices,
+                                   seifert_boundary_indices):
+    """打印 Seifert 曲面填充前后局部邻域缺陷统计对比。"""
+    neighborhood_mesh = _get_component_neighborhood_mesh(mesh, comp, depth)
+    if neighborhood_mesh is None:
+        print("  [WARN] 无法获取邻域网格，跳过 Seifert 填充对比")
+        return
+
+    before = _classify_mesh_edges_and_faces(neighborhood_mesh)
+
+    filled_mesh = _build_filled_mesh(
+        neighborhood_mesh,
+        seifert_mesh,
+        loop_original_indices,
+        seifert_boundary_indices,
+    )
+    if filled_mesh is None:
+        return
+
+    after = _classify_mesh_edges_and_faces(filled_mesh)
+
+    print("  Seifert 曲面局部填充对比（邻域）:")
+    print(f"    开放边:     {before['open_edges']:>6} -> {after['open_edges']:>6}  "
+          f"(变化 {after['open_edges'] - before['open_edges']:+d})")
+    print(f"    流形边:     {before['manifold_edges']:>6} -> {after['manifold_edges']:>6}  "
+          f"(变化 {after['manifold_edges'] - before['manifold_edges']:+d})")
+    print(f"    非流形边:   {before['nonmanifold_edges']:>6} -> {after['nonmanifold_edges']:>6}  "
+          f"(变化 {after['nonmanifold_edges'] - before['nonmanifold_edges']:+d})")
+    print(f"    开放面片:   {before['open_faces']:>6} -> {after['open_faces']:>6}  "
+          f"(变化 {after['open_faces'] - before['open_faces']:+d})")
+    print(f"    流形面片:   {before['manifold_faces']:>6} -> {after['manifold_faces']:>6}  "
+          f"(变化 {after['manifold_faces'] - before['manifold_faces']:+d})")
+    print(f"    非流形面片: {before['nonmanifold_faces']:>6} -> {after['nonmanifold_faces']:>6}  "
+          f"(变化 {after['nonmanifold_faces'] - before['nonmanifold_faces']:+d})")
+
+
 def _build_cotangent_laplacian(mesh):
     """
     构建当前网格的余切权重 Laplacian 矩阵。
@@ -1625,6 +1752,7 @@ def _capture_vedo_camera_info(plotter_or_viewer):
             up = np.asarray(cam.GetViewUp(), dtype=np.float64)
         else:
             up = np.asarray(cam.GetUp(), dtype=np.float64)
+
         view_dir = focal - pos
         dist = float(np.linalg.norm(view_dir))
 
@@ -2000,6 +2128,16 @@ def visualize_boundary_component(mesh, args):
                     seifert_camera_points = np.asarray(
                         seifert_mesh.vertices, dtype=np.float64
                     ).copy()
+
+                    # ===== 新增：局部填充分析 =====
+                    _print_seifert_fill_comparison(
+                        mesh,
+                        comp,
+                        args.boundary_neighborhood_depth,
+                        seifert_mesh,
+                        loop,
+                        boundary_indices,
+                    )
 
                     color = np.array(args.seifert_color, dtype=np.uint8)
                     seifert_mesh.visual.face_colors = np.tile(
