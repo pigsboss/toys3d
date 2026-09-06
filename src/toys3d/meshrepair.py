@@ -12,6 +12,10 @@ import numpy as np
 import trimesh
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import spsolve
+import json
+import argparse
+from pathlib import Path
+from toys3d.geometrics import analyze_mesh_defects
 
 
 def generate_seifert_surface(mesh, hole_vertex_indices,
@@ -534,3 +538,262 @@ def _laplacian_smooth_fixed_boundary(mesh, boundary_vertex_indices,
             break
 
     return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+
+# ---------------------------------------------------------------------------
+# 新增：Seifert 修补整合，并支持命令行入口
+# ---------------------------------------------------------------------------
+
+def apply_seifert_patch_to_mesh(mesh, seifert_mesh,
+                                hole_vertex_indices,
+                                seifert_boundary_indices):
+    """
+    将 Seifert 曲面合并到原始网格中，实现真正的孔洞修补。
+    边界顶点共享原网格索引，内部顶点追加到末尾。
+    """
+    hole_vertex_indices = [int(v) for v in hole_vertex_indices]
+    seifert_boundary_indices = [int(v) for v in seifert_boundary_indices]
+
+    if len(hole_vertex_indices) != len(seifert_boundary_indices):
+        raise ValueError("边界顶点映射长度不一致")
+
+    seifert_to_orig = {
+        seifert_boundary_indices[i]: hole_vertex_indices[i]
+        for i in range(len(hole_vertex_indices))
+    }
+
+    orig_vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    seifert_vertices = np.asarray(seifert_mesh.vertices, dtype=np.float64)
+    seifert_faces = np.asarray(seifert_mesh.faces, dtype=np.int64)
+
+    new_vertices_start = len(orig_vertices)
+    remapped_faces = []
+    for tri in seifert_faces:
+        new_tri = []
+        for vid in tri:
+            vid = int(vid)
+            if vid in seifert_to_orig:
+                new_tri.append(seifert_to_orig[vid])
+            else:
+                new_tri.append(new_vertices_start + vid)
+        remapped_faces.append(new_tri)
+
+    combined_vertices = np.vstack([orig_vertices, seifert_vertices])
+    combined_faces = np.vstack([
+        mesh.faces,
+        np.array(remapped_faces, dtype=np.int64),
+    ])
+
+    repaired = trimesh.Trimesh(
+        vertices=combined_vertices,
+        faces=combined_faces,
+        process=False,
+    )
+    return repaired
+
+
+def compute_global_mesh_stats(mesh):
+    """
+    统计网格全局边/面属性。
+    """
+    defect_stats, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+
+    total_edges = len(mesh.edges_unique)
+    open_edges = defect_stats["open_edges"]
+    nonmanifold_edges = defect_stats["nonmanifold_edges"]
+    manifold_edges = total_edges - open_edges - nonmanifold_edges
+
+    total_faces = len(mesh.faces)
+    open_faces = int(open_face_mask.sum())
+    nonmanifold_faces = int(nonmanifold_face_mask.sum())
+    union_mask = open_face_mask | nonmanifold_face_mask
+    manifold_faces = total_faces - int(union_mask.sum())
+
+    return {
+        "total_edges": total_edges,
+        "open_edges": open_edges,
+        "manifold_edges": manifold_edges,
+        "nonmanifold_edges": nonmanifold_edges,
+        "total_faces": total_faces,
+        "open_faces": open_faces,
+        "manifold_faces": manifold_faces,
+        "nonmanifold_faces": nonmanifold_faces,
+    }
+
+
+def print_global_mesh_stats(label, stats):
+    print(f"  {label}:")
+    print(f"    开放边:     {stats['open_edges']}")
+    print(f"    流形边:     {stats['manifold_edges']}")
+    print(f"    非流形边:   {stats['nonmanifold_edges']}")
+    print(f"    总边数:     {stats['total_edges']}")
+    print(f"    开放面片:   {stats['open_faces']}")
+    print(f"    流形面片:   {stats['manifold_faces']}")
+    print(f"    非流形面片: {stats['nonmanifold_faces']}")
+    print(f"    总面片数:   {stats['total_faces']}")
+
+
+def repair_healthy_hole(mesh, hole, seifert_options=None, verbose=False):
+    """
+    修补单个健康孔洞。
+
+    hole: hole_diagnosis.json 中的 healthy_holes 元素
+    """
+    if seifert_options is None:
+        seifert_options = {}
+
+    hole_id = hole["hole_id"]
+    loop = hole["vertex_indices"]
+
+    if verbose:
+        print(f"修补孔洞 {hole_id}（{len(loop)} 条边）...")
+
+    result = generate_seifert_surface(mesh, loop, **seifert_options)
+    if not result["success"]:
+        if verbose:
+            print(f"  [FAIL] {result['message']}")
+        return None, result["message"]
+
+    repaired = apply_seifert_patch_to_mesh(
+        mesh,
+        result["mesh"],
+        loop,
+        result["boundary_indices"],
+    )
+
+    if verbose:
+        print(f"  [OK] 新增 {len(result['mesh'].faces)} 个面片")
+
+    return repaired, "success"
+
+
+def repair_all_healthy_holes(mesh, healthy_holes, seifert_options=None, verbose=False):
+    """
+    顺序修补所有健康孔洞。
+    返回 (repaired_mesh, repaired_ids, failed_records)
+    """
+    if seifert_options is None:
+        seifert_options = {}
+
+    current_mesh = mesh
+    repaired_ids = []
+    failed_records = []
+
+    for hole in healthy_holes:
+        hole_id = hole["hole_id"]
+        new_mesh, msg = repair_healthy_hole(
+            current_mesh, hole, seifert_options, verbose
+        )
+        if new_mesh is None:
+            failed_records.append({"hole_id": hole_id, "message": msg})
+        else:
+            current_mesh = new_mesh
+            repaired_ids.append(hole_id)
+
+    return current_mesh, repaired_ids, failed_records
+
+
+def _main():
+    parser = argparse.ArgumentParser(
+        description="网格修复工具：对健康孔洞生成并合并 Seifert 极小曲面。"
+    )
+    parser.add_argument("input_file", help="输入网格文件 (ply/stl/obj)")
+    parser.add_argument("output_file", help="输出修补后的网格文件")
+    parser.add_argument(
+        "--hole-diagnosis-dir",
+        default="hole_diagnosis_report",
+        help="hole diagnosis 输出目录（默认 hole_diagnosis_report）",
+    )
+    parser.add_argument(
+        "--hole-id",
+        type=int,
+        default=None,
+        help="指定修补的健康孔洞 ID；不指定则修补所有健康孔洞",
+    )
+    parser.add_argument(
+        "--seifert-optimize-iterations",
+        type=int,
+        default=200,
+    )
+    parser.add_argument(
+        "--seifert-step-size",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--seifert-tolerance",
+        type=float,
+        default=1e-7,
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="打印详细过程",
+    )
+
+    args = parser.parse_args()
+
+    print(f"加载网格: {args.input_file}")
+    mesh = trimesh.load(args.input_file, force="mesh")
+
+    diag_path = Path(args.hole_diagnosis_dir) / "hole_diagnosis.json"
+    if not diag_path.exists():
+        raise FileNotFoundError(f"未找到 {diag_path}")
+
+    with open(diag_path, "r", encoding="utf-8") as f:
+        diag = json.load(f)
+
+    healthy_holes = diag.get("healthy_holes", [])
+    if not healthy_holes:
+        print("未找到健康孔洞，无需修补。")
+        mesh.export(args.output_file)
+        return
+
+    seifert_options = {
+        "optimize_iterations": args.seifert_optimize_iterations,
+        "step_size": args.seifert_step_size,
+        "tol": args.seifert_tolerance,
+        "verbose": args.verbose,
+    }
+
+    print("\n修补前网格统计:")
+    before_stats = compute_global_mesh_stats(mesh)
+    print_global_mesh_stats("修补前", before_stats)
+    print(f"  健康孔洞总数: {len(healthy_holes)}")
+
+    if args.hole_id is not None:
+        hole = next(
+            (h for h in healthy_holes if h["hole_id"] == args.hole_id),
+            None,
+        )
+        if hole is None:
+            raise ValueError(f"未找到 hole_id={args.hole_id} 的健康孔洞")
+        repaired_mesh, msg = repair_healthy_hole(
+            mesh, hole, seifert_options, verbose=args.verbose
+        )
+        if repaired_mesh is None:
+            raise RuntimeError(f"修补失败: {msg}")
+        repaired_ids = [args.hole_id]
+        failed_records = []
+    else:
+        repaired_mesh, repaired_ids, failed_records = repair_all_healthy_holes(
+            mesh, healthy_holes, seifert_options, verbose=args.verbose
+        )
+
+    print("\n修补后网格统计:")
+    after_stats = compute_global_mesh_stats(repaired_mesh)
+    print_global_mesh_stats("修补后", after_stats)
+
+    print(f"\n成功修补孔洞: {repaired_ids}")
+    print(f"剩余健康孔洞: {len(healthy_holes) - len(repaired_ids)}")
+    if failed_records:
+        print("失败记录:")
+        for rec in failed_records:
+            print(f"  hole_id={rec['hole_id']}: {rec['message']}")
+
+    repaired_mesh.export(args.output_file)
+    print(f"\n修补后网格已保存: {args.output_file}")
+
+
+if __name__ == "__main__":
+    _main()
