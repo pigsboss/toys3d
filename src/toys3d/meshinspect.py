@@ -898,25 +898,6 @@ def _generate_component_3d_diagram(component, mesh, output_path):
     plt.close(fig)
 
 
-def _print_boundary_component_diagnostics(mesh, comp, boundary_type, boundary_id, neighborhood_depth):
-    """
-    打印边界组件的简要诊断信息（用于 extract_component_package）。
-    """
-    vertices = comp.get("vertices", [])
-    edges = comp.get("edge_vertex_pairs", [])
-    face_ids = comp.get("face_ids", [])
-
-    print(f"  [{boundary_type} #{boundary_id}] 组件概览 "
-          f"(深度 {neighborhood_depth}):")
-    print(f"    组件顶点数: {len(vertices)}")
-    print(f"    组件边数: {len(edges)}")
-    print(f"    关联面数: {len(face_ids)}")
-    if comp.get("is_cycle"):
-        print("    类型: 闭合健康孔洞环")
-    else:
-        print("    类型: 未覆盖开放边分量")
-
-
 def _build_vertex_face_csr(mesh):
     """
     构建 (n_vertices, n_faces) 的 CSR 矩阵，行内存储包含该顶点的面索引。
@@ -1354,163 +1335,2453 @@ def _build_filled_mesh(neighborhood_mesh, seifert_mesh, loop_original_indices,
     return filled_mesh
 
 
-def _edge_tuple(v0, v1):
-    v0 = int(v0)
-    v1 = int(v1)
-    return (v0, v1) if v0 < v1 else (v1, v0)
-
-
-def _classify_edge_count(cnt):
-    if cnt == 1:
-        return "open"
-    if cnt == 2:
-        return "manifold"
-    return "nonmanifold"
-
-
-def _build_edge_tuple_to_faces(mesh, face_indices=None):
-    """构建 (min_v, max_v) -> 共享面片索引列表 的完整映射，包含开放边。"""
-    faces = np.asarray(mesh.faces, dtype=np.int64)
-    if face_indices is None:
-        face_indices = np.arange(len(faces), dtype=np.int64)
-
-    edge_map = {}
-    for fid in face_indices:
-        fid = int(fid)
-        face = faces[fid]
-        for j in range(3):
-            v0 = int(face[j])
-            v1 = int(face[(j + 1) % 3])
-            key = _edge_tuple(v0, v1)
-            edge_map.setdefault(key, []).append(fid)
-    return edge_map
-
-
-def _print_seifert_fill_comparison(mesh, comp, seifert_mesh,
-                                   loop_original_indices,
-                                   seifert_boundary_indices):
+def _compute_target_face_edge_stats(context_mesh, target_face_indices):
     """
-    打印 Seifert 曲面填充前后，健康孔洞边界边及新增 Seifert 曲面边/面属性统计。
+    在给定上下文网格中，统计指定目标面片集合的边/面缺陷类型。
 
-    仅使用 0 层邻域（组件种子面片）构建局部网格，不引入额外上下文。
+    边的类型由上下文网格中该边被多少个面片使用决定。
+    目标面片的开放/非流形标记也基于其三条边的上下文类型。
     """
-    seed_faces = list(map(int, comp.get("face_ids", [])))
-    if not seed_faces:
-        print("  [WARN] 无法获取组件种子面片，跳过 Seifert 填充对比")
-        return
+    target_face_indices = np.asarray(target_face_indices, dtype=np.int64)
+    if len(target_face_indices) == 0:
+        return {
+            "open_edges": 0,
+            "manifold_edges": 0,
+            "nonmanifold_edges": 0,
+            "open_faces": 0,
+            "manifold_faces": 0,
+            "nonmanifold_faces": 0,
+        }
 
-    # 0 层邻域：只取组件种子面片
-    original_faces = np.asarray(mesh.faces, dtype=np.int64)
-    face_idx_sub = np.array(sorted(seed_faces), dtype=np.int64)
-    sub_faces = original_faces[face_idx_sub]
+    edge_keys, edge_faces = compute_edge_to_faces(context_mesh)
+    edge_to_faces = {int(k): v for k, v in zip(edge_keys, edge_faces)}
+    face_edge_keys = compute_face_edge_keys(context_mesh)
 
-    unique_verts, inverse = np.unique(sub_faces.ravel(), return_inverse=True)
-    local_vertices = mesh.vertices[unique_verts]
-    local_faces = inverse.reshape(-1, 3)
-
-    local_mesh = trimesh.Trimesh(
-        vertices=local_vertices,
-        faces=local_faces,
-        process=False,
+    # 收集目标面片涉及的所有独特边
+    target_edge_keys = np.unique(
+        face_edge_keys[target_face_indices].ravel()
     )
 
-    old_to_new = {
-        int(old_v): int(new_v)
-        for new_v, old_v in enumerate(unique_verts)
-    }
+    open_edges = 0
+    manifold_edges = 0
+    nonmanifold_edges = 0
 
-    loop_local = []
-    for v in loop_original_indices:
-        if int(v) not in old_to_new:
-            print("  [WARN] 孔洞边界顶点不在种子面片中，跳过填充对比")
-            return
-        loop_local.append(old_to_new[int(v)])
+    for key in target_edge_keys:
+        cnt = len(edge_to_faces.get(int(key), []))
+        if cnt == 1:
+            open_edges += 1
+        elif cnt == 2:
+            manifold_edges += 1
+        else:
+            nonmanifold_edges += 1
 
-    if len(loop_local) != len(seifert_boundary_indices):
-        print("  [WARN] Seifert 边界映射长度不一致，跳过填充对比")
-        return
+    open_face_set = set()
+    nonmanifold_face_set = set()
 
-    filled_mesh = _build_filled_mesh(
-        local_mesh,
-        seifert_mesh,
-        loop_local,
-        seifert_boundary_indices,
-    )
-    if filled_mesh is None:
-        return
-
-    # 1) 健康孔洞边界边填充前后属性
-    loop_edge_tuples = []
-    for i in range(len(loop_local)):
-        v0 = loop_local[i]
-        v1 = loop_local[(i + 1) % len(loop_local)]
-        loop_edge_tuples.append(_edge_tuple(v0, v1))
-
-    local_edge_map = _build_edge_tuple_to_faces(local_mesh)
-    filled_edge_map = _build_edge_tuple_to_faces(filled_mesh)
-
-    before = {"open": 0, "manifold": 0, "nonmanifold": 0}
-    after = {"open": 0, "manifold": 0, "nonmanifold": 0}
-
-    for key in loop_edge_tuples:
-        cnt_before = len(local_edge_map.get(key, []))
-        cnt_after = len(filled_edge_map.get(key, []))
-        before[_classify_edge_count(cnt_before)] += 1
-        after[_classify_edge_count(cnt_after)] += 1
-
-    # 2) Seifert 曲面新增边/面属性
-    new_face_start = len(local_mesh.faces)
-    new_face_indices = list(range(new_face_start, len(filled_mesh.faces)))
-
-    new_face_stats = {"open": 0, "manifold": 0, "nonmanifold": 0}
-    new_edge_set = set()
-
-    for fid in new_face_indices:
-        face = filled_mesh.faces[fid]
+    for fid in target_face_indices:
         has_open = False
         has_nonmanifold = False
-
-        for j in range(3):
-            key = _edge_tuple(face[j], face[(j + 1) % 3])
-            new_edge_set.add(key)
-
-            cnt = len(filled_edge_map.get(key, []))
+        for key in face_edge_keys[fid]:
+            cnt = len(edge_to_faces.get(int(key), []))
             if cnt == 1:
                 has_open = True
             elif cnt >= 3:
                 has_nonmanifold = True
 
         if has_open:
-            new_face_stats["open"] += 1
-        elif has_nonmanifold:
-            new_face_stats["nonmanifold"] += 1
+            open_face_set.add(int(fid))
+        if has_nonmanifold:
+            nonmanifold_face_set.add(int(fid))
+
+    total_faces = int(len(target_face_indices))
+    union_defect_faces = open_face_set | nonmanifold_face_set
+    manifold_faces = total_faces - len(union_defect_faces)
+
+    return {
+        "open_edges": int(open_edges),
+        "manifold_edges": int(manifold_edges),
+        "nonmanifold_edges": int(nonmanifold_edges),
+        "open_faces": int(len(open_face_set)),
+        "manifold_faces": int(manifold_faces),
+        "nonmanifold_faces": int(len(nonmanifold_face_set)),
+    }
+
+
+def _print_seifert_fill_comparison(mesh, comp, seifert_mesh,
+                                   loop_original_indices,
+                                   seifert_boundary_indices):
+    """
+    打印 Seifert 曲面填充前后 0 层邻域（组件面片）缺陷统计对比。
+
+    边的类型根据第 1 层邻域上下文判断，避免将局部提取造成的
+    外边界边误判为开放边。
+    """
+    seed_faces = comp.get("face_ids", [])
+    if not seed_faces:
+        print("  [WARN] 无法获取组件种子面片，跳过 Seifert 填充对比")
+        return
+
+    # 第 1 层邻域上下文：种子面片 + 直接邻居
+    context_faces = sorted(
+        expand_face_neighborhood(mesh, set(seed_faces), 2)
+    )
+    if not context_faces:
+        context_faces = sorted(set(seed_faces))
+
+    # 构建上下文子网格，并建立原始面/顶点到局部索引的映射
+    faces_idx = np.array(context_faces, dtype=np.int64)
+    original_faces = np.asarray(mesh.faces, dtype=np.int64)[faces_idx]
+
+    unique_old_vertices = np.unique(original_faces.ravel())
+    old_to_new = {
+        int(old_v): int(new_v)
+        for new_v, old_v in enumerate(unique_old_vertices)
+    }
+
+    context_vertices = mesh.vertices[unique_old_vertices]
+    context_local_faces = np.array(
+        [
+            [old_to_new[int(v)] for v in face]
+            for face in original_faces
+        ],
+        dtype=np.int64,
+    )
+    context_mesh = trimesh.Trimesh(
+        vertices=context_vertices,
+        faces=context_local_faces,
+        process=False,
+    )
+
+    # 种子面片在上下文子网格中的局部索引
+    seed_original_set = set(int(f) for f in seed_faces)
+    seed_local_faces = [
+        local_idx
+        for local_idx, orig_idx in enumerate(faces_idx)
+        if int(orig_idx) in seed_original_set
+    ]
+
+    if not seed_local_faces:
+        print("  [WARN] 种子面片未包含在上下文中，跳过填充对比")
+        return
+
+    # 孔洞边界顶点映射到上下文子网格局部索引
+    loop_local = [
+        old_to_new[int(v)]
+        for v in loop_original_indices
+        if int(v) in old_to_new
+    ]
+    if len(loop_local) != len(loop_original_indices):
+        print("  [WARN] 部分孔洞边界顶点不在上下文子网格中，跳过填充对比")
+        return
+
+    # 填充前统计
+    before = _compute_target_face_edge_stats(
+        context_mesh,
+        seed_local_faces,
+    )
+
+    # 将 Seifert 曲面合并到上下文子网格中
+    filled_context_mesh = _build_filled_mesh(
+        context_mesh,
+        seifert_mesh,
+        loop_local,
+        seifert_boundary_indices,
+    )
+    if filled_context_mesh is None:
+        return
+
+    # 填充后统计（种子面片索引保持不变，因为 Seifert 面片追加在末尾）
+    after = _compute_target_face_edge_stats(
+        filled_context_mesh,
+        seed_local_faces,
+    )
+
+    print("  Seifert 曲面局部填充对比（0层邻域/组件面片，上下文感知）:")
+    print(f"    开放边:     {before['open_edges']:>6} -> {after['open_edges']:>6}  "
+          f"(变化 {after['open_edges'] - before['open_edges']:+d})")
+    print(f"    流形边:     {before['manifold_edges']:>6} -> {after['manifold_edges']:>6}  "
+          f"(变化 {after['manifold_edges'] - before['manifold_edges']:+d})")
+    print(f"    非流形边:   {before['nonmanifold_edges']:>6} -> {after['nonmanifold_edges']:>6}  "
+          f"(变化 {after['nonmanifold_edges'] - before['nonmanifold_edges']:+d})")
+    print(f"    开放面片:   {before['open_faces']:>6} -> {after['open_faces']:>6}  "
+          f"(变化 {after['open_faces'] - before['open_faces']:+d})")
+    print(f"    流形面片:   {before['manifold_faces']:>6} -> {after['manifold_faces']:>6}  "
+          f"(变化 {after['manifold_faces'] - before['manifold_faces']:+d})")
+    print(f"    非流形面片: {before['nonmanifold_faces']:>6} -> {after['nonmanifold_faces']:>6}  "
+          f"(变化 {after['nonmanifold_faces'] - before['nonmanifold_faces']:+d})")
+
+
+def _build_cotangent_laplacian(mesh):
+    """
+    构建当前网格的余切权重 Laplacian 矩阵。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    n_vertices = len(vertices)
+    if n_vertices == 0:
+        return csr_matrix((0, 0))
+
+    row = []
+    col = []
+    data = []
+
+    for fid, face in enumerate(faces):
+        tri = vertices[face]
+        a, b, c = tri[0], tri[1], tri[2]
+
+        def angle_at(p, q, r):
+            v1 = q - p
+            v2 = r - p
+            dot = np.dot(v1, v2)
+            denom = np.linalg.norm(v1) * np.linalg.norm(v2)
+            if denom < 1e-12:
+                return 0.0
+            cos_angle = np.clip(dot / denom, -1.0, 1.0)
+            return float(np.arccos(cos_angle))
+
+        alpha = angle_at(a, b, c)
+        beta = angle_at(b, c, a)
+        gamma = angle_at(c, a, b)
+
+        def add_weight(e0, e1, w):
+            if w == 0:
+                return
+            row.append(e0)
+            col.append(e1)
+            data.append(w)
+            row.append(e1)
+            col.append(e0)
+            data.append(w)
+
+        # edges are (v0,v1), (v1,v2), (v2,v0)
+        e0 = (int(face[1]), int(face[2])) if face[1] < face[2] else (int(face[2]), int(face[1]))
+        e1 = (int(face[2]), int(face[0])) if face[2] < face[0] else (int(face[0]), int(face[2]))
+        e2 = (int(face[0]), int(face[1])) if face[0] < face[1] else (int(face[1]), int(face[0]))
+
+        cot_alpha = 1.0 / np.tan(alpha) if abs(np.tan(alpha)) > 1e-12 else 0.0
+        cot_beta = 1.0 / np.tan(beta) if abs(np.tan(beta)) > 1e-12 else 0.0
+        cot_gamma = 1.0 / np.tan(gamma) if abs(np.tan(gamma)) > 1e-12 else 0.0
+
+        # Cot weight for edge opposite to alpha (AC?)
+        add_weight(e0[0], e0[1], cot_alpha)
+        add_weight(e1[0], e1[1], cot_beta)
+        add_weight(e2[0], e2[1], cot_gamma)
+
+    if not row:
+        return csr_matrix((n_vertices, n_vertices))
+
+    L = csr_matrix(
+        (np.array(data, dtype=np.float64), (np.array(row, dtype=np.int64), np.array(col, dtype=np.int64))),
+        shape=(n_vertices, n_vertices),
+    )
+
+    row_sums = np.asarray(L.sum(axis=1)).ravel()
+    L = L - csr_matrix(
+        (row_sums, (np.arange(n_vertices), np.arange(n_vertices))),
+        shape=(n_vertices, n_vertices),
+    )
+
+    return L
+
+
+def _laplacian_smooth_fixed_boundary(mesh, boundary_vertex_indices, iterations=200, step_size=1.0, tol=1e-7):
+    """
+    固定边界顶点，内部顶点按离散 Plateau 问题迭代求解。
+    """
+    from scipy.sparse.linalg import spsolve
+
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    vertices = mesh.vertices.copy()
+    n_vertices = len(vertices)
+    boundary_set = set(int(v) for v in boundary_vertex_indices)
+
+    if n_vertices == 0 or len(faces) == 0:
+        return mesh.copy()
+
+    all_indices = np.arange(n_vertices, dtype=np.int64)
+    interior_indices = np.array(
+        [i for i in all_indices if int(i) not in boundary_set],
+        dtype=np.int64,
+    )
+    boundary_indices = np.array(sorted(boundary_set), dtype=np.int64)
+
+    if len(interior_indices) == 0:
+        return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    step_size = float(np.clip(step_size, 0.0, 1.0))
+
+    for it in range(iterations):
+        current = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        L = _build_cotangent_laplacian(current)
+
+        Lint = L[interior_indices, :][:, interior_indices].tocsr()
+        Lbnd = L[interior_indices, :][:, boundary_indices].tocsr()
+
+        n_int = len(interior_indices)
+        eps_reg = 1e-10
+        Lint = Lint + csr_matrix(np.eye(n_int, dtype=np.float64) * eps_reg)
+
+        rhs = -Lbnd @ vertices[boundary_indices]
+        sol = spsolve(Lint, rhs)
+
+        new_vertices = vertices.copy()
+        new_vertices[interior_indices] = (
+            vertices[interior_indices] + step_size * (sol - vertices[interior_indices])
+        )
+
+        moves = np.linalg.norm(
+            new_vertices[interior_indices] - vertices[interior_indices],
+            axis=1,
+        )
+        max_move = float(np.max(moves)) if len(moves) > 0 else 0.0
+        vertices = new_vertices
+
+        if max_move < tol:
+            print(f"    Seifert 优化在第 {it+1} 次迭代收敛，最大位移 {max_move:.6e}")
+            break
+
+    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+
+def _compute_curvature_statistics(mesh, boundary_vertex_indices):
+    """
+    计算 Seifert 曲面内部顶点的离散曲率统计。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    n_vertices = len(vertices)
+    boundary_set = set(int(v) for v in boundary_vertex_indices)
+
+    L = _build_cotangent_laplacian(mesh)
+
+    area_faces = mesh.area_faces
+    vertex_areas = np.bincount(
+        faces.ravel(),
+        weights=np.repeat(area_faces, 3),
+        minlength=n_vertices,
+    ) / 3.0
+    vertex_areas[vertex_areas < 1e-12] = 1.0
+
+    Hn = L @ vertices
+    H_mag = np.linalg.norm(Hn, axis=1) / (2.0 * vertex_areas)
+
+    angle_sum = np.zeros(n_vertices, dtype=np.float64)
+    for face in faces:
+        tri = vertices[face]
+        for j in range(3):
+            v_idx = int(face[j])
+            p = tri[j]
+            q = tri[(j + 1) % 3]
+            r = tri[(j + 2) % 3]
+            v1 = q - p
+            v2 = r - p
+            dot = np.dot(v1, v2)
+            denom = np.linalg.norm(v1) * np.linalg.norm(v2)
+            if denom < 1e-12:
+                angle = 0.0
+            else:
+                cos_angle = np.clip(dot / denom, -1.0, 1.0)
+                angle = float(np.arccos(cos_angle))
+            angle_sum[v_idx] += angle
+    K = (2.0 * np.pi - angle_sum) / vertex_areas
+
+    interior_mask = np.array([i not in boundary_set for i in range(n_vertices)], dtype=bool)
+    if not np.any(interior_mask):
+        interior_mask = np.ones(n_vertices, dtype=bool)
+
+    H_int = H_mag[interior_mask]
+    K_int = K[interior_mask]
+
+    stats = {
+        "mean_abs_mean_curvature": float(np.mean(H_int)),
+        "median_abs_mean_curvature": float(np.median(H_int)),
+        "max_abs_mean_curvature": float(np.max(H_int)),
+        "p95_abs_mean_curvature": float(np.percentile(H_int, 95)),
+        "std_abs_mean_curvature": float(np.std(H_int)),
+        "mean_gaussian_curvature": float(np.mean(K_int)),
+        "median_gaussian_curvature": float(np.median(K_int)),
+        "max_gaussian_curvature": float(np.max(K_int)),
+        "min_gaussian_curvature": float(np.min(K_int)),
+        "area": float(mesh.area),
+        "perimeter": float(np.sum(np.linalg.norm(
+            vertices[boundary_vertex_indices] -
+            np.roll(vertices[boundary_vertex_indices], -1, axis=0), axis=1))),
+    }
+    return stats
+
+
+def _print_boundary_component_diagnostics(mesh, comp, boundary_type, boundary_id, neighborhood_depth):
+    """
+    打印指定边界组件/健康孔洞的基础诊断信息。
+    """
+    print(f"\n[DIAGNOSTICS] 可视化原始网格组件 (boundary_id={boundary_id}, type={boundary_type})")
+
+    edges = comp.get("edge_vertex_pairs", [])
+    vertices_set = set()
+    for v0, v1 in edges:
+        vertices_set.add(int(v0))
+        vertices_set.add(int(v1))
+
+    print(f"  边界边数: {len(edges)}")
+    print(f"  边界顶点数: {len(vertices_set)}")
+
+    # 顶点度数分布
+    degree = Counter()
+    for v0, v1 in edges:
+        degree[int(v0)] += 1
+        degree[int(v1)] += 1
+
+    deg1 = sum(1 for d in degree.values() if d == 1)
+    deg2 = sum(1 for d in degree.values() if d == 2)
+    deg3plus = sum(1 for d in degree.values() if d >= 3)
+    print(f"  度为1的顶点数: {deg1}")
+    print(f"  度为2的顶点数: {deg2}")
+    print(f"  度为3及以上的顶点数: {deg3plus}")
+
+    seed_faces = comp.get("face_ids", [])
+    print(f"  种子面片数: {len(seed_faces)}")
+
+    if neighborhood_depth > 0:
+        print("  邻域面片距离分布（距离0=种子面片）:")
+        max_display = min(neighborhood_depth, 20)  # 最多显示到20层
+        prev_set = set(seed_faces)
+        print(f"    距离 0: {len(prev_set)}")
+        for d in range(1, max_display + 1):
+            cur_set = expand_face_neighborhood(mesh, seed_faces, d + 1)
+            new_count = len(cur_set - prev_set)
+            print(f"    距离 {d}: {new_count}")
+            prev_set = cur_set
+
+
+def print_scene_debug_info(scene, title="Scene Debug Info"):
+    """
+    打印场景中所有几何对象的名称、类型、尺寸与包围盒。
+    """
+    print_separator(title)
+
+    geometry_items = list(scene.geometry.items())
+    if not geometry_items:
+        print("  scene is empty")
+        return
+
+    print(f"  geometry count: {len(geometry_items)}")
+
+    scene_bounds = None
+    for i, (name, geom) in enumerate(geometry_items):
+        geom_type = type(geom).__name__
+
+        n_vertices = len(getattr(geom, "vertices", [])) if hasattr(geom, "vertices") else 0
+        n_faces = len(getattr(geom, "faces", [])) if hasattr(geom, "faces") else 0
+
+        try:
+            bounds = geom.bounds
+        except Exception:
+            bounds = None
+
+        if bounds is not None:
+            bmin = bounds[0]
+            bmax = bounds[1]
+            extents = bmax - bmin
+            center = (bmin + bmax) / 2.0
+            diag = float(np.linalg.norm(extents))
         else:
-            new_face_stats["manifold"] += 1
+            bmin = np.zeros(3)
+            bmax = np.zeros(3)
+            extents = np.zeros(3)
+            center = np.zeros(3)
+            diag = 0.0
 
-    new_edge_stats = {"open": 0, "manifold": 0, "nonmanifold": 0}
-    for key in new_edge_set:
-        cnt = len(filled_edge_map.get(key, []))
-        new_edge_stats[_classify_edge_count(cnt)] += 1
+        print(f"  [{i}] name={name}")
+        print(f"      type={geom_type}")
+        print(f"      vertices={n_vertices}, faces={n_faces}")
+        print(f"      bounds.min=[{bmin[0]:.6f}, {bmin[1]:.6f}, {bmin[2]:.6f}]")
+        print(f"      bounds.max=[{bmax[0]:.6f}, {bmax[1]:.6f}, {bmax[2]:.6f}]")
+        print(f"      extents=[{extents[0]:.6f}, {extents[1]:.6f}, {extents[2]:.6f}]")
+        print(f"      center=[{center[0]:.6f}, {center[1]:.6f}, {center[2]:.6f}]")
+        print(f"      diagonal={diag:.6f}")
 
-    print("  Seifert 曲面局部填充对比（0层邻域）:")
-    print(
-        f"    健康孔洞边界边: "
-        f"开放={before['open']} -> {after['open']}, "
-        f"流形={before['manifold']} -> {after['manifold']}, "
-        f"非流形={before['nonmanifold']} -> {after['nonmanifold']}"
-    )
-    print(
-        f"    新增 Seifert 面片: {len(new_face_indices)} 个 "
-        f"(开放={new_face_stats['open']}, "
-        f"流形={new_face_stats['manifold']}, "
-        f"非流形={new_face_stats['nonmanifold']})"
-    )
-    print(
-        f"    新增 Seifert 唯一边: {len(new_edge_set)} 条 "
-        f"(开放={new_edge_stats['open']}, "
-        f"流形={new_edge_stats['manifold']}, "
-        f"非流形={new_edge_stats['nonmanifold']})"
+        if bounds is not None:
+            if scene_bounds is None:
+                scene_bounds = bounds.copy()
+            else:
+                scene_bounds[0] = np.minimum(scene_bounds[0], bmin)
+                scene_bounds[1] = np.maximum(scene_bounds[1], bmax)
+
+    if scene_bounds is not None:
+        sbmin = scene_bounds[0]
+        sbmax = scene_bounds[1]
+        sext = sbmax - sbmin
+        scent = (sbmin + sbmax) / 2.0
+        sdiag = float(np.linalg.norm(sext))
+        print("  [scene]")
+        print(f"      bounds.min=[{sbmin[0]:.6f}, {sbmin[1]:.6f}, {sbmin[2]:.6f}]")
+        print(f"      bounds.max=[{sbmax[0]:.6f}, {sbmax[1]:.6f}, {sbmax[2]:.6f}]")
+        print(f"      extents=[{sext[0]:.6f}, {sext[1]:.6f}, {sext[2]:.6f}]")
+        print(f"      center=[{scent[0]:.6f}, {scent[1]:.6f}, {scent[2]:.6f}]")
+        print(f"      diagonal={sdiag:.6f}")
+
+
+def _normalize_vector(v):
+    v = np.asarray(v, dtype=np.float64)
+    n = np.linalg.norm(v)
+    return v if n < 1e-12 else v / n
+
+
+def _print_camera_info(info):
+    """命令行打印摄像机信息。"""
+    print("\n[Camera Info]")
+    ws = info.get("window_size")
+    if ws:
+        print(f"  window_size:        {ws[0]} x {ws[1]}")
+
+    if "camera_position_display" in info:
+        c = info["camera_position_display"]
+        print(f"  camera_position (display): [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
+    if "focal_point_display" in info:
+        c = info["focal_point_display"]
+        print(f"  focal_point (display):     [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
+    if "view_up" in info:
+        c = info["view_up"]
+        print(f"  view_up:            [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
+    if "view_direction" in info:
+        c = info["view_direction"]
+        print(f"  view_direction:     [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
+    if "camera_distance" in info:
+        print(f"  camera_distance:    {info['camera_distance']:.6f}")
+    if "clipping_range" in info:
+        c = info["clipping_range"]
+        print(f"  clipping_range:     [{c[0]:.6f}, {c[1]:.6f}]")
+
+    if "scene_translation" in info:
+        c = info["scene_translation"]
+        print(f"  scene_translation:  [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
+
+    if "camera_position_world" in info:
+        c = info["camera_position_world"]
+        print(f"  camera_position (world):   [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
+    if "focal_point_world" in info:
+        c = info["focal_point_world"]
+        print(f"  focal_point (world):       [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
+
+    err = info.get("error")
+    if err:
+        print(f"  [ERROR] {err}")
+
+
+def _capture_vedo_camera_info(plotter_or_viewer):
+    """从 vedo Plotter 或 trimesh vedo viewer 捕获相机/窗口信息。"""
+    info = {}
+    try:
+        # 兼容 trimesh VedoViewer（有 .plotter）和 vedo Plotter 本身
+        plt = getattr(plotter_or_viewer, "plotter", plotter_or_viewer)
+
+        win = getattr(plt, "window", None)
+        if win is not None:
+            sz = win.GetSize()
+            info["window_size"] = [int(sz[0]), int(sz[1])]
+
+        cam = getattr(plt, "camera", None)
+        if cam is None:
+            return {"error": "plotter has no camera"}
+
+        pos = np.asarray(cam.GetPosition(), dtype=np.float64)
+        focal = np.asarray(cam.GetFocalPoint(), dtype=np.float64)
+        # vtkOpenGLCamera (vedo 2026+) 没有 GetUp，使用 GetViewUp
+        if hasattr(cam, "GetViewUp"):
+            up = np.asarray(cam.GetViewUp(), dtype=np.float64)
+        else:
+            up = np.asarray(cam.GetUp(), dtype=np.float64)
+
+        view_dir = focal - pos
+        dist = float(np.linalg.norm(view_dir))
+
+        info["camera_position_display"] = pos.tolist()
+        info["focal_point_display"] = focal.tolist()
+        info["view_up"] = up.tolist()
+        info["view_direction"] = _normalize_vector(view_dir).tolist()
+        info["camera_distance"] = dist
+
+        cr = cam.GetClippingRange()
+        info["clipping_range"] = [float(cr[0]), float(cr[1])]
+
+    except Exception as e:
+        info["error"] = str(e)
+
+    return info
+
+
+def _try_get_trimesh_vedo_viewer():
+    """尝试导入 trimesh 内置的 VedoViewer（旧版本才有）。"""
+    for module_path in ("trimesh.viewers.vedo_viewer", "trimesh.viewer.vedo_viewer"):
+        try:
+            mod = __import__(module_path, fromlist=["VedoViewer"])
+            return getattr(mod, "VedoViewer", None)
+        except Exception:
+            continue
+    return None
+
+
+def _show_scene_with_vedo(scene):
+    """使用 vedo 直接显示 trimesh.Scene，并返回相机信息。"""
+    import vedo
+
+    merged = scene.to_geometry()
+    actor = vedo.Mesh(merged)
+
+    if (hasattr(merged.visual, "face_colors") and
+            merged.visual.face_colors.shape[0] == len(merged.faces)):
+        colors = np.asarray(merged.visual.face_colors)
+        actor.cellcolors = colors[:, :3]
+
+    plt = vedo.Plotter()
+    plt.show(actor, interactive=True)
+
+    return _capture_vedo_camera_info(plt)
+
+
+def _show_scene_with_camera_info(scene, args, scene_translation=None):
+    """
+    统一封装 scene.show()，支持在窗口关闭后捕获并打印相机信息。
+    """
+    if not (args.print_camera_info or args.camera_info_output):
+        scene.show()
+        return
+
+    info = None
+
+    # 1. 旧版 trimesh 有 VedoViewer，优先使用
+    VedoViewer = _try_get_trimesh_vedo_viewer()
+    if VedoViewer is not None:
+        class _CameraInfoViewer(VedoViewer):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.camera_info = None
+
+            def show(self, **kw):
+                result = super().show(**kw)
+                self.camera_info = _capture_vedo_camera_info(self)
+                return result
+
+        viewer = _CameraInfoViewer(scene)
+        viewer.show()
+        info = viewer.camera_info or {}
+
+    # 2. trimesh 4.x 没有 viewer 模块，直接用 vedo
+    else:
+        try:
+            info = _show_scene_with_vedo(scene)
+        except ImportError as e:
+            print(f"[WARN] vedo 未安装，无法捕获相机信息: {e}")
+            scene.show()
+            return
+        except Exception as e:
+            print(f"[WARN] vedo 直接显示失败: {e}")
+            scene.show()
+            return
+
+    if info and scene_translation is not None and "error" not in info:
+        t = np.asarray(scene_translation, dtype=np.float64)
+        if "camera_position_display" in info:
+            info["camera_position_world"] = (
+                np.asarray(info["camera_position_display"]) - t
+            ).tolist()
+        if "focal_point_display" in info:
+            info["focal_point_world"] = (
+                np.asarray(info["focal_point_display"]) - t
+            ).tolist()
+        info["scene_translation"] = t.tolist()
+
+    if info:
+        _print_camera_info(info)
+        if args.camera_info_output:
+            out = Path(args.camera_info_output)
+            out.write_text(
+                json.dumps(info, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            print(f"相机信息已保存: {out}")
+
+
+def _filter_camera_core_points(points):
+    """
+    根据中位数绝对偏差过滤离群点，避免个别原点/错误点拉偏相机。
+    """
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3 or len(points) < 4:
+        return points
+
+    med = np.median(points, axis=0)
+    dist = np.linalg.norm(points - med, axis=1)
+    med_dist = np.median(dist)
+
+    if med_dist < 1e-12:
+        return points
+
+    ratio = dist / med_dist
+    kept = ratio <= 3.0
+    return points[kept]
+
+
+def visualize_boundary_component(mesh, args):
+    """
+    可视化健康孔洞或未覆盖开放边分量及其局部三角面片。
+    默认不显示整个网格，只显示目标边界和指定邻域深度内的面片。
+    """
+    boundary_id = args.boundary_id
+
+    if args.component_package:
+        package_path = Path(args.component_package)
+        if not package_path.exists():
+            raise FileNotFoundError(f"未找到组件包文件: {package_path}")
+
+        with open(package_path, "r", encoding="utf-8") as f:
+            package_data = json.load(f)
+
+        comp = package_data.get("component", {})
+        effective_boundary_type = package_data.get("boundary_type", args.boundary_type)
+        boundary_id = package_data.get("boundary_id", args.boundary_id)
+
+        # 确保必要字段存在
+        comp.setdefault("edge_vertex_pairs", [])
+        comp.setdefault("vertices", [])
+        comp.setdefault("face_ids", [])
+        comp.setdefault("endpoints", [])
+        comp.setdefault("branch_vertices", [])
+        comp.setdefault("candidate_breaks", [])
+        comp.setdefault("healthy_hole_vertex_indices", [])
+    else:
+        comp = load_boundary_component_data(
+            args.boundary_data_dir,
+            args.boundary_id,
+            args.boundary_type,
+        )
+        effective_boundary_type = args.boundary_type
+
+    # 打印组件诊断信息
+    _print_boundary_component_diagnostics(
+        mesh, comp, effective_boundary_type, boundary_id,
+        args.boundary_neighborhood_depth
     )
 
-# [The remaining file content continues unchanged from the original file.]
-# (...)
+    # 优先使用当前边集导出的顶点，避免 hole_diagnosis.json 中旧索引/异常索引
+    focus_indices = comp.get("vertices")
+
+    if not focus_indices:
+        focus_indices = comp.get("healthy_hole_vertex_indices", [])
+
+    if not focus_indices:
+        focus_indices = comp.get("endpoints", [])
+
+    # 核心取景点集：优先为健康孔洞边界顶点，其次组件顶点/端点
+    boundary_camera_points = []
+    seifert_camera_points = []
+
+    if focus_indices:
+        focus_points = mesh.vertices[np.asarray(focus_indices, dtype=np.int64)]
+        boundary_camera_points = focus_points.copy()
+
+    scene = trimesh.Scene()
+
+    # 可选：显示半透明原始网格
+    if args.boundary_show_original:
+        vis_mesh = mesh.copy()
+        # 赋予统一半透明颜色（确保存在 face_colors）
+        alpha_uint8 = int(0.3 * 255)
+        vis_mesh.visual.face_colors = np.full(
+            (len(vis_mesh.faces), 4),
+            [200, 200, 200, alpha_uint8],
+            dtype=np.uint8,
+        )
+        # 双面显示原始网格背景
+        if args.double_sided:
+            vis_mesh = make_double_sided(vis_mesh)
+        scene.add_geometry(vis_mesh)
+
+    # 根据邻域深度显示相关三角面片
+    if args.boundary_neighborhood_depth > 0:
+        face_ids = comp.get("face_ids", [])
+        if face_ids:
+            expanded_faces = expand_face_neighborhood(
+                mesh, face_ids, args.boundary_neighborhood_depth
+            )
+            if expanded_faces:
+                sub = mesh.submesh(
+                    [np.array(list(expanded_faces), dtype=np.int64)]
+                )[0]
+
+                if effective_boundary_type == "uncovered":
+                    sub.visual.face_colors = [255, 165, 0, 255]  # 橙色
+                else:
+                    sub.visual.face_colors = [144, 238, 144, 255]  # 浅绿
+
+                # 双面显示相关三角面片
+                if args.double_sided:
+                    sub = make_double_sided(sub)
+
+                scene.add_geometry(sub)
+
+    # 计算默认圆柱半径
+    radius = args.boundary_radius
+    if radius is None or radius <= 0:
+        bounds = mesh.bounds
+        diag = np.linalg.norm(bounds[1] - bounds[0])
+        radius = max(diag * 0.0005, 1e-6)
+
+    # 绘制边界边
+    if effective_boundary_type == "uncovered":
+        edge_color = [0, 128, 255, 255]   # 蓝色
+    else:
+        edge_color = [0, 255, 255, 255]   # 青色
+
+    for v0, v1 in comp["edge_vertex_pairs"]:
+        seg = trimesh.creation.cylinder(
+            radius=radius,
+            segment=[mesh.vertices[v0], mesh.vertices[v1]],
+            sections=4,
+        )
+        seg.visual.face_colors = edge_color
+        scene.add_geometry(seg)
+
+    # 绘制最小包络流形边界（若存在）
+    enclosing = comp.get("minimal_enclosing_boundary", {})
+    if enclosing.get("success"):
+        enclosing_vertices = enclosing.get("boundary_vertices", [])
+        enclosing_radius = radius * 1.5   # 稍粗，更醒目
+
+        for loop_verts in enclosing_vertices:
+            for i in range(len(loop_verts) - 1):
+                v0 = loop_verts[i]
+                v1 = loop_verts[i + 1]
+                seg = trimesh.creation.cylinder(
+                    radius=enclosing_radius,
+                    segment=[mesh.vertices[v0], mesh.vertices[v1]],
+                    sections=6,
+                )
+                seg.visual.face_colors = [255, 0, 255, 255]  # 洋红色
+                scene.add_geometry(seg)
+
+    # 拟合水密包络曲面并显示交线
+    if args.fit_watertight_patch:
+        print("拟合水密包络曲面...")
+        patch_result = fit_watertight_patch_from_component(
+            mesh,
+            comp,
+            method=args.patch_method,
+            neighborhood_depth=args.patch_neighborhood_depth,
+            poisson_depth=args.patch_poisson_depth,
+            density_quantile=args.patch_density_quantile,
+            alpha=args.patch_alpha,
+            allow_non_genus0=args.allow_non_genus0,
+        )
+        if patch_result["success"]:
+            watertight_mesh = patch_result["watertight_mesh"]
+            intersection_vertices = patch_result["intersection_vertices"]
+            intersection_edges = patch_result["intersection_edges"]
+
+            # 显示拟合曲面（半透明青色）
+            # 使用用户指定的不透明度，并支持双面渲染避免背面剔除导致的结构透视
+            alpha = int(np.clip(args.patch_opacity, 0.0, 1.0) * 255)
+            watertight_mesh.visual.face_colors = np.full(
+                (len(watertight_mesh.faces), 4),
+                [0, 200, 200, alpha],
+                dtype=np.uint8,
+            )
+            if args.double_sided:
+                watertight_mesh = make_double_sided(watertight_mesh)
+            scene.add_geometry(watertight_mesh)
+
+            # 显示交线（洋红色圆柱）
+            for edge in intersection_edges:
+                p0 = intersection_vertices[edge[0]]
+                p1 = intersection_vertices[edge[1]]
+                seg = trimesh.creation.cylinder(
+                    radius=radius * 1.2,
+                    segment=[p0, p1],
+                    sections=5,
+                )
+                seg.visual.face_colors = [255, 0, 255, 255]
+                scene.add_geometry(seg)
+
+            print(f"  拟合成功：交线 {len(intersection_vertices)} 个顶点，"
+                  f"{len(intersection_edges)} 条边")
+        else:
+            print(f"  [WARN] 水密包络拟合失败: {patch_result['message']}")
+
+    # 端点（绿色球）
+    for v in comp.get("endpoints", []):
+        sphere = trimesh.creation.icosphere(subdivisions=1, radius=radius * 2.0)
+        sphere.apply_translation(mesh.vertices[v])
+        sphere.visual.face_colors = [0, 255, 0, 255]
+        scene.add_geometry(sphere)
+
+    # 分支点（红色球）
+    for v in comp.get("branch_vertices", []):
+        sphere = trimesh.creation.icosphere(subdivisions=1, radius=radius * 2.0)
+        sphere.apply_translation(mesh.vertices[v])
+        sphere.visual.face_colors = [255, 0, 0, 255]
+        scene.add_geometry(sphere)
+
+    # 候选断裂点对（橙色虚线，用细圆柱表示）
+    for cand in comp.get("candidate_breaks", []):
+        p0 = mesh.vertices[cand["v0"]]
+        p1 = mesh.vertices[cand["v1"]]
+        seg = trimesh.creation.cylinder(
+            radius=radius * 0.8,
+            segment=[p0, p1],
+            sections=4,
+        )
+        seg.visual.face_colors = [255, 165, 0, 255]
+        scene.add_geometry(seg)
+
+    # Seifert 曲面
+    if getattr(args, 'generate_seifert_surface', False):
+        if effective_boundary_type != "healthy":
+            print("  警告: --generate-seifert-surface 仅适用于 healthy 孔洞")
+        else:
+            loop = comp.get("healthy_hole_vertex_indices")
+            if not loop:
+                # 从 edge_vertex_pairs 恢复环
+                edge_pairs = comp.get("edge_vertex_pairs", [])
+                if edge_pairs:
+                    import warnings
+                    # 简化恢复：取所有边的顶点并排序？但这里直接用边构建邻接并遍历
+                    # 可以省略，因为健康孔洞 JSON 中应已有 vertex_indices
+                    print("  [WARN] 未找到 healthy_hole_vertex_indices")
+                else:
+                    print("  [WARN] 未找到任何边界信息")
+                loop = []
+            if loop and len(loop) >= 3:
+                print("生成 Seifert 曲面...")
+                disk_mesh, boundary_indices = _generate_initial_seifert_disk(mesh, loop)
+                if disk_mesh is None:
+                    print("  [WARN] 无法生成初始圆盘")
+                else:
+                    seifert_mesh = _laplacian_smooth_fixed_boundary(
+                        disk_mesh,
+                        boundary_indices,
+                        iterations=args.seifert_optimize_iterations,
+                        step_size=args.seifert_step_size,
+                        tol=args.seifert_tolerance,
+                    )
+                    # 仅将 Seifert 顶点用于扩大取景半径，不参与相机中心计算
+                    seifert_camera_points = np.asarray(
+                        seifert_mesh.vertices, dtype=np.float64
+                    ).copy()
+
+                    # ===== 新增：局部填充分析 =====
+                    _print_seifert_fill_comparison(
+                        mesh,
+                        comp,
+                        seifert_mesh,
+                        loop,
+                        boundary_indices,
+                    )
+
+                    color = np.array(args.seifert_color, dtype=np.uint8)
+                    seifert_mesh.visual.face_colors = np.tile(
+                        color, (len(seifert_mesh.faces), 1)
+                    )
+                    if args.double_sided:
+                        seifert_mesh = make_double_sided(seifert_mesh)
+                    scene.add_geometry(seifert_mesh)
+                    print(f"  Seifert 曲面已生成: {len(seifert_mesh.faces)} 个三角面片")
+                    if args.seifert_curvature_report:
+                        stats = _compute_curvature_statistics(
+                            seifert_mesh, boundary_indices
+                        )
+                        print("  Seifert 曲面曲率统计:")
+                        for k, v in stats.items():
+                            print(f"    {k}: {v:.6f}")
+            else:
+                print("  [WARN] 未找到有效的健康孔洞边界环")
+
+    if getattr(args, "debug_scene", False):
+        print_scene_debug_info(scene, title="Boundary Component Scene Debug Info")
+
+    if args.output:
+        scene.export(args.output)
+        print(
+            f"边界组件 {boundary_id} 可视化已保存至: {args.output}"
+        )
+
+    camera_center = None
+    if args.show:
+        show_scene = scene
+
+        if len(boundary_camera_points) > 0:
+            try:
+                boundary_pts = np.asarray(boundary_camera_points, dtype=np.float64)
+                camera_center = boundary_pts.mean(axis=0)
+
+                # 将孔洞中心平移到原点，让 viewer 的默认旋转中心固定为原点
+                show_scene = scene.copy()
+                show_scene.apply_translation(-camera_center)
+
+                if getattr(args, "debug_scene", False):
+                    print("  [camera] translated scene center:",
+                          f"({camera_center[0]:.6f}, {camera_center[1]:.6f}, {camera_center[2]:.6f})")
+                    print("  [camera] using origin-centered scene for viewer")
+
+            except Exception as e:
+                print(f"[WARN] 场景中心平移失败: {e}")
+
+        os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
+        _show_scene_with_camera_info(
+            show_scene,
+            args,
+            scene_translation=-camera_center,
+        )
+
+
+def run_full_diagnosis_pass1(mesh, output_dir, valence_threshold=5):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n=== Full Diagnosis Pass 1 ===")
+    print("分析网格缺陷...")
+    _, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+    abnormal_mask = open_face_mask | nonmanifold_face_mask
+    abnormal_indices = np.where(abnormal_mask)[0]
+
+    print(f"异常面片总数: {len(abnormal_indices)}")
+
+    vertex_face_counts = compute_vertex_face_counts(mesh)
+    face_edge_types = compute_face_edge_types(mesh)
+
+    # 计算所有面片的拓扑编码
+    all_face_indices = np.arange(len(mesh.faces))
+    codes_all, _, _ = compute_face_topology_codes(
+        mesh, all_face_indices, vertex_face_counts, face_edge_types
+    )
+    save_codes(codes_all, output_dir / "face_codes.npy")
+
+    if len(abnormal_indices) == 0:
+        # 创建空的分类 JSON 和 checkpoint
+        empty_classes = {
+            "valence_threshold": valence_threshold,
+            "total_abnormal_faces": 0,
+            "classes": {}
+        }
+        with open(output_dir / "abnormal_truncated_classes.json", "w") as f:
+            json.dump(empty_classes, f, indent=2)
+        checkpoint = {
+            "valence_threshold": valence_threshold,
+            "classes": {},
+            "total_classes": 0,
+            "abnormal_count": 0
+        }
+        with open(output_dir / "checkpoint.json", "w") as f:
+            json.dump(checkpoint, f, indent=2)
+        return {}, abnormal_indices
+
+    # 对异常面片进行截断聚类
+    print("截断聚类异常面片...")
+    grouped = group_faces_by_topology_codes(
+        mesh, abnormal_indices, vertex_face_counts, face_edge_types,
+        valence_threshold=valence_threshold
+    )
+
+    class_faces = {}
+    classes_json = {}
+    for key, face_list in grouped.items():
+        hex_code = code_to_hex(key)
+        class_faces[hex_code] = face_list
+        classes_json[hex_code] = {
+            "face_indices": face_list.tolist(),
+            "count": int(len(face_list)),
+            "status": "pending"
+        }
+
+    abnormal_data = {
+        "valence_threshold": valence_threshold,
+        "total_abnormal_faces": int(len(abnormal_indices)),
+        "classes": classes_json
+    }
+    with open(output_dir / "abnormal_truncated_classes.json", "w") as f:
+        json.dump(abnormal_data, f, indent=2)
+
+    checkpoint = {
+        "valence_threshold": valence_threshold,
+        "classes": {hex_code: "pending" for hex_code in class_faces},
+        "total_classes": len(class_faces),
+        "abnormal_count": int(len(abnormal_indices))
+    }
+    with open(output_dir / "checkpoint.json", "w") as f:
+        json.dump(checkpoint, f, indent=2)
+
+    print(f"发现 {len(class_faces)} 个不同拓扑类别（截断）。")
+    return class_faces, abnormal_indices
+
+
+def run_full_diagnosis_pass2(mesh, output_dir, class_faces,
+                             open_face_mask, nonmanifold_face_mask,
+                             valence_threshold=5,
+                             resume=False):
+    output_dir = Path(output_dir)
+    checkpoint_path = output_dir / "checkpoint.json"
+    classes_json_path = output_dir / "abnormal_truncated_classes.json"
+
+    if resume and checkpoint_path.exists() and classes_json_path.exists():
+        with open(checkpoint_path, "r") as f:
+            checkpoint = json.load(f)
+        pending_classes = [hex_code for hex_code, status in checkpoint["classes"].items()
+                           if status == "pending"]
+        print(f"恢复模式：已完成 {len(checkpoint['classes']) - len(pending_classes)} 类，"
+              f"剩余 {len(pending_classes)} 类")
+    else:
+        pending_classes = list(class_faces.keys())
+
+    if not pending_classes:
+        print("没有待分析类别。")
+        return {}
+
+    # 预计算共享数据
+    vertex_faces_csr = _build_vertex_face_csr(mesh)
+    vertex_face_counts = compute_vertex_face_counts(mesh)
+    edge_keys, edge_faces = compute_edge_to_faces(mesh)
+    edge_to_faces = {int(k): v for k, v in zip(edge_keys, edge_faces)}
+    face_edge_keys = compute_face_edge_keys(mesh)
+    edge_valences_all = compute_face_edge_valences(mesh, edge_to_faces, face_edge_keys)
+
+    results = {}
+    for idx, hex_code in enumerate(pending_classes):
+        face_indices = np.asarray(class_faces[hex_code], dtype=np.int64)
+        print(f"\n=== 分析类别 {idx+1}/{len(pending_classes)} ===", flush=True)
+        print(f"  编码: {hex_code}, 面片数: {len(face_indices)}", flush=True)
+
+        areas = mesh.area_faces[face_indices]
+        area_stats = {
+            'count': int(len(face_indices)),
+            'mean': float(np.mean(areas)),
+            'min': float(np.min(areas)),
+            'p1': float(np.percentile(areas, 1)),
+            'p5': float(np.percentile(areas, 5)),
+            'p10': float(np.percentile(areas, 10)),
+            'p25': float(np.percentile(areas, 25)),
+            'p50': float(np.percentile(areas, 50)),
+            'p75': float(np.percentile(areas, 75)),
+            'p90': float(np.percentile(areas, 90)),
+            'p95': float(np.percentile(areas, 95)),
+            'p99': float(np.percentile(areas, 99)),
+            'max': float(np.max(areas)),
+        }
+
+        point_counts, edge_counts = compute_class_neighbor_stats(
+            mesh, face_indices, open_face_mask, nonmanifold_face_mask,
+            vertex_faces_csr, edge_to_faces, face_edge_keys
+        )
+
+        rep_face = int(face_indices[0])
+        vertex_stats, edge_stats = compute_single_face_neighbor_stats(
+            mesh, rep_face, open_face_mask, nonmanifold_face_mask,
+            vertex_faces_csr, edge_to_faces, face_edge_keys
+        )
+
+        _, v_order, e_order = get_face_topology_code_and_order(
+            mesh, rep_face, vertex_face_counts, edge_to_faces, face_edge_keys
+        )
+
+        aligned_vertex_stats = [vertex_stats[i] for i in v_order]
+        aligned_edge_stats = [edge_stats[i] for i in e_order]
+
+        # 截断字段的真实值分布
+        verts = mesh.faces[face_indices]                # (k,3)
+        v_counts = vertex_face_counts[verts]            # (k,3)
+        e_counts = edge_valences_all[face_indices]      # (k,3)
+
+        # 顶点元截断分布：只统计 >= valence_threshold 的字段
+        truncated_v_mask = v_counts >= valence_threshold
+        truncated_v_vals = v_counts[truncated_v_mask]
+        truncated_v_dist = Counter(truncated_v_vals.tolist())
+
+        # 边元截断分布：只统计 >= 3 的字段
+        truncated_e_mask = e_counts >= 3
+        truncated_e_vals = e_counts[truncated_e_mask]
+        truncated_e_dist = Counter(truncated_e_vals.tolist())
+
+        class_result = {
+            'class_id': hex_code,
+            'code': hex_code,
+            'area_stats': area_stats,
+            'point_counts': point_counts,
+            'edge_counts': edge_counts,
+            'representative_vertex_stats': aligned_vertex_stats,
+            'representative_edge_stats': aligned_edge_stats,
+            'truncated_vertex_valence_dist': dict(sorted(truncated_v_dist.items())),
+            'truncated_edge_valence_dist': dict(sorted(truncated_e_dist.items())),
+        }
+        results[hex_code] = class_result
+
+        # 更新 abnormal_truncated_classes.json
+        with open(classes_json_path, "r") as f:
+            data = json.load(f)
+        if hex_code not in data["classes"]:
+            # 兼容恢复时 dict 中可能没有该键
+            data["classes"][hex_code] = {
+                "face_indices": face_indices.tolist(),
+                "count": len(face_indices)
+            }
+        data["classes"][hex_code]["area_stats"] = area_stats
+        data["classes"][hex_code]["point_counts"] = point_counts
+        data["classes"][hex_code]["edge_counts"] = edge_counts
+        data["classes"][hex_code]["representative_vertex_stats"] = aligned_vertex_stats
+        data["classes"][hex_code]["representative_edge_stats"] = aligned_edge_stats
+        data["classes"][hex_code]["status"] = "done"
+
+        data["classes"][hex_code]["truncated_vertex_valence_dist"] = \
+            dict(sorted(truncated_v_dist.items()))
+        data["classes"][hex_code]["truncated_edge_valence_dist"] = \
+            dict(sorted(truncated_e_dist.items()))
+
+        with open(classes_json_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+        # 更新 checkpoint
+        with open(checkpoint_path, "r") as f:
+            ckpt = json.load(f)
+        if hex_code not in ckpt["classes"]:
+            ckpt["classes"][hex_code] = "pending"  # 兼容可能缺失
+        ckpt["classes"][hex_code] = "done"
+        with open(checkpoint_path, "w") as f:
+            json.dump(ckpt, f, indent=2)
+
+        print(f"  面积: 平均={area_stats['mean']:.6f}, p50={area_stats['p50']:.6f}", flush=True)
+        print(f"  点邻: 流形={point_counts['normal']}, 开放={point_counts['open']}, "
+              f"非流形={point_counts['nonmanifold']}", flush=True)
+        print(f"  边邻: 流形={edge_counts['normal']}, 开放={edge_counts['open']}, "
+              f"非流形={edge_counts['nonmanifold']}", flush=True)
+
+    return results
+
+
+def generate_html_report(output_dir, id_to_code, results):
+    """生成 HTML 报告，包含图例、交互式 SVG 示意图和详细统计。"""
+    output_dir = Path(output_dir)
+    html_path = output_dir / "report.html"
+
+    html = ["<html><head><meta charset='utf-8'><title>Full Face Diagnosis</title>",
+            "<style>",
+            "body { font-family: sans-serif; margin: 20px; }",
+            "table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }",
+            "th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: center; }",
+            "th { background: #f0f0f0; }",
+            ".class-block { margin-bottom: 30px; border: 1px solid #ddd; padding: 10px; }",
+            "img { max-width: 300px; height: auto; }",
+            ".diagram-container { display: inline-block; vertical-align: top; margin-right: 20px; }",
+            ".diagram-container svg { width: 200px; height: 170px; }",
+            ".legend { margin-bottom: 20px; padding: 10px; border: 1px solid #ccc; background: #fafafa; }",
+            ".legend span.legend-dot { display: inline-block; width: 15px; height: 15px; border-radius: 50%; margin-right: 5px; }",
+            ".legend span.solid { background: black; border: 1px solid black; }",
+            ".legend span.hollow { background: white; border: 2px solid black; }",
+            ".legend span.legend-line { display: inline-block; width: 30px; height: 0; border-top: 3px solid; margin-right: 5px; vertical-align: middle; }",
+            ".legend span.blue { border-color: blue; }",
+            ".legend span.green { border-color: green; }",
+            ".legend span.red { border-color: red; }",
+            "</style></head><body>",
+            "<h1>Full Face Diagnosis Report</h1>"]
+
+    # ---- 图例 ----
+    html.append("<div class='legend'>")
+    html.append("<strong>图例：</strong><br>")
+    html.append("<span class='legend-dot solid'></span> 独占顶点（仅被当前面引用）<br>")
+    html.append("<span class='legend-dot hollow'></span> 共享顶点（被多个面引用）<br>")
+    html.append("<span class='legend-line blue'></span> 开放边（仅属于当前面）<br>")
+    html.append("<span class='legend-line green'></span> 流形边（被两面共享）<br>")
+    html.append("<span class='legend-line red'></span> 非流形边（被三面或更多共享）<br>")
+    html.append("</div>")
+
+    html.append("<h2>Topology Classes</h2>")
+
+    for class_id in sorted(results.keys()):
+        res = results[class_id]
+        code = res['code']
+        area = res['area_stats']
+        pc = res['point_counts']
+        ec = res['edge_counts']
+        v_stats = res.get('representative_vertex_stats')
+        if not v_stats:
+            v_stats = [{'normal': 0, 'open': 0, 'nonmanifold': 0} for _ in range(3)]
+        e_stats = res.get('representative_edge_stats')
+        if not e_stats:
+            e_stats = [{'normal': 0, 'open': 0, 'nonmanifold': 0} for _ in range(3)]
+
+        # 内联 SVG 交互图
+        diagram_path = output_dir / "diagrams" / f"diagram_{class_id}.svg"
+        if diagram_path.exists():
+            svg_content = diagram_path.read_text(encoding="utf-8")
+        else:
+            svg_content = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='170'><text x='10' y='80'>Diagram not generated</text></svg>"
+
+        html.append("<div class='class-block'>")
+        html.append(f"<h3>Class {class_id}: {code}</h3>")
+        html.append("<div class='diagram-container'>")
+        html.append(svg_content)
+        html.append("</div>")
+        html.append("<div style='display: inline-block; vertical-align: top;'>")
+
+        # 面积统计表
+        html.append("<table>")
+        html.append("<tr><th>面积统计</th><th>值</th></tr>")
+        rows = [
+            ("count", "面片数"),
+            ("mean", "平均"),
+            ("min", "最小值"),
+            ("p1", "p1"),
+            ("p5", "p5"),
+            ("p10", "p10"),
+            ("p25", "p25"),
+            ("p50", "p50"),
+            ("p75", "p75"),
+            ("p90", "p90"),
+            ("p95", "p95"),
+            ("p99", "p99"),
+            ("max", "最大值"),
+        ]
+        for key, label in rows:
+            html.append(f"<tr><td>{label}</td><td>{area[key]:.6f}</td></tr>")
+        html.append("</table>")
+
+        # 总体邻接统计（点邻 / 边邻）
+        html.append("<table>")
+        html.append("<tr><th></th><th>流形</th><th>开放</th><th>非流形</th></tr>")
+        html.append("<tr><th>点邻（合计）</th>"
+                    f"<td>{pc['normal']}</td><td>{pc['open']}</td><td>{pc['nonmanifold']}</td></tr>")
+        html.append("<tr><th>边邻（合计）</th>"
+                    f"<td>{ec['normal']}</td><td>{ec['open']}</td><td>{ec['nonmanifold']}</td></tr>")
+        html.append("</table>")
+
+        html.append("</div>")  # 关闭右侧容器
+        html.append("</div>")  # 关闭 class-block
+
+    html.append("</body></html>")
+
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(html))
+    print(f"HTML 报告已保存: {html_path}")
+
+
+def generate_latex_report(output_dir, id_to_code, results):
+    """生成 LaTeX 报告（包含更多面积百分位和邻接统计）。"""
+    output_dir = Path(output_dir)
+    tex_path = output_dir / "report.tex"
+
+    tex = ["\\documentclass{article}",
+           "\\usepackage{graphicx}",
+           "\\usepackage{booktabs}",
+           "\\begin{document}",
+           "\\section{Full Face Diagnosis Report}"]
+
+    for class_id in sorted(results.keys()):
+        res = results[class_id]
+        code = res['code']
+        area = res['area_stats']
+        pc = res['point_counts']
+        ec = res['edge_counts']
+        diagram_rel = f"diagrams/diagram_{class_id}.svg"
+
+        tex.append(f"\\subsection{{Class {class_id}: {code}}}")
+        tex.append("\\begin{figure}[h]")
+        tex.append(f"\\includegraphics[width=0.25\\textwidth]{{{diagram_rel}}}")
+        tex.append("\\end{figure}")
+
+        # 面积统计表
+        tex.append("\\begin{tabular}{l r}")
+        tex.append("\\toprule")
+        tex.append("Area Metric & Value \\\\")
+        tex.append("\\midrule")
+        rows = [
+            ("Count", area['count']),
+            ("Mean", area['mean']),
+            ("Min", area['min']),
+            ("p1", area['p1']),
+            ("p5", area['p5']),
+            ("p10", area['p10']),
+            ("p25", area['p25']),
+            ("p50", area['p50']),
+            ("p75", area['p75']),
+            ("p90", area['p90']),
+            ("p95", area['p95']),
+            ("p99", area['p99']),
+            ("Max", area['max']),
+        ]
+        for label, val in rows:
+            tex.append(f"{label} & {val:.6f} \\\\")
+        tex.append("\\bottomrule")
+        tex.append("\\end{tabular}")
+
+        # 邻接统计表
+        tex.append("\\begin{tabular}{l c c c}")
+        tex.append("\\toprule")
+        tex.append("Neighbor & Manifold & Open & Nonmanifold \\\\")
+        tex.append("\\midrule")
+        tex.append(f"Point & {pc['normal']} & {pc['open']} & {pc['nonmanifold']} \\\\")
+        tex.append(f"Edge & {ec['normal']} & {ec['open']} & {ec['nonmanifold']} \\\\")
+        tex.append("\\bottomrule")
+        tex.append("\\end{tabular}")
+
+    tex.append("\\end{document}")
+    with open(tex_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(tex))
+    print(f"LaTeX 报告已保存: {tex_path}")
+
+
+def generate_html_report_from_json(output_dir):
+    """
+    从 abnormal_truncated_classes.json 生成 HTML 报告，
+    包含每个类的拓扑 SVG 示意图和统计表。
+    """
+    output_dir = Path(output_dir)
+    html_path = output_dir / "report.html"
+    classes_json_path = output_dir / "abnormal_truncated_classes.json"
+    diagrams_dir = output_dir / "diagrams"
+    diagrams_dir.mkdir(exist_ok=True)
+
+    if not classes_json_path.exists():
+        print(f"[ERROR] {classes_json_path} not found.")
+        return
+
+    with open(classes_json_path, "r") as f:
+        data = json.load(f)
+
+    html = ["<html><head><meta charset='utf-8'><title>Full Face Diagnosis</title>",
+            "<style>",
+            "body { font-family: sans-serif; margin: 20px; }",
+            "table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }",
+            "th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: center; }",
+            "th { background: #f0f0f0; }",
+            ".class-block { margin-bottom: 30px; border: 1px solid #ddd; padding: 10px; }",
+            "img { max-width: 300px; height: auto; }",
+            ".diagram-container { display: inline-block; vertical-align: top; margin-right: 20px; }",
+            ".diagram-container svg { width: 200px; height: 170px; }",
+            ".legend { margin-bottom: 20px; padding: 10px; border: 1px solid #ccc; background: #fafafa; }",
+            ".legend span.legend-dot { display: inline-block; width: 15px; height: 15px; border-radius: 50%; margin-right: 5px; }",
+            ".legend span.solid { background: black; border: 1px solid black; }",
+            ".legend span.hollow { background: white; border: 2px solid black; }",
+            ".legend span.legend-line { display: inline-block; width: 30px; height: 0; border-top: 3px solid; margin-right: 5px; vertical-align: middle; }",
+            ".legend span.blue { border-color: blue; }",
+            ".legend span.green { border-color: green; }",
+            ".legend span.red { border-color: red; }",
+            "</style></head><body>",
+            "<h1>Full Face Diagnosis Report</h1>"]
+
+    # 图例
+    html.append("<div class='legend'>")
+    html.append("<strong>图例：</strong><br>")
+    html.append("<span class='legend-dot solid'></span> 独占顶点（仅被当前面引用）<br>")
+    html.append("<span class='legend-dot hollow'></span> 共享顶点（被多个面引用）<br>")
+    html.append("<span class='legend-line blue'></span> 开放边（仅属于当前面）<br>")
+    html.append("<span class='legend-line green'></span> 流形边（被两面共享）<br>")
+    html.append("<span class='legend-line red'></span> 非流形边（被三面或更多共享）<br>")
+    html.append("</div>")
+
+    html.append("<h2>Topology Classes</h2>")
+
+    classes = data.get("classes", {})
+    if not classes:
+        html.append("<p>No abnormal classes found.</p>")
+    else:
+        for hex_code, cls_data in classes.items():
+            # 生成 SVG 图
+            diagram_path = diagrams_dir / f"diagram_{hex_code}.svg"
+            try:
+                code_arr = hex_to_code(hex_code)
+                _generate_topology_diagram(code_arr, str(diagram_path))
+            except Exception as e:
+                print(f"  [WARN] Diagram generation for {hex_code} failed: {e}")
+                diagram_path = None
+
+            svg_content = ""
+            if diagram_path and diagram_path.exists():
+                svg_content = diagram_path.read_text(encoding="utf-8")
+            if not svg_content:
+                svg_content = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='170'><text x='10' y='80'>Diagram not generated</text></svg>"
+
+            html.append("<div class='class-block'>")
+            html.append(f"<h3>Class {hex_code}</h3>")
+            html.append("<div class='diagram-container'>")
+            html.append(svg_content)
+            html.append("</div>")
+            html.append("<div style='display: inline-block; vertical-align: top;'>")
+
+            # 面积统计表
+            area = cls_data.get("area_stats", {})
+            if area:
+                html.append("<table>")
+                html.append("<tr><th>面积统计</th><th>值</th></tr>")
+                rows = [
+                    ("count", "面片数"),
+                    ("mean", "平均"),
+                    ("min", "最小值"),
+                    ("p1", "p1"),
+                    ("p5", "p5"),
+                    ("p10", "p10"),
+                    ("p25", "p25"),
+                    ("p50", "p50"),
+                    ("p75", "p75"),
+                    ("p90", "p90"),
+                    ("p95", "p95"),
+                    ("p99", "p99"),
+                    ("max", "最大值"),
+                ]
+                for key, label in rows:
+                    if key in area:
+                        html.append(f"<tr><td>{label}</td><td>{area[key]:.6f}</td></tr>")
+                    else:
+                        html.append(f"<tr><td>{label}</td><td>N/A</td></tr>")
+                html.append("</table>")
+
+            # 邻接统计
+            pc = cls_data.get("point_counts", {})
+            ec = cls_data.get("edge_counts", {})
+            if pc and ec:
+                html.append("<table>")
+                html.append("<tr><th></th><th>流形</th><th>开放</th><th>非流形</th></tr>")
+                html.append("<tr><th>点邻（合计）</th>"
+                            f"<td>{pc.get('normal', 0)}</td><td>{pc.get('open', 0)}</td><td>{pc.get('nonmanifold', 0)}</td></tr>")
+                html.append("<tr><th>边邻（合计）</th>"
+                            f"<td>{ec.get('normal', 0)}</td><td>{ec.get('open', 0)}</td><td>{ec.get('nonmanifold', 0)}</td></tr>")
+                html.append("</table>")
+
+            # 代表面逐顶点/逐边统计（可选展示）
+            v_stats = cls_data.get("representative_vertex_stats")
+            e_stats = cls_data.get("representative_edge_stats")
+            if v_stats:
+                html.append("<table>")
+                html.append("<tr><th>代表面-顶点</th><th>流形</th><th>开放</th><th>非流形</th></tr>")
+                for idx, vs in enumerate(v_stats):
+                    html.append(f"<tr><td>V{idx}</td>"
+                                f"<td>{vs.get('normal', 0)}</td><td>{vs.get('open', 0)}</td><td>{vs.get('nonmanifold', 0)}</td></tr>")
+                html.append("</table>")
+            if e_stats:
+                html.append("<table>")
+                html.append("<tr><th>代表面-边</th><th>流形</th><th>开放</th><th>非流形</th></tr>")
+                for idx, es in enumerate(e_stats):
+                    html.append(f"<tr><td>E{idx}</td>"
+                                f"<td>{es.get('normal', 0)}</td><td>{es.get('open', 0)}</td><td>{es.get('nonmanifold', 0)}</td></tr>")
+                html.append("</table>")
+
+            # 截断字段真实分布
+            vertex_dist = cls_data.get("truncated_vertex_valence_dist", {})
+            edge_dist = cls_data.get("truncated_edge_valence_dist", {})
+
+            if vertex_dist:
+                html.append("<table>")
+                html.append("<tr><th>顶点元截断分布</th><th>真实 valence</th><th>计数</th></tr>")
+                for val_str, cnt in vertex_dist.items():
+                    html.append(f"<tr><td>valence</td><td>{val_str}</td><td>{cnt}</td></tr>")
+                html.append("</table>")
+
+            if edge_dist:
+                html.append("<table>")
+                html.append("<tr><th>边元截断分布</th><th>真实共享数</th><th>计数</th></tr>")
+                for val_str, cnt in edge_dist.items():
+                    html.append(f"<tr><td>edge</td><td>{val_str}</td><td>{cnt}</td></tr>")
+                html.append("</table>")
+
+            html.append("</div>")  # 关闭右侧容器
+            html.append("</div>")  # 关闭 class-block
+
+    html.append("</body></html>")
+    html_path.write_text("\n".join(html), encoding="utf-8")
+    print(f"HTML 报告已保存: {html_path}")
+
+
+def perform_full_diagnosis(mesh, args):
+    """
+    Full Diagnosis 入口，协调 Pass 1 和 Pass 2。
+    """
+    output_dir = Path(args.diagnosis_output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    _, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
+
+    resume_checkpoint = output_dir / "checkpoint.json"
+    classes_json_path = output_dir / "abnormal_truncated_classes.json"
+
+    if args.resume and resume_checkpoint.exists() and classes_json_path.exists():
+        with open(classes_json_path, "r") as f:
+            classes_data = json.load(f)
+        class_faces = {hex_code: np.asarray(entry["face_indices"], dtype=np.int64)
+                       for hex_code, entry in classes_data.get("classes", {}).items()}
+        print("Resume: loading existing classifications from Pass 1.")
+    else:
+        class_faces, _ = run_full_diagnosis_pass1(
+            mesh, output_dir,
+            valence_threshold=args.valence_threshold
+        )
+
+    results = run_full_diagnosis_pass2(
+        mesh, output_dir, class_faces,
+        open_face_mask, nonmanifold_face_mask,
+        valence_threshold=args.valence_threshold,
+        resume=args.resume
+    )
+
+    if args.diagnosis_format == "html":
+        generate_html_report_from_json(output_dir)
+    else:
+        # 新的架构中以 JSON 为单一数据源，暂未适配 LaTeX 生成，这里回退到 HTML
+        print("[WARN] LaTeX report generation is not yet adapted to the new architecture.")
+        print("Falling back to HTML report generation.")
+        generate_html_report_from_json(output_dir)
+
+    # 计算异常面总数（用于 meta；不再单独生成 diagnosis_results.json）
+    abnormal_mask = open_face_mask | nonmanifold_face_mask
+    abnormal_count = int(abnormal_mask.sum())
+    print(f"\nFull Diagnosis 完成，异常面总数：{abnormal_count}，"
+          f"报告已生成到 {output_dir}")
+
+
+def perform_hole_diagnosis(mesh, args):
+    """执行孔洞诊断，输出健康孔洞与未覆盖开放边分析。"""
+    output_dir = Path(args.hole_diagnosis_output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n=== Hole Diagnosis ===")
+    print("提取开放边与健康孔洞...")
+    hole_data = build_hole_diagnosis_data(mesh)
+
+    # 1. 保存二进制数据
+    print("保存开放边与孔洞数据...")
+    open_edge_ids = np.arange(len(hole_data['open_edge_face_ids']), dtype=np.int64)
+    np.savez_compressed(
+        output_dir / "hole_diagnosis_data.npz",
+        open_edge_ids=open_edge_ids,
+        open_edge_vertex_pairs=hole_data['open_edge_vertex_pairs'],
+        open_edge_face_ids=hole_data['open_edge_face_ids'],
+        open_edge_keys=hole_data['open_edge_keys'],
+        hole_ids_per_edge=hole_data['hole_ids_per_edge'],
+        uncovered_edge_ids=hole_data['uncovered_edge_ids'],
+        uncovered_category=hole_data['uncovered_category'],
+    )
+
+    # 2. 分析未覆盖开放边连通分量（异常孔洞）
+    print("分析未覆盖开放边连通分量...")
+    components = analyze_uncovered_open_edge_components(mesh, hole_data)
+    component_json_path = output_dir / "uncovered_component_analysis.json"
+    with open(component_json_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "total_components": len(components),
+            "components": components,
+        }, f, indent=2, ensure_ascii=False)
+    print(f"未覆盖开放边分量分析已保存: {component_json_path}")
+
+    # 计算最小包络流形边界（可选）
+    if getattr(args, 'compute_enclosing_boundaries', False):
+        print("计算最小包络流形边界...")
+        for comp in components:
+            comp_id = comp['component_id']
+            bound = find_minimal_enclosing_manifold_boundary_greedy(mesh, comp)
+            comp['minimal_enclosing_boundary'] = bound
+            if bound['success']:
+                print(f"  Component {comp_id}: 包络边界深度 {bound['depth']}, "
+                      f"内部面片 {len(bound['enclosed_faces'])}, "
+                      f"边界边 {len(bound['boundary_edges'])}")
+            else:
+                print(f"  Component {comp_id}: 未找到包络边界 "
+                      f"(最大深度 {bound['depth']})")
+
+        # 更新 JSON 文件
+        with open(component_json_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "total_components": len(components),
+                "components": components,
+            }, f, indent=2, ensure_ascii=False)
+        print(f"已更新包含包络边界信息的: {component_json_path}")
+
+    # 3. 构造 JSON 报告
+    print("生成孔洞诊断 JSON...")
+    total_open_edges = len(open_edge_ids)
+    total_holes = len(hole_data['hole_vertex_lists'])
+    uncovered_count = len(hole_data['uncovered_edge_ids'])
+    covered_count = total_open_edges - uncovered_count
+
+    hole_info_list = []
+    for hole_id, (vert_list, edge_list) in enumerate(zip(
+        hole_data['hole_vertex_lists'],
+        hole_data['hole_edge_lists']
+    )):
+        # 计算周长和面积
+        pts = mesh.vertices[np.asarray(vert_list, dtype=np.int64)]
+        # 面积调用 polygon_area_from_3d_ccw
+        area = polygon_area_from_3d_ccw(pts)
+        perimeter = float(np.sum(np.linalg.norm(pts - np.roll(pts, -1, axis=0), axis=1)))
+        hole_info_list.append({
+            "hole_id": hole_id,
+            "num_edges": len(edge_list),
+            "num_vertices": len(vert_list),
+            "area": area,
+            "perimeter": perimeter,
+            "vertex_indices": vert_list,
+        })
+
+    # 未覆盖开放边分类统计
+    category_counts = Counter(hole_data['uncovered_category'].tolist())
+    category_names = {
+        0: "孤立开放链",
+        1: "悬空开放边",
+        2: "分支内部开放边",
+        4: "非流形关联开放边",
+        5: "其他复杂开放边",
+    }
+    uncovered_categories_summary = {
+        category_names.get(int(cat), f"cat_{cat}"): int(cnt)
+        for cat, cnt in category_counts.items()
+    }
+
+    diagnosis_json = {
+        "total_open_edges": total_open_edges,
+        "total_healthy_holes": total_holes,
+        "covered_open_edges": covered_count,
+        "uncovered_open_edges": uncovered_count,
+        "healthy_holes": hole_info_list,
+        "uncovered_categories_summary": uncovered_categories_summary,
+        "open_edge_face_ids": hole_data['open_edge_face_ids'].tolist(),  # 可用于关联面片
+    }
+    with open(output_dir / "hole_diagnosis.json", "w", encoding="utf-8") as f:
+        json.dump(diagnosis_json, f, indent=2, ensure_ascii=False)
+
+    # 4. 生成 HTML 报告
+    print("生成孔洞诊断 HTML...")
+    html_path = output_dir / "hole_report.html"
+    html = ["<html><head><meta charset='utf-8'><title>Hole Diagnosis</title>",
+            "<style>body{font-family:sans-serif;margin:20px}",
+            "table{border-collapse:collapse;width:100%;margin-bottom:20px}",
+            "th,td{border:1px solid #ccc;padding:4px 8px;text-align:center}",
+            "th{background:#f0f0f0}",
+            ".component-block{margin-bottom:20px;border:1px solid #ddd;padding:10px}",
+            "</style></head><body>",
+            "<h1>Hole Diagnosis Report</h1>",
+            f"<p>总开放边: {total_open_edges}</p>",
+            f"<p>健康孔洞数: {total_holes}</p>",
+            f"<p>覆盖开放边: {covered_count}</p>",
+            f"<p>未覆盖开放边: {uncovered_count}</p>",
+            "<h2>未覆盖开放边分类</h2>",
+            "<table><tr><th>分类</th><th>数量</th></tr>"]
+    for cat, cnt in uncovered_categories_summary.items():
+        html.append(f"<tr><td>{cat}</td><td>{cnt}</td></tr>")
+    html.append("</table>")
+    html.append("<h2>健康孔洞概览</h2>")
+    html.append("<table><tr><th>孔洞ID</th><th>边数</th><th>面积</th><th>周长</th></tr>")
+    for hole in hole_info_list:
+        html.append(f"<tr><td>{hole['hole_id']}</td><td>{hole['num_edges']}</td>"
+                    f"<td>{hole['area']:.6f}</td><td>{hole['perimeter']:.6f}</td></tr>")
+    html.append("</table>")
+    html.append("<h2>未覆盖开放边组件分析</h2>")
+    html.append("<table><tr><th>组件ID</th><th>边数</th><th>端点</th><th>分支点</th>"
+                "<th>断裂候选</th></tr>")
+    for comp in components:
+        html.append(f"<tr><td>{comp['component_id']}</td><td>{comp['num_edges']}</td>"
+                    f"<td>{len(comp['endpoints'])}</td><td>{len(comp['branch_vertices'])}</td>"
+                    f"<td>{len(comp['candidate_breaks'])}</td></tr>")
+    html.append("</table>")
+
+    # 生成并嵌入每个组件的 3D 图
+    component_diagrams_dir = output_dir / "component_diagrams"
+    component_diagrams_dir.mkdir(exist_ok=True)
+
+    html.append("<h2>未覆盖开放边组件三维视图</h2>")
+    for comp in components:
+        comp_id = comp['component_id']
+        diagram_path = component_diagrams_dir / f"component_{comp_id}.svg"
+        try:
+            _generate_component_3d_diagram(comp, mesh, str(diagram_path))
+        except Exception as e:
+            print(f"  [WARN] Component {comp_id} 3D diagram failed: {e}")
+            diagram_path = None
+
+        if diagram_path and diagram_path.exists():
+            svg_content = diagram_path.read_text(encoding="utf-8")
+        else:
+            svg_content = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='170'><text x='10' y='80'>Diagram not generated</text></svg>"
+
+        html.append("<div class='component-block'>")
+        html.append(f"<h3>组件 {comp_id}（边数 {comp['num_edges']}）</h3>")
+        html.append("<div class='diagram-container'>")
+        html.append(svg_content)
+        html.append("</div>")
+        html.append("<p>")
+        html.append(f"顶点数: {comp['num_vertices']} | 端点: {len(comp['endpoints'])} | "
+                    f"分支点: {len(comp['branch_vertices'])} | 断裂候选: {len(comp['candidate_breaks'])}")
+        html.append("</p>")
+        html.append("</div>")
+
+    html.append("</body></html>")
+    html_path.write_text("\n".join(html), encoding="utf-8")
+    print(f"孔洞诊断 HTML 报告已保存: {html_path}")
+
+    print(f"\nHole Diagnosis 完成，健康孔洞：{total_holes}，未覆盖开放边：{uncovered_count}，"
+          f"报告已生成到 {output_dir}")
+
+
+def print_separator(title=None):
+    if title:
+        print(f"\n{'=' * 60}")
+        print(f" {title}")
+        print(f"{'=' * 60}")
+    else:
+        print(f"\n{'=' * 60}")
+
+
+def inspect_mesh(mesh, args):
+    """
+    主检查函数：输出统计信息并可选返回可视化场景。
+    """
+    if args.weld_small_holes:
+        print_separator("Weld Small Holes")
+        mesh = weld_small_holes(
+            mesh,
+            threshold=args.weld_hole_threshold,
+            quantile=args.weld_hole_quantile,
+            min_edges=args.weld_min_hole_edges,
+            verbose=True,
+        )
+
+    stats = compute_mesh_stats(mesh)
+    (
+        defect_stats,
+        open_face_mask,
+        nonmanifold_face_mask,
+        open_edge_per_face,
+        manifold_edge_per_face,
+        nonmanifold_edge_per_face,
+    ) = analyze_mesh_defects(mesh, return_face_edge_counts=True)
+    area_stats = compute_face_area_stats(mesh)
+    bbox_stats = compute_bounding_box_stats(mesh)
+    volume = compute_volume_if_closed(mesh)
+
+    defect_mask = open_face_mask | nonmanifold_face_mask
+    if np.any(defect_mask):
+        distances = compute_face_distances(mesh, defect_mask)
+        reliable_mask = (~defect_mask) & (distances >= args.reliable_distance)
+    else:
+        distances = np.full(len(mesh.faces), args.reliable_distance + 1, dtype=np.int32)
+        reliable_mask = np.ones(len(mesh.faces), dtype=bool)
+
+    print_separator("Mesh Topology")
+    print(f"  vertices:          {stats['vertices']}")
+    print(f"  faces:             {stats['faces']}")
+    print(f"  edges (unique):    {stats['edges']}")
+    print(f"  watertight:        {stats['is_watertight']}")
+    print(f"  open edges:        {defect_stats['open_edges']}")
+    print(f"  nonmanifold edges: {defect_stats['nonmanifold_edges']}")
+    print(f"  open faces:        {defect_stats['open_faces']}")
+    print(f"  nonmanifold faces: {defect_stats['nonmanifold_faces']}")
+
+    hole_stats = compute_hole_area_stats(mesh)
+    print(f"  open boundary loops: {hole_stats['count']}")
+    print(f"  total hole area:     {hole_stats['total_area']:.6f}")
+    if hole_stats['count'] > 0:
+        print(f"  hole area percentiles: "
+              f"p1={hole_stats['p1_area']:.6f}, "
+              f"p5={hole_stats['p5_area']:.6f}, "
+              f"p25={hole_stats['p25_area']:.6f}, "
+              f"p50={hole_stats['p50_area']:.6f}, "
+              f"p75={hole_stats['p75_area']:.6f}, "
+              f"p90={hole_stats['p90_area']:.6f}, "
+              f"p95={hole_stats['p95_area']:.6f}, "
+              f"p99={hole_stats['p99_area']:.6f}, "
+              f"max={hole_stats['max_area']:.6f}")
+
+    print_separator("Defect Face Details")
+    both_mask = open_face_mask & nonmanifold_face_mask
+    open_only_mask = open_face_mask & ~nonmanifold_face_mask
+    nonmanifold_only_mask = nonmanifold_face_mask & ~open_face_mask
+    print(f"  open-only faces:                 {open_only_mask.sum()}")
+    print(f"  nonmanifold-only faces:          {nonmanifold_only_mask.sum()}")
+    print(f"  both open & nonmanifold faces:   {both_mask.sum()}")
+
+    print_separator("Open Face Diagnostics")
+
+    open_face_areas = mesh.area_faces[open_face_mask]
+    if len(open_face_areas) == 0:
+        print("  no open faces")
+    else:
+        print(f"  open face count: {len(open_face_areas)}")
+
+        print("  face area percentiles:")
+        for p in [1, 5, 10, 25, 50, 75, 90, 95, 99]:
+            print(f"    p{p}: {np.percentile(open_face_areas, p):.6f}")
+        print(f"    mean: {open_face_areas.mean():.6f}")
+        print(f"    min:  {open_face_areas.min():.6f}")
+        print(f"    max:  {open_face_areas.max():.6f}")
+
+        # 开放边数量分布（每个开放面片有几条边是开放边）
+        open_edge_hist = np.bincount(open_edge_per_face[open_face_mask])
+        print("  open-edge count per open face:")
+        for k, cnt in enumerate(open_edge_hist):
+            if cnt > 0:
+                print(f"    {k} open edge(s): {cnt} faces")
+
+        # 流形边数量分布
+        manifold_edge_hist = np.bincount(manifold_edge_per_face[open_face_mask])
+        print("  manifold-edge count per open face:")
+        for k, cnt in enumerate(manifold_edge_hist):
+            if cnt > 0:
+                print(f"    {k} manifold edge(s): {cnt} faces")
+
+        # 非流形边数量分布
+        nonmanifold_edge_hist = np.bincount(nonmanifold_edge_per_face[open_face_mask])
+        if nonmanifold_edge_hist.size > 1:
+            print("  nonmanifold-edge count per open face:")
+            for k, cnt in enumerate(nonmanifold_edge_hist):
+                if cnt > 0:
+                    print(f"    {k} nonmanifold edge(s): {cnt} faces")
+
+    print_separator("Topological Reliability Distribution")
+    max_display = 5
+    for d in range(max_display + 1):
+        cnt = int(np.sum(distances == d))
+        print(f"  distance {d}: {cnt} faces")
+    rest = int(np.sum(distances > max_display))
+    print(f"  distance > {max_display}: {rest} faces")
+
+    reliable_count = int(reliable_mask.sum())
+    total_faces = len(mesh.faces)
+    pct = 100.0 * reliable_count / max(total_faces, 1)
+    print(f"  reliable faces (distance >= {args.reliable_distance}): "
+          f"{reliable_count} ({pct:.2f}%)")
+
+    print_separator("Bounding Box")
+    print(f"  min:      [{bbox_stats['min'][0]:.4f}, "
+          f"{bbox_stats['min'][1]:.4f}, {bbox_stats['min'][2]:.4f}]")
+    print(f"  max:      [{bbox_stats['max'][0]:.4f}, "
+          f"{bbox_stats['max'][1]:.4f}, {bbox_stats['max'][2]:.4f}]")
+    print(f"  extents:  [{bbox_stats['extents'][0]:.4f}, "
+          f"{bbox_stats['extents'][1]:.4f}, {bbox_stats['extents'][2]:.4f}]")
+    print(f"  diagonal: {bbox_stats['diagonal']:.4f}")
+    print(f"  centroid: [{bbox_stats['centroid'][0]:.4f}, "
+          f"{bbox_stats['centroid'][1]:.4f}, {bbox_stats['centroid'][2]:.4f}]")
+
+    print_separator("Edge Length Statistics")
+    print(f"  mean: {stats['mean_edge_length']:.6f}")
+    print(f"  p1:   {stats['edge_length_p1']:.6f}")
+    print(f"  p5:   {stats['edge_length_p5']:.6f}")
+    print(f"  p50:  {stats['edge_length_p50']:.6f}")
+    print(f"  p95:  {stats['edge_length_p95']:.6f}")
+    print(f"  p99:  {stats['edge_length_p99']:.6f}")
+
+    print_separator("Face Area Statistics")
+    print(f"  count: {area_stats['count']}")
+    print(f"  mean:  {area_stats['mean']:.6f}")
+    print(f"  min:   {area_stats['min']:.6f}")
+    print(f"  p1:    {area_stats['p1']:.6f}")
+    print(f"  p5:    {area_stats['p5']:.6f}")
+    print(f"  p10:   {area_stats['p10']:.6f}")
+    print(f"  p25:   {area_stats['p25']:.6f}")
+    print(f"  p50:   {area_stats['p50']:.6f}")
+    print(f"  p75:   {area_stats['p75']:.6f}")
+    print(f"  p90:   {area_stats['p90']:.6f}")
+    print(f"  p95:   {area_stats['p95']:.6f}")
+    print(f"  p99:   {area_stats['p99']:.6f}")
+    print(f"  max:   {area_stats['max']:.6f}")
+
+    print_separator("Surface & Volume")
+    print(f"  total surface area: {mesh.area:.6f}")
+    if np.isfinite(volume):
+        print(f"  volume (watertight): {volume:.6f}")
+    else:
+        print(f"  volume: N/A (mesh is not watertight)")
+
+    # 可视化
+    scene = None
+
+    if len(mesh.faces) == 0 or len(mesh.vertices) == 0:
+        if args.show or args.output:
+            print("  Mesh is empty; visualization skipped.")
+        return scene
+
+    if args.show or args.output:
+        # 提前加载代理网格，供叠加显示、投影和透明度控制使用
+        proxy_mesh = load_proxy_mesh(args) if args.overlay_proxy else None
+
+        if args.keep_reliable_only:
+            print_separator("Reliable-Only Extracted Mesh")
+            print(f"  min_distance: {args.reliable_distance}")
+
+            # 使用之前计算好的可靠面片掩码
+            reliable_count = int(reliable_mask.sum())
+            print(f"  reliable faces: {reliable_count}/{len(mesh.faces)}")
+
+            if reliable_count == 0:
+                print("  No reliable faces selected; skipping extraction.")
+                return None
+
+            # 提取可靠面片子网格
+            reliable_faces = np.asarray(mesh.faces, dtype=np.int64)[reliable_mask]
+            flat_faces = reliable_faces.ravel()
+            unique_verts, inverse = np.unique(flat_faces, return_inverse=True)
+            reliable_mesh = trimesh.Trimesh(
+                vertices=mesh.vertices[unique_verts],
+                faces=inverse.reshape(-1, 3),
+                process=False,
+            )
+            # 清理提取后的网格
+            reliable_mesh.remove_unreferenced_vertices()
+            reliable_mesh.merge_vertices()
+            reliable_mesh = repair_mesh_by_removing_duplicates(reliable_mesh)
+
+            if args.weld_small_holes:
+                print_separator("Weld Small Holes (Reliable Mesh)")
+                reliable_mesh = weld_small_holes(
+                    reliable_mesh,
+                    threshold=args.weld_hole_threshold,
+                    quantile=args.weld_hole_quantile,
+                    min_edges=args.weld_min_hole_edges,
+                    verbose=True,
+                )
+
+            # 打印提取后的简要统计
+            extracted_stats = compute_mesh_stats(reliable_mesh)
+            extracted_defects, _, _ = analyze_mesh_defects(reliable_mesh)
+            print(f"  extracted vertices: {extracted_stats['vertices']}")
+            print(f"  extracted faces:    {extracted_stats['faces']}")
+            print(f"  extracted open edges:        {extracted_defects['open_edges']}")
+            print(f"  extracted nonmanifold edges: {extracted_defects['nonmanifold_edges']}")
+
+            # 导出或显示
+            if args.output:
+                reliable_mesh.export(args.output)
+                print(f"\nReliable-only mesh saved to: {args.output}")
+
+            # 构造用于显示的双面网格，并设置输入网格透明度
+            if args.double_sided:
+                display_mesh = make_double_sided(
+                    reliable_mesh,
+                    backface_color=args.backface_color,
+                )
+            else:
+                display_mesh = reliable_mesh
+
+            if args.input_alpha < 1.0:
+                set_face_alpha(display_mesh, args.input_alpha)
+
+            scene = trimesh.Scene(display_mesh)
+
+            # 若用户要求线框，可叠加在提取网格上
+            if args.wireframe:
+                add_wireframe_to_scene(
+                    scene, reliable_mesh,
+                    color=args.wireframe_color,
+                    radius=args.wireframe_radius
+                )
+
+            # 若用户要求高亮孔洞，也可以基于提取网格显示
+            if args.highlight_holes:
+                add_hole_boundaries_to_scene(
+                    scene, reliable_mesh,
+                    radius=args.hole_radius,
+                    min_edges=args.min_hole_edges,
+                    min_area=args.min_hole_area,
+                    verbose=True,
+                )
+
+            # 孔洞边界投影到代理网格
+            if args.boundary_projection and proxy_mesh is not None:
+                add_boundary_projection_to_scene(
+                    scene, reliable_mesh, proxy_mesh,
+                    radius=args.boundary_projection_radius,
+                    verbose=True,
+                    print_enclosed_vertices=args.print_shell_enclosed_vertices,
+                    max_report_loops=args.max_report_boundary_loops,
+                    max_report_vertices=args.max_report_shell_vertices,
+                )
+
+            # 最后叠加代理网格
+            if proxy_mesh is not None:
+                add_proxy_overlay_to_scene(scene, args, proxy_mesh)
+
+            return scene
+
+        if args.highlight_reliable:
+            print_separator("Topological Reliable Visualization")
+            print(f"  min_distance: {args.reliable_distance}")
+            print("  green:  reliable faces (distance >= min_distance)")
+            print("  yellow: intermediate faces (0 < distance < min_distance)")
+            print("  red:    defect faces (distance = 0)")
+
+            vis = build_reliable_visualization(mesh, distances, args.reliable_distance)
+        else:
+            print_separator("Defect Visualization")
+            print("  gray:    normal faces")
+            print("  yellow:  faces adjacent to open edges")
+            print("  red:     faces adjacent to non-manifold edges")
+            print("  orange:  faces with both defects")
+
+            vis = build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask)
+
+        # 默认双面渲染：薄壳从任何一侧观察都可见
+        if args.double_sided:
+            vis = make_double_sided(vis, args.backface_color)
+
+        if args.input_alpha < 1.0:
+            set_face_alpha(vis, args.input_alpha)
+
+        scene = trimesh.Scene(vis)
+
+        # 导出着色网格
+        if args.output:
+            vis.export(args.output)
+            if args.highlight_reliable:
+                print(f"\nReliable-neighborhood mesh saved to: {args.output}")
+            else:
+                print(f"\nColored defect mesh saved to: {args.output}")
+
+        # 再叠加线框到场景用于可视化
+        if args.wireframe:
+            add_wireframe_to_scene(
+                scene, vis,
+                color=args.wireframe_color,
+                radius=args.wireframe_radius
+            )
+
+        # 高亮显示闭合孔洞边界
+        if args.highlight_holes:
+            add_hole_boundaries_to_scene(
+                scene, mesh,
+                radius=args.hole_radius,
+                min_edges=args.min_hole_edges,
+                min_area=args.min_hole_area,
+                verbose=True,
+            )
+
+        # 孔洞边界投影到代理网格
+        if args.boundary_projection and proxy_mesh is not None:
+            add_boundary_projection_to_scene(
+                scene, mesh, proxy_mesh,
+                radius=args.boundary_projection_radius,
+                verbose=True,
+                print_enclosed_vertices=args.print_shell_enclosed_vertices,
+                max_report_loops=args.max_report_boundary_loops,
+                max_report_vertices=args.max_report_shell_vertices,
+            )
+
+    if scene is not None and proxy_mesh is not None:
+        add_proxy_overlay_to_scene(scene, args, proxy_mesh)
+
+    if args.highlight_uncovered_edges and scene is not None:
+        add_uncovered_edges_to_scene(
+            scene, mesh,
+            data_dir=args.uncovered_data_dir,
+            radius=args.uncovered_radius,
+            verbose=True,
+        )
+
+    return scene
+
+
+def _parse_color_string(s):
+    """
+    将 'R,G,B,A' 字符串解析为整数列表。
+    """
+    parts = s.split(',')
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError(
+            f"Color must be 'R,G,B,A', got '{s}'"
+        )
+    try:
+        return [int(p.strip()) for p in parts]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Color components must be integers, got '{s}'"
+        )
+
+
+def _parse_color_string_flexible(s):
+    """将 'R,G,B' 或 'R,G,B,A' 字符串解析为整数列表。"""
+    parts = s.split(',')
+    if len(parts) not in (3, 4):
+        raise argparse.ArgumentTypeError(
+            f"Color must be 'R,G,B' or 'R,G,B,A', got '{s}'"
+        )
+    try:
+        return [int(p.strip()) for p in parts]
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Color components must be integers, got '{s}'"
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="检查并可视化网格模型，输出拓扑、边长、面积等统计信息。"
+    )
+    parser.add_argument("input_file", help="输入网格文件路径 (stl/ply/obj)")
+    parser.add_argument("-o", "--output",
+                        help="输出带缺陷着色的网格文件路径 (可选)")
+    parser.add_argument("--show", action="store_true",
+                        help="显示可视化窗口")
+    parser.add_argument("--wireframe", action="store_true",
+                        help="在可视化中叠加黑色线框，观察三角剖分")
+    parser.add_argument("--wireframe-radius", type=float, default=None,
+                        help="线框圆柱半径（默认按包围盒自动计算）")
+    parser.add_argument("--wireframe-color", type=str, default="0,0,0,255",
+                        help="线框 RGBA 颜色，默认 '0,0,0,255'")
+    parser.add_argument("--highlight-holes", action="store_true",
+                        help="高亮显示闭合孔洞边界，相邻孔洞使用不同高饱和度颜色")
+    parser.add_argument("--highlight-uncovered-edges", action="store_true",
+                        help="在 --show 或 --output 时高亮 hole diagnosis 中未覆盖的开放边")
+    parser.add_argument("--uncovered-data-dir", type=str,
+                        default="hole_diagnosis_report",
+                        help="hole diagnosis 输出目录，用于加载未覆盖开放边数据 "
+                             "（默认 hole_diagnosis_report）")
+    parser.add_argument("--uncovered-radius", type=float, default=None,
+                        help="未覆盖开放边圆柱半径（默认自动计算，略粗于普通线框）")
+    parser.add_argument("--highlight-reliable", action="store_true",
+                        help="高亮显示可靠邻域（绿色=可靠，黄色=缺陷邻域，红色=不可靠）")
+    parser.add_argument("--keep-reliable-only", action="store_true",
+                        help="只保留可靠面片，删除其余面片。"
+                             "需配合 --output 或 --show 使用。")
+    parser.add_argument("--reliable-threshold", type=float, default=None,
+                        help="[已废弃] 请使用 --reliable-distance。"
+                             "该参数不再生效，仅保留兼容。")
+    parser.add_argument("--reliable-distance", type=int, default=2,
+                        help="可靠面片距离开放/非流形面的最小拓扑距离"
+                             "（面邻接跳数），默认 2。")
+    parser.add_argument("--hole-radius", type=float, default=None,
+                        help="孔洞边界圆柱半径（默认自动计算，通常比普通线框略粗）")
+    parser.add_argument("--double-sided", dest='double_sided',
+                        action='store_true', default=True,
+                        help="双面渲染薄壳网格（默认开启）")
+    parser.add_argument("--no-double-sided", dest='double_sided',
+                        action='store_false',
+                        help="关闭双面渲染，恢复默认背面剔除")
+    parser.add_argument("--backface-color", type=str, default=None,
+                        help="双面渲染时背面子颜色，格式 'R,G,B,A'。"
+                             "默认自动根据正面颜色生成同色系暗色")
+    parser.add_argument("--min-hole-edges", type=int, default=3,
+                        help="高亮孔洞的最小边界边数（默认 3）")
+    parser.add_argument("--min-hole-area", type=float, default=0.0,
+                        help="高亮孔洞的最小面积（默认 0，不过滤）")
+    parser.add_argument("--weld-small-holes", action="store_true",
+                        help="自动焊接面积小于阈值的小孔洞，适用于扫描去重后的伪孔洞")
+    parser.add_argument("--weld-hole-threshold", type=float, default=None,
+                        help="焊接孔洞的绝对面积阈值；默认使用面片面积百分位")
+    parser.add_argument("--weld-hole-quantile", type=float, default=5.0,
+                        help="用于计算焊接阈值的面片面积百分位，默认 5")
+    parser.add_argument("--weld-min-hole-edges", type=int, default=3,
+                        help="焊接孔洞的最小边数，默认 3")
+    parser.add_argument("--overlay-proxy", type=str, default=None,
+                        help="同时显示输入的代理网格文件（例如体素壳），路径为 STL/PLY/OBJ")
+    parser.add_argument("--input-alpha", type=float, default=1.0,
+                        help="输入网格（或可靠子网格）不透明度，范围 0~1，"
+                             "默认 1.0。与 --overlay-proxy 配合使用时，"
+                             "设置为 0.3~0.6 效果较好")
+    parser.add_argument("--boundary-projection", action="store_true",
+                        help="将输入网格（或可靠子网格）的孔洞边界投影到代理网格表面显示。"
+                             "仅在 --overlay-proxy 且 --highlight-holes 或 --keep-reliable-only 时有效")
+    parser.add_argument("--boundary-projection-radius", type=float, default=None,
+                        help="边界投影线圆柱半径（默认使用与孔洞边界相同的半径）")
+    parser.add_argument(
+        "--print-shell-enclosed-vertices",
+        action="store_true",
+        help="在 --boundary-projection 模式下，打印投影孔洞多边形及被包围的代理网格顶点信息"
+    )
+    parser.add_argument(
+        "--max-report-boundary-loops",
+        type=int,
+        default=None,
+        help="最多打印多少个孔洞边界的投影诊断信息；默认全部"
+    )
+    parser.add_argument(
+        "--max-report-shell-vertices",
+        type=int,
+        default=20,
+        help="每个孔洞最多列出多少个被包围的代理网格顶点索引；默认 20"
+    )
+    parser.add_argument("--proxy-alpha", type=float, default=0.45,
+                        help="代理网格透明度，0=全透明，1=不透明，默认 0.45")
+    parser.add_argument("--proxy-color", type=str, default=None,
+                        help="代理网格统一颜色，格式 'R,G,B' 或 'R,G,B,A'。"
+                             "默认使用浅蓝灰色半透明 [128, 180, 255, alpha]")
+    parser.add_argument("--proxy-double-sided", dest='proxy_double_sided',
+                        action='store_true', default=True,
+                        help="双面渲染代理网格（默认开启）")
+    parser.add_argument("--no-proxy-double-sided", dest='proxy_double_sided',
+                        action='store_false',
+                        help="关闭代理网格双面渲染")
+    parser.add_argument("--full-diagnosis", action="store_true",
+                        help="执行 Full Diagnosis（2-Pass），生成异常面拓扑分类报告")
+    parser.add_argument("--hole-diagnosis", action="store_true",
+                        help="执行孔洞诊断（健康孔洞提取及未覆盖开放边分类）")
+    parser.add_argument("--compute-enclosing-boundaries", action="store_true",
+                        help="在 hole diagnosis 中计算每个未覆盖开放边组件的最小包络流形边界")
+    parser.add_argument(
+        "--extract-component-package",
+        action="store_true",
+        help="提取指定边界组件或健康孔洞的局部网格和组件数据并保存"
+    )
+    parser.add_argument(
+        "--component-output",
+        type=str,
+        default=None,
+        help="提取的局部网格 PLY 输出路径（默认：<输入文件名>_component_<boundary_id>.ply）"
+    )
+    parser.add_argument(
+        "--component-json",
+        type=str,
+        default=None,
+        help="提取的组件 JSON 输出路径（默认：<输入文件名>_component_<boundary_id>.json）"
+    )
+    parser.add_argument(
+        "--component-package",
+        type=str,
+        default=None,
+        help="加载已提取的组件包 JSON（与 --visualize-boundary-component 配合使用）"
+    )
+    # 新增：局部边界组件可视化参数（在 --hole-diagnosis 后插入）
+    parser.add_argument("--visualize-boundary-component", action="store_true",
+                        help="可视化特定孔洞/开放边分量及其三角面片")
+    parser.add_argument("--boundary-type", choices=["uncovered", "healthy"],
+                        default="uncovered",
+                        help="要可视化的边界类型：uncovered（未覆盖开放边分量）或 healthy（健康孔洞）")
+    parser.add_argument("--boundary-id", type=int, default=0,
+                        help="边界组件或孔洞的 ID（默认 0）")
+    parser.add_argument("--boundary-data-dir", type=str, default="hole_diagnosis_report",
+                        help="hole diagnosis 输出目录（默认 hole_diagnosis_report）")
+    parser.add_argument("--boundary-neighborhood-depth", type=int, default=1,
+                        help="边界邻域深度：0 仅边界，1 边界所在面片，"
+                             "2 边界面片+直接邻居，依此类推（默认 1）")
+    parser.add_argument("--boundary-radius", type=float, default=None,
+                        help="边界圆柱半径（默认自动计算）")
+    parser.add_argument("--boundary-show-original", action="store_true",
+                        help="同时显示原始网格（半透明背景）")
+    parser.add_argument("--debug-scene", action="store_true",
+                        help="在显示或导出边界组件场景前，打印场景内所有几何对象的位置与大小")
+    parser.add_argument("--fit-watertight-patch", action="store_true",
+                        help="在可视化边界组件时，拟合亏格0水密曲面并显示包络交线")
+    parser.add_argument("--patch-method",
+                        choices=["poisson", "convex_hull", "concave_hull"],
+                        default="poisson",
+                        help="水密包络曲面生成算法（默认 poisson）")
+    parser.add_argument("--patch-neighborhood-depth", type=int, default=2,
+                        help="点云提取的邻域深度（默认 2）")
+    parser.add_argument("--patch-poisson-depth", type=int, default=8,
+                        help="泊松重建深度（默认 8）")
+    parser.add_argument("--patch-density-quantile", type=float, default=0.2,
+                        help="泊松密度过滤分位（默认 0.2）")
+    parser.add_argument("--patch-alpha", type=float, default=1.5,
+                        help="凹包算法的 alpha 参数（默认 1.5）")
+    parser.add_argument("--patch-opacity", type=float, default=0.3,
+                        help="拟合水密曲面的不透明度，范围 0~1，默认 0.3")
+    parser.add_argument("--allow-non-genus0", action="store_true",
+                        help="允许水密但亏格非0的拟合曲面通过（用于可视化调试）")
+    parser.add_argument(
+        "--generate-seifert-surface",
+        action="store_true",
+        help="在可视化健康孔洞时，生成并显示 Seifert 曲面（固定边界极小曲面优化）"
+    )
+    parser.add_argument(
+        "--seifert-optimize-iterations",
+        type=int,
+        default=200,
+        help="Seifert 曲面内部顶点优化迭代次数（默认 200）"
+    )
+    parser.add_argument(
+        "--seifert-step-size",
+        type=float,
+        default=1.0,
+        help="Seifert 曲面 Dirichlet 求解松弛系数（默认 1.0）"
+    )
+    parser.add_argument(
+        "--seifert-tolerance",
+        type=float,
+        default=1e-7,
+        help="Seifert 曲面优化收敛容差（默认 1e-7）"
+    )
+    parser.add_argument(
+        "--seifert-color",
+        type=str,
+        default="255,215,0,255",
+        help="Seifert 曲面显示颜色，格式 'R,G,B,A'，默认金色"
+    )
+    parser.add_argument(
+        "--seifert-curvature-report",
+        action="store_true",
+        help="打印 Seifert 曲面曲率统计信息"
+    )
+    parser.add_argument(
+        "--print-camera-info",
+        action="store_true",
+        help="在可视化窗口关闭后输出窗口大小、摄像机位置/朝向等参数"
+    )
+    parser.add_argument(
+        "--camera-info-output",
+        type=str,
+        default=None,
+        help="将摄像机信息保存为 JSON 文件（可选）"
+    )
+    parser.add_argument("--hole-diagnosis-output", type=str, default="hole_diagnosis_report",
+                        help="孔洞诊断输出目录（默认 hole_diagnosis_report）")
+    parser.add_argument("--diagnosis-output", type=str, default="diagnosis_report",
+                        help="Full Diagnosis 输出目录（默认 diagnosis_report）")
+    parser.add_argument("--diagnosis-format", type=str, default="html",
+                        choices=["html", "latex"],
+                        help="报告格式：html 或 latex（默认 html）")
+    parser.add_argument("--resume", action="store_true",
+                        help="从现有检查点继续 Full Diagnosis Pass 2（跳过已完成类别）")
+    parser.add_argument("--valence-threshold",
+                        type=int,
+                        default=5,
+                        help="顶点元 valence 截断阈值，默认 5。"
+                             "当顶点被引用的面片数 >= 阈值时，截断编码归并为该阈值。")
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return
+
+    args = parser.parse_args()
+
+    if args.reliable_threshold is not None:
+        print("[WARNING] --reliable-threshold is deprecated and ignored. "
+              "Use --reliable-distance instead.")
+
+    args.wireframe_color = _parse_color_string(args.wireframe_color)
+
+    if args.backface_color is not None:
+        args.backface_color = _parse_color_string(args.backface_color)
+
+    if args.proxy_color is not None:
+        args.proxy_color = _parse_color_string_flexible(args.proxy_color)
+
+    if args.seifert_color is not None:
+        args.seifert_color = _parse_color_string(args.seifert_color)
+
+    print(f"Hey! Loading {args.input_file}")
+    mesh = trimesh.load(args.input_file, force="mesh")
+    if not isinstance(mesh, trimesh.Trimesh):
+        mesh = mesh.dump(concatenate=True)
+        print("Multiple meshes detected, merged.")
+
+    # 提取组件包入口
+    if args.extract_component_package:
+        extract_component_package(mesh, args)
+        return
+
+    # 新增：局部边界组件可视化入口
+    if args.visualize_boundary_component:
+        visualize_boundary_component(mesh, args)
+        return
+
+    if args.hole_diagnosis:
+        perform_hole_diagnosis(mesh, args)
+        return
+
+    if args.full_diagnosis:
+        perform_full_diagnosis(mesh, args)
+        return
+
+    scene = inspect_mesh(mesh, args)
+
+    if args.show and scene is not None:
+        try:
+            os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
+            _show_scene_with_camera_info(scene, args)
+        except Exception as e:
+            print(f"\n[ERROR] Visualization failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
