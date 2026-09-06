@@ -898,6 +898,25 @@ def _generate_component_3d_diagram(component, mesh, output_path):
     plt.close(fig)
 
 
+def _print_boundary_component_diagnostics(mesh, comp, boundary_type, boundary_id, neighborhood_depth):
+    """
+    打印边界组件的简要诊断信息（用于 extract_component_package）。
+    """
+    vertices = comp.get("vertices", [])
+    edges = comp.get("edge_vertex_pairs", [])
+    face_ids = comp.get("face_ids", [])
+
+    print(f"  [{boundary_type} #{boundary_id}] 组件概览 "
+          f"(深度 {neighborhood_depth}):")
+    print(f"    组件顶点数: {len(vertices)}")
+    print(f"    组件边数: {len(edges)}")
+    print(f"    关联面数: {len(face_ids)}")
+    if comp.get("is_cycle"):
+        print("    类型: 闭合健康孔洞环")
+    else:
+        print("    类型: 未覆盖开放边分量")
+
+
 def _build_vertex_face_csr(mesh):
     """
     构建 (n_vertices, n_faces) 的 CSR 矩阵，行内存储包含该顶点的面索引。
@@ -1494,4 +1513,4 @@ def _print_seifert_fill_comparison(mesh, comp, seifert_mesh,
     )
 
 # [The remaining file content continues unchanged from the original file.]
-# (…)
+# (...)
