@@ -1245,52 +1245,6 @@ def _generate_initial_seifert_disk(mesh, loop_vertices):
         return None, []
 
 
-def _get_component_neighborhood_mesh(mesh, comp, depth):
-    """获取指定组件邻域子网格（未双面化）。"""
-    face_ids = comp.get("face_ids", [])
-    if not face_ids:
-        return None
-
-    expanded = expand_face_neighborhood(mesh, face_ids, depth)
-    if not expanded:
-        expanded = set(face_ids)
-
-    return mesh.submesh([np.array(sorted(expanded), dtype=np.int64)])[0]
-
-
-def _classify_mesh_edges_and_faces(mesh):
-    """
-    统计网格中的边与面片缺陷类型。
-
-    返回字典：
-        total_edges, open_edges, manifold_edges, nonmanifold_edges
-        total_faces, open_faces, manifold_faces, nonmanifold_faces
-    """
-    defect_stats, open_face_mask, nonmanifold_face_mask = analyze_mesh_defects(mesh)
-
-    total_edges = len(mesh.edges_unique)
-    open_edges = defect_stats["open_edges"]
-    nonmanifold_edges = defect_stats["nonmanifold_edges"]
-    manifold_edges = total_edges - open_edges - nonmanifold_edges
-
-    total_faces = len(mesh.faces)
-    open_faces = int(open_face_mask.sum())
-    nonmanifold_faces = int(nonmanifold_face_mask.sum())
-    union_mask = open_face_mask | nonmanifold_face_mask
-    manifold_faces = total_faces - int(union_mask.sum())
-
-    return {
-        "total_edges": total_edges,
-        "open_edges": open_edges,
-        "manifold_edges": manifold_edges,
-        "nonmanifold_edges": nonmanifold_edges,
-        "total_faces": total_faces,
-        "open_faces": open_faces,
-        "manifold_faces": manifold_faces,
-        "nonmanifold_faces": nonmanifold_faces,
-    }
-
-
 def _build_filled_mesh(neighborhood_mesh, seifert_mesh, loop_original_indices,
                        seifert_boundary_indices):
     """
@@ -1335,180 +1289,163 @@ def _build_filled_mesh(neighborhood_mesh, seifert_mesh, loop_original_indices,
     return filled_mesh
 
 
-def _compute_target_face_edge_stats(context_mesh, target_face_indices):
-    """
-    在给定上下文网格中，统计指定目标面片集合的边/面缺陷类型。
+def _edge_tuple(v0, v1):
+    v0 = int(v0)
+    v1 = int(v1)
+    return (v0, v1) if v0 < v1 else (v1, v0)
 
-    边的类型由上下文网格中该边被多少个面片使用决定。
-    目标面片的开放/非流形标记也基于其三条边的上下文类型。
-    """
-    target_face_indices = np.asarray(target_face_indices, dtype=np.int64)
-    if len(target_face_indices) == 0:
-        return {
-            "open_edges": 0,
-            "manifold_edges": 0,
-            "nonmanifold_edges": 0,
-            "open_faces": 0,
-            "manifold_faces": 0,
-            "nonmanifold_faces": 0,
-        }
 
-    edge_keys, edge_faces = compute_edge_to_faces(context_mesh)
-    edge_to_faces = {int(k): v for k, v in zip(edge_keys, edge_faces)}
-    face_edge_keys = compute_face_edge_keys(context_mesh)
+def _classify_edge_count(cnt):
+    if cnt == 1:
+        return "open"
+    if cnt == 2:
+        return "manifold"
+    return "nonmanifold"
 
-    # 收集目标面片涉及的所有独特边
-    target_edge_keys = np.unique(
-        face_edge_keys[target_face_indices].ravel()
-    )
 
-    open_edges = 0
-    manifold_edges = 0
-    nonmanifold_edges = 0
+def _build_edge_tuple_to_faces(mesh, face_indices=None):
+    """构建 (min_v, max_v) -> 共享面片索引列表 的完整映射，包含开放边。"""
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    if face_indices is None:
+        face_indices = np.arange(len(faces), dtype=np.int64)
 
-    for key in target_edge_keys:
-        cnt = len(edge_to_faces.get(int(key), []))
-        if cnt == 1:
-            open_edges += 1
-        elif cnt == 2:
-            manifold_edges += 1
-        else:
-            nonmanifold_edges += 1
-
-    open_face_set = set()
-    nonmanifold_face_set = set()
-
-    for fid in target_face_indices:
-        has_open = False
-        has_nonmanifold = False
-        for key in face_edge_keys[fid]:
-            cnt = len(edge_to_faces.get(int(key), []))
-            if cnt == 1:
-                has_open = True
-            elif cnt >= 3:
-                has_nonmanifold = True
-
-        if has_open:
-            open_face_set.add(int(fid))
-        if has_nonmanifold:
-            nonmanifold_face_set.add(int(fid))
-
-    total_faces = int(len(target_face_indices))
-    union_defect_faces = open_face_set | nonmanifold_face_set
-    manifold_faces = total_faces - len(union_defect_faces)
-
-    return {
-        "open_edges": int(open_edges),
-        "manifold_edges": int(manifold_edges),
-        "nonmanifold_edges": int(nonmanifold_edges),
-        "open_faces": int(len(open_face_set)),
-        "manifold_faces": int(manifold_faces),
-        "nonmanifold_faces": int(len(nonmanifold_face_set)),
-    }
+    edge_map = {}
+    for fid in face_indices:
+        fid = int(fid)
+        face = faces[fid]
+        for j in range(3):
+            v0 = int(face[j])
+            v1 = int(face[(j + 1) % 3])
+            key = _edge_tuple(v0, v1)
+            edge_map.setdefault(key, []).append(fid)
+    return edge_map
 
 
 def _print_seifert_fill_comparison(mesh, comp, seifert_mesh,
                                    loop_original_indices,
                                    seifert_boundary_indices):
     """
-    打印 Seifert 曲面填充前后 0 层邻域（组件面片）缺陷统计对比。
+    打印 Seifert 曲面填充前后，健康孔洞边界边及新增 Seifert 曲面边/面属性统计。
 
-    边的类型根据第 1 层邻域上下文判断，避免将局部提取造成的
-    外边界边误判为开放边。
+    仅使用 0 层邻域（组件种子面片）构建局部网格。
     """
-    seed_faces = comp.get("face_ids", [])
+    seed_faces = list(map(int, comp.get("face_ids", [])))
     if not seed_faces:
         print("  [WARN] 无法获取组件种子面片，跳过 Seifert 填充对比")
         return
 
-    # 第 1 层邻域上下文：种子面片 + 直接邻居
-    context_faces = sorted(
-        expand_face_neighborhood(mesh, set(seed_faces), 2)
-    )
-    if not context_faces:
-        context_faces = sorted(set(seed_faces))
+    # 0 层邻域：只取组件种子面片
+    original_faces = np.asarray(mesh.faces, dtype=np.int64)
+    face_idx_sub = np.array(sorted(seed_faces), dtype=np.int64)
+    sub_faces = original_faces[face_idx_sub]
 
-    # 构建上下文子网格，并建立原始面/顶点到局部索引的映射
-    faces_idx = np.array(context_faces, dtype=np.int64)
-    original_faces = np.asarray(mesh.faces, dtype=np.int64)[faces_idx]
+    unique_verts, inverse = np.unique(sub_faces.ravel(), return_inverse=True)
+    local_vertices = mesh.vertices[unique_verts]
+    local_faces = inverse.reshape(-1, 3)
 
-    unique_old_vertices = np.unique(original_faces.ravel())
-    old_to_new = {
-        int(old_v): int(new_v)
-        for new_v, old_v in enumerate(unique_old_vertices)
-    }
-
-    context_vertices = mesh.vertices[unique_old_vertices]
-    context_local_faces = np.array(
-        [
-            [old_to_new[int(v)] for v in face]
-            for face in original_faces
-        ],
-        dtype=np.int64,
-    )
-    context_mesh = trimesh.Trimesh(
-        vertices=context_vertices,
-        faces=context_local_faces,
+    local_mesh = trimesh.Trimesh(
+        vertices=local_vertices,
+        faces=local_faces,
         process=False,
     )
 
-    # 种子面片在上下文子网格中的局部索引
-    seed_original_set = set(int(f) for f in seed_faces)
-    seed_local_faces = [
-        local_idx
-        for local_idx, orig_idx in enumerate(faces_idx)
-        if int(orig_idx) in seed_original_set
-    ]
+    old_to_new = {
+        int(old_v): int(new_v)
+        for new_v, old_v in enumerate(unique_verts)
+    }
 
-    if not seed_local_faces:
-        print("  [WARN] 种子面片未包含在上下文中，跳过填充对比")
+    loop_local = []
+    for v in loop_original_indices:
+        if int(v) not in old_to_new:
+            print("  [WARN] 孔洞边界顶点不在种子面片中，跳过填充对比")
+            return
+        loop_local.append(old_to_new[int(v)])
+
+    if len(loop_local) != len(seifert_boundary_indices):
+        print("  [WARN] Seifert 边界映射长度不一致，跳过填充对比")
         return
 
-    # 孔洞边界顶点映射到上下文子网格局部索引
-    loop_local = [
-        old_to_new[int(v)]
-        for v in loop_original_indices
-        if int(v) in old_to_new
-    ]
-    if len(loop_local) != len(loop_original_indices):
-        print("  [WARN] 部分孔洞边界顶点不在上下文子网格中，跳过填充对比")
-        return
-
-    # 填充前统计
-    before = _compute_target_face_edge_stats(
-        context_mesh,
-        seed_local_faces,
-    )
-
-    # 将 Seifert 曲面合并到上下文子网格中
-    filled_context_mesh = _build_filled_mesh(
-        context_mesh,
+    filled_mesh = _build_filled_mesh(
+        local_mesh,
         seifert_mesh,
         loop_local,
         seifert_boundary_indices,
     )
-    if filled_context_mesh is None:
+    if filled_mesh is None:
         return
 
-    # 填充后统计（种子面片索引保持不变，因为 Seifert 面片追加在末尾）
-    after = _compute_target_face_edge_stats(
-        filled_context_mesh,
-        seed_local_faces,
-    )
+    # 1) 健康孔洞边界边填充前后属性
+    loop_edge_tuples = []
+    for i in range(len(loop_local)):
+        v0 = loop_local[i]
+        v1 = loop_local[(i + 1) % len(loop_local)]
+        loop_edge_tuples.append(_edge_tuple(v0, v1))
 
-    print("  Seifert 曲面局部填充对比（0层邻域/组件面片，上下文感知）:")
-    print(f"    开放边:     {before['open_edges']:>6} -> {after['open_edges']:>6}  "
-          f"(变化 {after['open_edges'] - before['open_edges']:+d})")
-    print(f"    流形边:     {before['manifold_edges']:>6} -> {after['manifold_edges']:>6}  "
-          f"(变化 {after['manifold_edges'] - before['manifold_edges']:+d})")
-    print(f"    非流形边:   {before['nonmanifold_edges']:>6} -> {after['nonmanifold_edges']:>6}  "
-          f"(变化 {after['nonmanifold_edges'] - before['nonmanifold_edges']:+d})")
-    print(f"    开放面片:   {before['open_faces']:>6} -> {after['open_faces']:>6}  "
-          f"(变化 {after['open_faces'] - before['open_faces']:+d})")
-    print(f"    流形面片:   {before['manifold_faces']:>6} -> {after['manifold_faces']:>6}  "
-          f"(变化 {after['manifold_faces'] - before['manifold_faces']:+d})")
-    print(f"    非流形面片: {before['nonmanifold_faces']:>6} -> {after['nonmanifold_faces']:>6}  "
-          f"(变化 {after['nonmanifold_faces'] - before['nonmanifold_faces']:+d})")
+    local_edge_map = _build_edge_tuple_to_faces(local_mesh)
+    filled_edge_map = _build_edge_tuple_to_faces(filled_mesh)
+
+    before = {"open": 0, "manifold": 0, "nonmanifold": 0}
+    after = {"open": 0, "manifold": 0, "nonmanifold": 0}
+
+    for key in loop_edge_tuples:
+        cnt_before = len(local_edge_map.get(key, []))
+        cnt_after = len(filled_edge_map.get(key, []))
+        before[_classify_edge_count(cnt_before)] += 1
+        after[_classify_edge_count(cnt_after)] += 1
+
+    # 2) Seifert 曲面新增边/面属性
+    new_face_start = len(local_mesh.faces)
+    new_face_indices = list(range(new_face_start, len(filled_mesh.faces)))
+
+    new_face_stats = {"open": 0, "manifold": 0, "nonmanifold": 0}
+    new_edge_set = set()
+
+    for fid in new_face_indices:
+        face = filled_mesh.faces[fid]
+        has_open = False
+        has_nonmanifold = False
+
+        for j in range(3):
+            key = _edge_tuple(face[j], face[(j + 1) % 3])
+            new_edge_set.add(key)
+
+            cnt = len(filled_edge_map.get(key, []))
+            if cnt == 1:
+                has_open = True
+            elif cnt >= 3:
+                has_nonmanifold = True
+
+        if has_open:
+            new_face_stats["open"] += 1
+        elif has_nonmanifold:
+            new_face_stats["nonmanifold"] += 1
+        else:
+            new_face_stats["manifold"] += 1
+
+    new_edge_stats = {"open": 0, "manifold": 0, "nonmanifold": 0}
+    for key in new_edge_set:
+        cnt = len(filled_edge_map.get(key, []))
+        new_edge_stats[_classify_edge_count(cnt)] += 1
+
+    print("  Seifert 曲面局部填充对比（0层邻域）:")
+    print(
+        f"    健康孔洞边界边: "
+        f"开放={before['open']} -> {after['open']}, "
+        f"流形={before['manifold']} -> {after['manifold']}, "
+        f"非流形={before['nonmanifold']} -> {after['nonmanifold']}"
+    )
+    print(
+        f"    新增 Seifert 面片: {len(new_face_indices)} 个 "
+        f"(开放={new_face_stats['open']}, "
+        f"流形={new_face_stats['manifold']}, "
+        f"非流形={new_face_stats['nonmanifold']})"
+    )
+    print(
+        f"    新增 Seifert 唯一边: {len(new_edge_set)} 条 "
+        f"(开放={new_edge_stats['open']}, "
+        f"流形={new_edge_stats['manifold']}, "
+        f"非流形={new_edge_stats['nonmanifold']})"
+    )
 
 
 def _build_cotangent_laplacian(mesh):
