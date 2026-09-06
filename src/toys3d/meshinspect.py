@@ -1878,12 +1878,8 @@ def _show_scene_with_vedo(scene):
 
 def _show_scene_with_camera_info(scene, args, scene_translation=None):
     """
-    统一封装 scene.show()，支持在窗口关闭后捕获并打印相机信息。
+    统一封装 scene.show()，使用 vedo 显示，并按需捕获/打印相机信息。
     """
-    if not (args.print_camera_info or args.camera_info_output):
-        scene.show()
-        return
-
     info = None
 
     # 1. 旧版 trimesh 有 VedoViewer，优先使用
@@ -1908,11 +1904,11 @@ def _show_scene_with_camera_info(scene, args, scene_translation=None):
         try:
             info = _show_scene_with_vedo(scene)
         except ImportError as e:
-            print(f"[WARN] vedo 未安装，无法捕获相机信息: {e}")
+            print(f"[WARN] vedo 未安装，回退到默认显示: {e}")
             scene.show()
             return
         except Exception as e:
-            print(f"[WARN] vedo 直接显示失败: {e}")
+            print(f"[WARN] vedo 直接显示失败，回退到默认显示: {e}")
             scene.show()
             return
 
@@ -1928,7 +1924,8 @@ def _show_scene_with_camera_info(scene, args, scene_translation=None):
             ).tolist()
         info["scene_translation"] = t.tolist()
 
-    if info:
+    # 只有用户要求时才打印/保存相机信息
+    if info and (args.print_camera_info or args.camera_info_output):
         _print_camera_info(info)
         if args.camera_info_output:
             out = Path(args.camera_info_output)
