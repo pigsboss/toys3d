@@ -1335,21 +1335,56 @@ def _build_filled_mesh(neighborhood_mesh, seifert_mesh, loop_original_indices,
     return filled_mesh
 
 
-def _print_seifert_fill_comparison(mesh, comp, depth, seifert_mesh,
+def _print_seifert_fill_comparison(mesh, comp, seifert_mesh,
                                    loop_original_indices,
                                    seifert_boundary_indices):
-    """打印 Seifert 曲面填充前后局部邻域缺陷统计对比。"""
-    neighborhood_mesh = _get_component_neighborhood_mesh(mesh, comp, depth)
-    if neighborhood_mesh is None:
-        print("  [WARN] 无法获取邻域网格，跳过 Seifert 填充对比")
+    """打印 Seifert 曲面填充前后 0 层邻域（组件面片）缺陷统计对比。"""
+    seed_faces = comp.get("face_ids", [])
+    if not seed_faces:
+        print("  [WARN] 无法获取组件种子面片，跳过 Seifert 填充对比")
         return
 
+    # 仅使用种子面片构建局部网格
+    faces_idx = np.array(sorted(set(seed_faces)), dtype=np.int64)
+    original_faces = np.asarray(mesh.faces, dtype=np.int64)[faces_idx]
+
+    unique_old_vertices = np.unique(original_faces.ravel())
+    old_to_new = {
+        int(old_v): int(new_v)
+        for new_v, old_v in enumerate(unique_old_vertices)
+    }
+
+    local_vertices = mesh.vertices[unique_old_vertices]
+    local_faces = np.array(
+        [
+            [old_to_new[int(v)] for v in face]
+            for face in original_faces
+        ],
+        dtype=np.int64,
+    )
+
+    neighborhood_mesh = trimesh.Trimesh(
+        vertices=local_vertices,
+        faces=local_faces,
+        process=False,
+    )
+
     before = _classify_mesh_edges_and_faces(neighborhood_mesh)
+
+    # 将原网格孔洞顶点索引映射到局部网格索引
+    loop_local = [
+        old_to_new[int(v)]
+        for v in loop_original_indices
+        if int(v) in old_to_new
+    ]
+    if len(loop_local) != len(loop_original_indices):
+        print("  [WARN] 部分孔洞边界顶点不在种子面片中，跳过填充对比")
+        return
 
     filled_mesh = _build_filled_mesh(
         neighborhood_mesh,
         seifert_mesh,
-        loop_original_indices,
+        loop_local,
         seifert_boundary_indices,
     )
     if filled_mesh is None:
@@ -1357,7 +1392,7 @@ def _print_seifert_fill_comparison(mesh, comp, depth, seifert_mesh,
 
     after = _classify_mesh_edges_and_faces(filled_mesh)
 
-    print("  Seifert 曲面局部填充对比（邻域）:")
+    print("  Seifert 曲面局部填充对比（0层邻域/组件面片）:")
     print(f"    开放边:     {before['open_edges']:>6} -> {after['open_edges']:>6}  "
           f"(变化 {after['open_edges'] - before['open_edges']:+d})")
     print(f"    流形边:     {before['manifold_edges']:>6} -> {after['manifold_edges']:>6}  "
@@ -2095,9 +2130,9 @@ def visualize_boundary_component(mesh, args):
         scene.add_geometry(seg)
 
     # Seifert 曲面
-    if getattr(args, 'generate_seifert_surface_strict', False):
+    if getattr(args, 'generate_seifert_surface', False):
         if effective_boundary_type != "healthy":
-            print("  警告: --generate-seifert-surface-strict 仅适用于 healthy 孔洞")
+            print("  警告: --generate-seifert-surface 仅适用于 healthy 孔洞")
         else:
             loop = comp.get("healthy_hole_vertex_indices")
             if not loop:
@@ -2112,7 +2147,7 @@ def visualize_boundary_component(mesh, args):
                     print("  [WARN] 未找到任何边界信息")
                 loop = []
             if loop and len(loop) >= 3:
-                print("生成严格 Seifert 曲面...")
+                print("生成 Seifert 曲面...")
                 disk_mesh, boundary_indices = _generate_initial_seifert_disk(mesh, loop)
                 if disk_mesh is None:
                     print("  [WARN] 无法生成初始圆盘")
@@ -2133,7 +2168,6 @@ def visualize_boundary_component(mesh, args):
                     _print_seifert_fill_comparison(
                         mesh,
                         comp,
-                        args.boundary_neighborhood_depth,
                         seifert_mesh,
                         loop,
                         boundary_indices,
@@ -3529,9 +3563,9 @@ def main():
     parser.add_argument("--allow-non-genus0", action="store_true",
                         help="允许水密但亏格非0的拟合曲面通过（用于可视化调试）")
     parser.add_argument(
-        "--generate-seifert-surface-strict",
+        "--generate-seifert-surface",
         action="store_true",
-        help="在可视化健康孔洞时，生成并显示严格 Seifert 曲面（固定边界极小曲面优化）"
+        help="在可视化健康孔洞时，生成并显示 Seifert 曲面（固定边界极小曲面优化）"
     )
     parser.add_argument(
         "--seifert-optimize-iterations",
