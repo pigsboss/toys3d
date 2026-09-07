@@ -26,10 +26,6 @@ _src_parent = os.path.dirname(_project_root)
 if _src_parent not in sys.path:
     sys.path.insert(0, _src_parent)
 
-from toys3d.geometrics import (  # noqa: E402
-    expand_face_neighborhood as geometric_expand_face_neighborhood,
-)
-
 
 def load_mesh(input_file):
     """加载网格并返回 trimesh.Trimesh。"""
