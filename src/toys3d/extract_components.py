@@ -28,8 +28,13 @@ if _src_parent not in sys.path:
 
 
 def load_mesh(input_file):
-    """加载网格并返回 trimesh.Trimesh。"""
-    mesh = trimesh.load(input_file, force="mesh")
+    """加载网格并返回 trimesh.Trimesh（跳过慢速顶点合并）。"""
+    mesh = trimesh.load(
+        input_file,
+        force="mesh",
+        process=False,      # 跳过 merge_vertices，大幅加速千万级网格加载
+        validate=False,
+    )
     if isinstance(mesh, trimesh.Scene):
         mesh = mesh.dump(concatenate=True)
     return mesh
@@ -321,8 +326,9 @@ def main():
             hole["endpoints"] = []
             hole["branch_vertices"] = []
             hole["candidate_breaks"] = []
-            hole.setdefault("healthy_hole_vertex_indices", hole["vertex_indices"])
-            hole["vertices"] = hole["vertex_indices"]
+            # 加载网格时未合并顶点，全局顶点索引可能失效，这里不写入旧索引
+            hole["vertices"] = []
+            hole["healthy_hole_vertex_indices"] = []
     else:
         components = load_uncovered_components(args.hole_diagnosis_dir)
         # 未覆盖组件中已经有 component_id、face_ids 等
