@@ -733,7 +733,7 @@ def _main():
 
     args = parser.parse_args()
 
-    print(f"加载网格: {args.input_file}")
+    print(f"Hey! Loading {args.input_file}")
     mesh = trimesh.load(args.input_file, force="mesh")
 
     diag_path = Path(args.hole_diagnosis_dir) / "hole_diagnosis.json"
