@@ -1504,6 +1504,13 @@ def visualize_boundary_component(mesh, args):
     可视化健康孔洞或未覆盖开放边分量及其局部三角面片。
     默认不显示整个网格，只显示目标边界和指定邻域深度内的面片。
     """
+    # 自动查找与输入 PLY 同名的组件包 JSON
+    if not args.component_package:
+        candidate = Path(args.input_file).with_suffix('.json')
+        if candidate.exists():
+            args.component_package = str(candidate)
+            print(f"自动找到组件包: {candidate}")
+
     boundary_id = args.boundary_id
 
     if args.component_package:
@@ -3218,6 +3225,11 @@ def main():
         return
 
     args = parser.parse_args()
+
+    # 可视化边界组件时，自动开启显示窗口
+    if args.visualize_boundary_component and not args.show:
+        args.show = True
+        print("  [info] --visualize-boundary-component 已自动开启 --show")
 
     if args.reliable_threshold is not None:
         print("[WARNING] --reliable-threshold is deprecated and ignored. "
