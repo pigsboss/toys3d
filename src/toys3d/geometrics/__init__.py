@@ -46,8 +46,6 @@ from .topology import (
     expand_face_neighborhood,
     compute_face_distances,
     reconstruct_loop_from_edges,
-    extract_plate_boundary_loops,
-    get_k_ring_neighbors,
 )
 
 from .discrete import (
@@ -65,12 +63,6 @@ from .discrete import (
 from .analysis import (
     build_box_aligned_frame_voxel,
     build_box_aligned_frame_mesh,
-    fit_line_3d,
-    fit_circle_3d,
-    ransac_plane_fitting,
-    multi_ransac_planes,
-    map_labels_from_proxy,
-    segment_plates_by_plane_fitting,
 )
 
 from .generation import (
@@ -92,21 +84,4 @@ from .utilities import (
     generate_initial_seifert_disk,
     extract_intersection_faces_by_vertex_state,
     segment_tubular_regions,
-)
-
-# ------------------------------------------------------------------------------
-# Legacy fallbacks for functions still used by shell.py / downstream tools but
-# not yet moved into the split geometrics sub-package.
-# ------------------------------------------------------------------------------
-from toys3d.geometrics_older import (
-    fit_spline_3d,
-    classify_edge_regularity,
-    detect_multiscale_edges,
-    segment_regions_by_edges,
-    estimate_shell_thickness,
-    segment_plates_by_smoothness,
-    detect_thin_regions,
-    compute_wall_thickness_statistics,
-    build_proxy_mesh,
-    segment_plates_by_local_clustering,
 )

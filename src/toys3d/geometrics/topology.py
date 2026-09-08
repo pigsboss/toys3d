@@ -1043,26 +1043,6 @@ def reconstruct_loop_from_edges(edge_vertex_pairs):
     return loop
 
 
-def build_face_adjacency(mesh):
-    """
-    返回面片邻接表，adj[fi] 为与 fi 共享一条边的面片索引列表。
-    """
-    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
-    N = len(faces)
-    adjacency = [[] for _ in range(N)]
-    edge_map = {}
-    for fi, (v1, v2, v3) in enumerate(faces):
-        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
-            key = (a, b) if a < b else (b, a)
-            if key in edge_map:
-                fj = edge_map[key]
-                adjacency[fi].append(fj)
-                adjacency[fj].append(fi)
-            else:
-                edge_map[key] = fi
-    return adjacency
-
-
 def compute_g1_deviation(mesh, face_i, face_j):
     """
     计算两个相邻面片间的 G1 光滑偏差（二面角，弧度）。
@@ -1073,87 +1053,40 @@ def compute_g1_deviation(mesh, face_i, face_j):
     return np.arccos(dot)
 
 
-def get_k_ring_neighbors(adjacency, seed, k=1):
-    """
-    获取面片的 k-ring 邻域（包括 seed 自身）。
-    """
-    visited = {seed}
-    frontier = {seed}
-    for _ in range(k):
-        new_frontier = set()
-        for f in frontier:
-            new_frontier.update(adjacency[f])
-        frontier = new_frontier - visited
-        visited.update(frontier)
-        if not frontier:
-            break
-    return np.array(list(visited), dtype=int)
+def extract_intersection_faces_by_vertex_state(W, N, eps=None):
+    n_verts = len(N.vertices)
+    n_faces = len(N.faces)
 
+    if n_verts == 0 or n_faces == 0:
+        return np.zeros(n_faces, dtype=bool), np.array([], dtype=np.int64), np.zeros(n_verts, dtype=np.int8)
 
-def extract_plate_boundary_loops(mesh, plate_mask):
-    """
-    提取指定薄板面片集合的所有边界环。
+    closest, dist, _ = W.nearest.on_surface(N.vertices)
+    inside = W.contains(N.vertices)
 
-    Parameters
-    ----------
-    mesh : trimesh.Trimesh
-    plate_mask : (N,) bool
-        属于某一块板（或合并后的板）的面片掩码。
+    if eps is None:
+        median_w = np.median(W.edges_unique_length) if len(W.edges_unique) else 0.0
+        median_n = np.median(N.edges_unique_length) if len(N.edges_unique) else 0.0
+        eps = max(median_w, median_n) * 1e-6
 
-    Returns
-    -------
-    loops : list of list of int
-        每个边界环的顶点索引列表。
-    """
-    faces = np.asarray(mesh.faces).reshape(-1, 3)
-    mask = np.asarray(plate_mask, dtype=bool)
-    plate_indices = np.flatnonzero(mask)
+    on_surface = dist <= eps
+    outside = (~inside) & (~on_surface)
+    inside_only = inside & (~on_surface)
 
-    if len(plate_indices) == 0:
-        return []
+    vertex_state = np.zeros(n_verts, dtype=np.int8)
+    vertex_state[inside_only] = 0
+    vertex_state[outside] = 1
+    vertex_state[on_surface] = 2
 
-    # 统计子网格内部每条边的出现次数
-    edge_count = {}
-    for fi in plate_indices:
-        v = faces[fi]
-        for j in range(3):
-            a, b = int(v[j]), int(v[(j + 1) % 3])
-            key = (a, b) if a < b else (b, a)
-            edge_count[key] = edge_count.get(key, 0) + 1
+    face_mask = np.zeros(n_faces, dtype=bool)
 
-    boundary_edges = [e for e, c in edge_count.items() if c == 1]
-    if not boundary_edges:
-        return []
+    faces = np.asarray(N.faces, dtype=np.int64)
+    for fid, tri in enumerate(faces):
+        vs = vertex_state[tri]
+        has_inside = np.any(vs == 0)
+        has_outside = np.any(vs == 1)
+        has_surface = np.any(vs == 2)
 
-    adjacency = {}
-    for a, b in boundary_edges:
-        adjacency.setdefault(a, []).append(b)
-        adjacency.setdefault(b, []).append(a)
+        if has_surface or (has_inside and has_outside):
+            face_mask[fid] = True
 
-    visited = set()
-    loops = []
-    for start in adjacency:
-        if start in visited:
-            continue
-
-        loop = [start]
-        visited.add(start)
-        prev, curr = None, start
-
-        while True:
-            neighbors = [v for v in adjacency.get(curr, []) if v != prev]
-            if not neighbors:
-                break
-            nxt = neighbors[0]
-            if nxt == start and len(loop) > 2:
-                break
-            if nxt in visited:
-                break
-            loop.append(nxt)
-            visited.add(nxt)
-            prev, curr = curr, nxt
-
-        if len(loop) >= 3:
-            loops.append(loop)
-
-    return loops
+    return face_mask, np.where(face_mask)[0], vertex_state
