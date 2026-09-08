@@ -2,6 +2,11 @@
 """生成/修复类工具。"""
 import numpy as np
 import trimesh
+from .discrete import (
+    build_cotangent_laplacian,
+    laplacian_smooth_fixed_boundary,
+    compute_curvature_statistics,
+)
 
 
 def repair_mesh_by_removing_duplicates(mesh):
@@ -190,3 +195,442 @@ def fill_small_holes(mesh, max_loop_edges=50, verbose=True):
     out = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     out.fix_normals()
     return out
+
+
+# ---------------------------------------------------------------------------
+# Seifert 曲面生成与修补
+# ---------------------------------------------------------------------------
+
+def generate_initial_seifert_disk(mesh, loop_vertices):
+    loop_vertices = [int(v) for v in loop_vertices]
+    if len(loop_vertices) < 3:
+        return None, []
+
+    pts = np.asarray(mesh.vertices[loop_vertices], dtype=np.float64)
+
+    try:
+        from shapely.geometry import Polygon
+
+        centroid = pts.mean(axis=0)
+        _, _, vh = np.linalg.svd(pts - centroid)
+        u = vh[0]
+        v = vh[1]
+
+        poly2d = np.column_stack([
+            (pts - centroid) @ u,
+            (pts - centroid) @ v,
+        ])
+
+        polygon = Polygon(poly2d)
+        if not polygon.is_valid:
+            polygon = polygon.buffer(0)
+
+        triangulated = trimesh.creation.triangulate_polygon(polygon)
+        if triangulated is None:
+            raise ValueError("triangulate_polygon returned None")
+
+        tri_vertices_2d, tri_faces = triangulated
+        tri_vertices_2d = np.asarray(tri_vertices_2d, dtype=np.float64)
+        tri_faces = np.asarray(tri_faces, dtype=np.int64)
+
+        if tri_vertices_2d.ndim != 2 or tri_vertices_2d.shape[1] != 2:
+            raise ValueError("invalid 2D vertices")
+        if tri_faces.ndim != 2 or tri_faces.shape[1] != 3 or len(tri_faces) == 0:
+            raise ValueError("empty or invalid faces")
+
+        v3d = centroid + tri_vertices_2d[:, 0:1] * u + tri_vertices_2d[:, 1:2] * v
+
+        boundary_indices = []
+        for p2d in poly2d:
+            dists = np.linalg.norm(tri_vertices_2d - p2d, axis=1)
+            idx = int(np.argmin(dists))
+            if dists[idx] > 1e-8:
+                raise ValueError("boundary point not found in triangulation")
+            boundary_indices.append(idx)
+
+        disk = trimesh.Trimesh(
+            vertices=v3d,
+            faces=tri_faces,
+            process=False,
+        )
+
+        if len(boundary_indices) != len(poly2d):
+            raise ValueError("boundary indices mismatch")
+
+        return disk, boundary_indices
+
+    except Exception as e:
+        print(f"  [WARN] 初始 Seifert 圆盘生成失败: {e}")
+        return None, []
+
+
+def generate_seifert_surface(mesh, hole_vertex_indices,
+                             optimize_iterations=200,
+                             step_size=1.0,
+                             tol=1e-7,
+                             verbose=False):
+    """
+    为健康孔洞生成固定边界的 Seifert 极小曲面。
+    """
+    hole_vertex_indices = [int(v) for v in hole_vertex_indices]
+    if len(hole_vertex_indices) < 3:
+        return {
+            "success": False,
+            "mesh": None,
+            "boundary_indices": [],
+            "message": "孔洞边界顶点数不足 3，无法生成 Seifert 曲面",
+        }
+
+    disk_mesh, boundary_indices = generate_initial_seifert_disk(
+        mesh, hole_vertex_indices
+    )
+    if disk_mesh is None:
+        return {
+            "success": False,
+            "mesh": None,
+            "boundary_indices": [],
+            "message": "无法生成初始 Seifert 圆盘",
+        }
+
+    seifert_mesh = laplacian_smooth_fixed_boundary(
+        disk_mesh,
+        boundary_indices,
+        iterations=optimize_iterations,
+        step_size=step_size,
+        tol=tol,
+        verbose=verbose,
+    )
+
+    return {
+        "success": True,
+        "mesh": seifert_mesh,
+        "boundary_indices": boundary_indices,
+        "message": "Seifert 曲面生成成功",
+    }
+
+
+def compute_seifert_fill_stats(mesh, comp, seifert_mesh,
+                               hole_vertex_indices,
+                               seifert_boundary_indices):
+    """
+    计算 Seifert 曲面填充前后，健康孔洞边界边及新增 Seifert 曲面边/面的属性统计。
+    """
+    seed_faces = list(map(int, comp.get("face_ids", [])))
+    if not seed_faces:
+        raise ValueError("无法获取组件种子面片")
+
+    original_faces = np.asarray(mesh.faces, dtype=np.int64)
+    face_idx_sub = np.array(sorted(seed_faces), dtype=np.int64)
+    sub_faces = original_faces[face_idx_sub]
+
+    unique_verts, inverse = np.unique(sub_faces.ravel(), return_inverse=True)
+    local_vertices = mesh.vertices[unique_verts]
+    local_faces = inverse.reshape(-1, 3)
+
+    local_mesh = trimesh.Trimesh(
+        vertices=local_vertices,
+        faces=local_faces,
+        process=False,
+    )
+
+    old_to_new = {
+        int(old_v): int(new_v)
+        for new_v, old_v in enumerate(unique_verts)
+    }
+
+    loop_local = []
+    for v in hole_vertex_indices:
+        if int(v) not in old_to_new:
+            raise ValueError("孔洞边界顶点不在种子面片中")
+        loop_local.append(old_to_new[int(v)])
+
+    if len(loop_local) != len(seifert_boundary_indices):
+        raise ValueError("Seifert 边界映射长度不一致")
+
+    filled_mesh = _build_filled_mesh(
+        local_mesh,
+        seifert_mesh,
+        loop_local,
+        seifert_boundary_indices,
+    )
+    if filled_mesh is None:
+        raise ValueError("无法构建填充网格")
+
+    loop_edge_tuples = []
+    for i in range(len(loop_local)):
+        v0 = loop_local[i]
+        v1 = loop_local[(i + 1) % len(loop_local)]
+        loop_edge_tuples.append(_edge_tuple(v0, v1))
+
+    local_edge_map = _build_edge_tuple_to_faces(local_mesh)
+    filled_edge_map = _build_edge_tuple_to_faces(filled_mesh)
+
+    before = {"open": 0, "manifold": 0, "nonmanifold": 0}
+    after = {"open": 0, "manifold": 0, "nonmanifold": 0}
+
+    for key in loop_edge_tuples:
+        cnt_before = len(local_edge_map.get(key, []))
+        cnt_after = len(filled_edge_map.get(key, []))
+        before[_classify_edge_count(cnt_before)] += 1
+        after[_classify_edge_count(cnt_after)] += 1
+
+    new_face_start = len(local_mesh.faces)
+    new_face_indices = list(range(new_face_start, len(filled_mesh.faces)))
+
+    new_face_stats = {"open": 0, "manifold": 0, "nonmanifold": 0}
+    new_edge_set = set()
+
+    for fid in new_face_indices:
+        face = filled_mesh.faces[fid]
+        has_open = False
+        has_nonmanifold = False
+
+        for j in range(3):
+            key = _edge_tuple(face[j], face[(j + 1) % 3])
+            new_edge_set.add(key)
+
+            cnt = len(filled_edge_map.get(key, []))
+            if cnt == 1:
+                has_open = True
+            elif cnt >= 3:
+                has_nonmanifold = True
+
+        if has_open:
+            new_face_stats["open"] += 1
+        elif has_nonmanifold:
+            new_face_stats["nonmanifold"] += 1
+        else:
+            new_face_stats["manifold"] += 1
+
+    new_edge_stats = {"open": 0, "manifold": 0, "nonmanifold": 0}
+    for key in new_edge_set:
+        cnt = len(filled_edge_map.get(key, []))
+        new_edge_stats[_classify_edge_count(cnt)] += 1
+
+    return {
+        "boundary_edges_before": before,
+        "boundary_edges_after": after,
+        "new_faces": len(new_face_indices),
+        "new_faces_by_type": new_face_stats,
+        "new_unique_edges": len(new_edge_set),
+        "new_edges_by_type": new_edge_stats,
+    }
+
+
+def print_seifert_fill_stats(stats):
+    """
+    命令行打印 Seifert 填充统计。
+    """
+    before = stats["boundary_edges_before"]
+    after = stats["boundary_edges_after"]
+
+    print("  Seifert 曲面局部填充对比（0层邻域）:")
+    print(
+        f"    健康孔洞边界边: "
+        f"开放={before['open']} -> {after['open']}, "
+        f"流形={before['manifold']} -> {after['manifold']}, "
+        f"非流形={before['nonmanifold']} -> {after['nonmanifold']}"
+    )
+    print(
+        f"    新增 Seifert 面片: {stats['new_faces']} 个 "
+        f"(开放={stats['new_faces_by_type']['open']}, "
+        f"流形={stats['new_faces_by_type']['manifold']}, "
+        f"非流形={stats['new_faces_by_type']['nonmanifold']})"
+    )
+    print(
+        f"    新增 Seifert 唯一边: {stats['new_unique_edges']} 条 "
+        f"(开放={stats['new_edges_by_type']['open']}, "
+        f"流形={stats['new_edges_by_type']['manifold']}, "
+        f"非流形={stats['new_edges_by_type']['nonmanifold']})"
+    )
+
+
+def compute_seifert_curvature_stats(seifert_mesh, boundary_vertex_indices):
+    """
+    计算 Seifert 曲面内部顶点的离散曲率统计。
+    """
+    return compute_curvature_statistics(seifert_mesh, boundary_vertex_indices)
+
+
+def apply_seifert_patch_to_mesh(mesh, seifert_mesh,
+                                hole_vertex_indices,
+                                seifert_boundary_indices):
+    """
+    将 Seifert 曲面合并到原始网格中，实现真正的孔洞修补。
+    边界顶点共享原网格索引，内部顶点追加到末尾。
+    """
+    hole_vertex_indices = [int(v) for v in hole_vertex_indices]
+    seifert_boundary_indices = [int(v) for v in seifert_boundary_indices]
+
+    if len(hole_vertex_indices) != len(seifert_boundary_indices):
+        raise ValueError("边界顶点映射长度不一致")
+
+    seifert_to_orig = {
+        seifert_boundary_indices[i]: hole_vertex_indices[i]
+        for i in range(len(hole_vertex_indices))
+    }
+
+    orig_vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    seifert_vertices = np.asarray(seifert_mesh.vertices, dtype=np.float64)
+    seifert_faces = np.asarray(seifert_mesh.faces, dtype=np.int64)
+
+    new_vertices_start = len(orig_vertices)
+    remapped_faces = []
+    for tri in seifert_faces:
+        new_tri = []
+        for vid in tri:
+            vid = int(vid)
+            if vid in seifert_to_orig:
+                new_tri.append(seifert_to_orig[vid])
+            else:
+                new_tri.append(new_vertices_start + vid)
+        remapped_faces.append(new_tri)
+
+    combined_vertices = np.vstack([orig_vertices, seifert_vertices])
+    combined_faces = np.vstack([
+        mesh.faces,
+        np.array(remapped_faces, dtype=np.int64),
+    ])
+
+    repaired = trimesh.Trimesh(
+        vertices=combined_vertices,
+        faces=combined_faces,
+        process=False,
+    )
+    return repaired
+
+
+def repair_healthy_hole(mesh, hole, seifert_options=None, verbose=False):
+    """
+    修补单个健康孔洞。
+
+    hole: hole_diagnosis.json 中的 healthy_holes 元素
+    """
+    if seifert_options is None:
+        seifert_options = {}
+
+    hole_id = hole["hole_id"]
+    loop = hole["vertex_indices"]
+
+    if verbose:
+        print(f"修补孔洞 {hole_id}（{len(loop)} 条边）...")
+
+    result = generate_seifert_surface(mesh, loop, **seifert_options)
+    if not result["success"]:
+        if verbose:
+            print(f"  [FAIL] {result['message']}")
+        return None, result["message"]
+
+    repaired = apply_seifert_patch_to_mesh(
+        mesh,
+        result["mesh"],
+        loop,
+        result["boundary_indices"],
+    )
+
+    if verbose:
+        print(f"  [OK] 新增 {len(result['mesh'].faces)} 个面片")
+
+    return repaired, "success"
+
+
+def repair_all_healthy_holes(mesh, healthy_holes, seifert_options=None, verbose=False):
+    """
+    顺序修补所有健康孔洞。
+    返回 (repaired_mesh, repaired_ids, failed_records)
+    """
+    if seifert_options is None:
+        seifert_options = {}
+
+    current_mesh = mesh
+    repaired_ids = []
+    failed_records = []
+
+    for hole in healthy_holes:
+        hole_id = hole["hole_id"]
+        new_mesh, msg = repair_healthy_hole(
+            current_mesh, hole, seifert_options, verbose
+        )
+        if new_mesh is None:
+            failed_records.append({"hole_id": hole_id, "message": msg})
+        else:
+            current_mesh = new_mesh
+            repaired_ids.append(hole_id)
+
+    return current_mesh, repaired_ids, failed_records
+
+
+# ---------------------------------------------------------------------------
+# Seifert 内部辅助函数
+# ---------------------------------------------------------------------------
+
+def _build_filled_mesh(neighborhood_mesh, seifert_mesh, loop_original_indices,
+                       seifert_boundary_indices):
+    """
+    将邻域网格与 Seifert 曲面合并，使孔洞边界共享同一组顶点。
+    """
+    if len(loop_original_indices) != len(seifert_boundary_indices):
+        print("  [WARN] Seifert 边界映射长度不一致，跳过填充对比")
+        return None
+
+    seifert_to_orig = {
+        int(seifert_boundary_indices[i]): int(loop_original_indices[i])
+        for i in range(len(loop_original_indices))
+    }
+
+    orig_n = len(neighborhood_mesh.vertices)
+    seifert_faces = np.asarray(seifert_mesh.faces, dtype=np.int64)
+    remapped_faces = []
+
+    for tri in seifert_faces:
+        new_tri = []
+        for vid in tri:
+            vid = int(vid)
+            if vid in seifert_to_orig:
+                new_tri.append(seifert_to_orig[vid])
+            else:
+                new_tri.append(orig_n + vid)
+        remapped_faces.append(new_tri)
+
+    remapped_faces = np.array(remapped_faces, dtype=np.int64)
+    combined_vertices = np.vstack([neighborhood_mesh.vertices, seifert_mesh.vertices])
+    combined_faces = np.vstack([neighborhood_mesh.faces, remapped_faces])
+
+    filled_mesh = trimesh.Trimesh(
+        vertices=combined_vertices,
+        faces=combined_faces,
+        process=False,
+    )
+    return filled_mesh
+
+
+def _edge_tuple(v0, v1):
+    v0 = int(v0)
+    v1 = int(v1)
+    return (v0, v1) if v0 < v1 else (v1, v0)
+
+
+def _classify_edge_count(cnt):
+    if cnt == 1:
+        return "open"
+    if cnt == 2:
+        return "manifold"
+    return "nonmanifold"
+
+
+def _build_edge_tuple_to_faces(mesh, face_indices=None):
+    """构建 (min_v, max_v) -> 共享面片索引列表 的完整映射，包含开放边。"""
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    if face_indices is None:
+        face_indices = np.arange(len(faces), dtype=np.int64)
+
+    edge_map = {}
+    for fid in face_indices:
+        fid = int(fid)
+        face = faces[fid]
+        for j in range(3):
+            v0 = int(face[j])
+            v1 = int(face[(j + 1) % 3])
+            key = _edge_tuple(v0, v1)
+            edge_map.setdefault(key, []).append(fid)
+    return edge_map

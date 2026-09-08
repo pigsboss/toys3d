@@ -69,6 +69,14 @@ from .generation import (
     repair_mesh_by_removing_duplicates,
     repair_nonmanifold_edges,
     fill_small_holes,
+    generate_initial_seifert_disk,
+    generate_seifert_surface,
+    compute_seifert_fill_stats,
+    print_seifert_fill_stats,
+    compute_seifert_curvature_stats,
+    apply_seifert_patch_to_mesh,
+    repair_healthy_hole,
+    repair_all_healthy_holes,
 )
 
 from .utilities import (
@@ -81,7 +89,6 @@ from .utilities import (
     build_hole_diagnosis_data,
     analyze_uncovered_open_edge_components,
     find_minimal_enclosing_manifold_boundary_greedy,
-    generate_initial_seifert_disk,
     extract_intersection_faces_by_vertex_state,
     segment_tubular_regions,
 )
