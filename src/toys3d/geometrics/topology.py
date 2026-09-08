@@ -15,16 +15,36 @@ def analyze_mesh_defects(mesh, return_face_edge_counts=False):
         if return_face_edge_counts:
             empty = np.zeros(0, dtype=np.uint8)
             return (
-                {'open_edges': 0, 'nonmanifold_edges': 0,
-                 'open_faces': 0, 'nonmanifold_faces': 0},
+                {
+                    'total_faces': 0,
+                    'raw_edges_count': 0,
+                    'unique_edges_count': 0,
+                    'open_edges': 0,
+                    'manifold_edges': 0,
+                    'nonmanifold_edges': 0,
+                    'open_faces': 0,
+                    'nonmanifold_faces': 0,
+                    'both_defect_faces': 0,
+                    'watertight_by_count': True,
+                },
                 np.zeros(0, dtype=bool),
                 np.zeros(0, dtype=bool),
                 empty.copy(), empty.copy(), empty.copy()
             )
         else:
             return (
-                {'open_edges': 0, 'nonmanifold_edges': 0,
-                 'open_faces': 0, 'nonmanifold_faces': 0},
+                {
+                    'total_faces': 0,
+                    'raw_edges_count': 0,
+                    'unique_edges_count': 0,
+                    'open_edges': 0,
+                    'manifold_edges': 0,
+                    'nonmanifold_edges': 0,
+                    'open_faces': 0,
+                    'nonmanifold_faces': 0,
+                    'both_defect_faces': 0,
+                    'watertight_by_count': True,
+                },
                 np.zeros(0, dtype=bool),
                 np.zeros(0, dtype=bool)
             )
@@ -95,10 +115,16 @@ def analyze_mesh_defects(mesh, return_face_edge_counts=False):
             np.add.at(nonmanifold_edge_per_face, seg_face_ids, 1)
 
     defect_stats = {
+        'total_faces': n_faces,
+        'raw_edges_count': n_faces * 3,
+        'unique_edges_count': int(len(start_idx)),
         'open_edges': open_edges,
+        'manifold_edges': int(np.sum(counts == 2)),
         'nonmanifold_edges': nonmanifold_edges,
         'open_faces': int(open_face_mask.sum()),
         'nonmanifold_faces': int(nonmanifold_face_mask.sum()),
+        'both_defect_faces': int(np.sum(open_face_mask & nonmanifold_face_mask)),
+        'watertight_by_count': bool(open_edges == 0),
     }
 
     if return_face_edge_counts:

@@ -3,6 +3,14 @@
 from .euclidean import (
     polygon_area_from_3d_ccw,
     point_in_polygon_2d,
+    plucker_design_matrix,
+    axis_from_plucker,
+    orthogonalize_axes,
+    line_line_distance_and_midpoint,
+    point_line_distance,
+    intersect_line_plane,
+    kmeans_1d,
+    average_antiparallel_directions,
 )
 
 from .topology import (
@@ -47,6 +55,7 @@ from .discrete import (
     build_cotangent_laplacian,
     laplacian_smooth_fixed_boundary,
     compute_curvature_statistics,
+    estimate_symmetry_plane_voxel,
 )
 
 from .utilities import (
@@ -62,4 +71,7 @@ from .utilities import (
     find_minimal_enclosing_manifold_boundary_greedy,
     generate_initial_seifert_disk,
     extract_intersection_faces_by_vertex_state,
+    segment_tubular_regions,
+    repair_nonmanifold_edges,
+    fill_small_holes,
 )

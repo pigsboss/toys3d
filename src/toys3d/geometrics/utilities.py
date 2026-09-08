@@ -908,3 +908,299 @@ def extract_intersection_faces_by_vertex_state(W, N, eps=None):
             face_mask[fid] = True
 
     return face_mask, np.where(face_mask)[0], vertex_state
+
+
+def segment_tubular_regions(normals, areas=None, threshold=0.1, min_faces=100,
+                            max_regions=5, max_iterations=1000, rng=None):
+    """
+    使用 RANSAC 根据面片法线将三角网格分割为不同的管状区域。
+
+    管状区域的特征是所有面片法线大致垂直于该区域的轴线。随机抽取两个面片，
+    其法线叉乘作为候选轴线，将法线与轴线点积绝对值小于阈值的面片作为内点。
+    重复此过程以取出多个区域。
+
+    Parameters
+    ----------
+    normals : (N, 3) np.ndarray
+        面片单位法向量（必须已归一化）。
+    areas : (N,) np.ndarray or None
+        面片面积，用于加权评分。若为 None，则使用等权（每个面片权重为 1）。
+    threshold : float
+        内点判定阈值：若 |dot(normal, axis)| <= threshold，该面片属于当前区域。
+        数值越小越严格。
+    min_faces : int
+        一个区域必须包含的最少面片数。
+    max_regions : int
+        最多提取的区域数量。
+    max_iterations : int
+        每个区域 RANSAC 的最大迭代次数。
+    rng : numpy.random.Generator or None
+        随机数生成器，用于可重复性。若为 None 则使用默认随机状态。
+
+    Returns
+    -------
+    labels : (N,) np.ndarray (int)
+        面片区域标签。0 表示未归类，1..k 表示第 k 个区域。
+    axes : list of ndarray (3,)
+        每个区域对应的单位轴线方向（顺序与标签编号一致）。
+    """
+    N = normals.shape[0]
+    if N == 0:
+        return np.zeros(0, dtype=int), []
+
+    # 面积权重
+    if areas is None:
+        weights = np.ones(N, dtype=np.float64)
+    else:
+        weights = np.asarray(areas, dtype=np.float64)
+
+    # 检查并过滤零/无效法向量，避免除零
+    norms = np.linalg.norm(normals, axis=1, keepdims=True)
+    valid_mask = norms[:, 0] > 1e-12
+    n = np.zeros_like(normals, dtype=np.float64)
+    n[valid_mask] = normals[valid_mask] / norms[valid_mask]
+
+    # 随机数生成器
+    if rng is None:
+        rng = np.random.default_rng()
+
+    labels = np.zeros(N, dtype=int)
+    axes = []
+
+    # 当前可用的面片索引（未归类的且法向有效）
+    active = np.where((labels == 0) & valid_mask)[0]
+
+    for region_id in range(1, max_regions + 1):
+        if len(active) < 2 or len(active) < min_faces:
+            break
+
+        # 当前活动子集
+        active_n = n[active]
+        active_w = weights[active]
+
+        best_score = -1.0
+        best_axis = None
+        best_inliers = None  # 相对于 active 的布尔掩码
+
+        # 自适应迭代次数：考虑期望内点比例至少 min_faces/len(active)
+        desired_inlier_ratio = max(min_faces / len(active), 0.01)
+        # 概率采样模型所需最少迭代次数（保证至少一次全内点抽样概率 0.99）
+        iters = min(
+            max_iterations,
+            int(np.log(0.01) / np.log(1 - desired_inlier_ratio**2))
+        )
+        iters = max(1, iters)
+
+        for _ in range(iters):
+            # 随机抽取两个不同的活动面片
+            i, j = rng.choice(len(active), size=2, replace=False)
+            n1, n2 = active_n[i], active_n[j]
+
+            cross = np.cross(n1, n2)
+            norm_cross = np.linalg.norm(cross)
+            if norm_cross < 1e-9:   # 法线几乎平行，无法定义轴线
+                continue
+            axis = cross / norm_cross
+
+            # 计算所有活动面片与该轴线的点积绝对值
+            dots = np.abs(active_n @ axis)
+            inliers = dots <= threshold
+
+            # 评分 = 内点权重之和
+            score = np.sum(active_w[inliers])
+
+            # 内点数必须满足最小要求
+            if np.sum(inliers) < min_faces:
+                continue
+
+            if score > best_score:
+                best_score = score
+                best_axis = axis.copy()
+                best_inliers = inliers
+
+        # 如果没有找到合格模型，停止
+        if best_axis is None:
+            break
+
+        # 将内点标记到全局 labels
+        active_indices = active[best_inliers]
+        labels[active_indices] = region_id
+        axes.append(best_axis)
+
+        # 更新 active 列表
+        active = np.where(labels == 0)[0]
+
+    return labels, axes
+
+
+def repair_nonmanifold_edges(mesh, max_iterations=10, verbose=True):
+    """
+    策略2：对每个非流形边，保留法向最一致的两个面，删除其余面片。
+    迭代直到没有非流形边（或达到迭代上限）。
+    """
+    for it in range(max_iterations):
+        faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+
+        edge_face_map = {}
+        for fi, face in enumerate(faces):
+            v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+            for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+                key = (a, b) if a < b else (b, a)
+                edge_face_map.setdefault(key, []).append(fi)
+
+        nonmanifold = {e: fl for e, fl in edge_face_map.items()
+                       if len(fl) > 2}
+        if not nonmanifold:
+            if verbose:
+                print(f"  [Iter {it}] No nonmanifold edges remain.")
+            break
+
+        if verbose:
+            print(f"  [Iter {it}] {len(nonmanifold)} nonmanifold edges, "
+                  f"removing extra faces...")
+
+        normals = mesh.face_normals
+        areas = mesh.area_faces
+        faces_to_remove = set()
+
+        for edge, fl in nonmanifold.items():
+            if verbose:
+                va, vb = mesh.vertices[edge[0]], mesh.vertices[edge[1]]
+                print(f"    edge {edge} at {va} <-> {vb}, "
+                      f"shared by {len(fl)} faces")
+                for fi in fl:
+                    print(f"      face {fi}: area={areas[fi]:.4f}, "
+                          f"normal={normals[fi].round(3)}")
+
+            best_pair, best_key = None, -np.inf
+            for i in range(len(fl)):
+                for j in range(i + 1, len(fl)):
+                    dot = np.dot(normals[fl[i]], normals[fl[j]])
+                    score = dot + 1e-6 * min(areas[fl[i]], areas[fl[j]])
+                    if score > best_key:
+                        best_key = score
+                        best_pair = (fl[i], fl[j])
+
+            for fi in fl:
+                if fi not in best_pair:
+                    faces_to_remove.add(fi)
+
+        keep = np.ones(len(faces), dtype=bool)
+        keep[list(faces_to_remove)] = False
+        mesh = trimesh.Trimesh(vertices=mesh.vertices,
+                               faces=faces[keep], process=False)
+
+    mesh = mesh.copy()
+    mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+def fill_small_holes(mesh, max_loop_edges=50, verbose=True):
+    """
+    用质心扇形三角化封闭小边界环。
+    使用基于边界边集合的 DFS，按方向连续性在分叉处选择下一条边。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+
+    # 构建 edge -> faces 映射，识别边界边
+    edge_face_map = {}
+    for fi, face in enumerate(faces):
+        v1, v2, v3 = int(face[0]), int(face[1]), int(face[2])
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
+            edge_face_map.setdefault(key, []).append(fi)
+
+    boundary_edges = set(e for e, fl in edge_face_map.items() if len(fl) == 1)
+
+    if not boundary_edges:
+        if verbose:
+            print("  No boundary edges, nothing to fill.")
+        return mesh
+
+    # 稳健地提取所有边界环
+    loops = []
+    edge_set = set(boundary_edges)
+
+    while edge_set:
+        e0 = edge_set.pop()
+        v_start, v_curr = e0
+        loop = [v_start, v_curr]
+        v_prev = v_start
+
+        while True:
+            # 找与 v_curr 相连且未访问的边界边
+            candidates = [e for e in edge_set if v_curr in e]
+
+            if not candidates:
+                # 无法闭合，放弃这条路径
+                if verbose and len(loop) > 2:
+                    print(f"  Dropped unclosed boundary path ({len(loop)} edges)")
+                break
+
+            # 如果有多个候选，按方向连续性选择最自然的延续
+            if len(candidates) > 1:
+                dir_curr = mesh.vertices[v_curr] - mesh.vertices[v_prev]
+                dir_curr = dir_curr / (np.linalg.norm(dir_curr) + 1e-12)
+
+                best_edge = None
+                best_score = -np.inf
+                for e in candidates:
+                    v_next = e[0] if e[1] == v_curr else e[1]
+                    dir_next = mesh.vertices[v_next] - mesh.vertices[v_curr]
+                    dn = np.linalg.norm(dir_next)
+                    if dn < 1e-12:
+                        continue
+                    dir_next = dir_next / dn
+
+                    # 偏好与当前方向夹角最小的延续
+                    dot = np.dot(dir_curr, dir_next)
+                    # 惩罚反向转弯
+                    score = dot if dot >= 0 else -0.5 * dot
+                    if score > best_score:
+                        best_score = score
+                        best_edge = e
+                next_edge = best_edge
+            else:
+                next_edge = candidates[0]
+
+            edge_set.remove(next_edge)
+            v_next = next_edge[0] if next_edge[1] == v_curr else next_edge[1]
+            loop.append(v_next)
+
+            if v_next == v_start:
+                # 成功闭合
+                loops.append(loop[:-1])  # 去掉重复的起点
+                break
+
+            v_prev, v_curr = v_curr, v_next
+
+            # 安全上限，防止异常拓扑导致无限循环
+            if len(loop) > max(max_loop_edges * 3, 500):
+                if verbose:
+                    print(f"  Dropped overly long boundary path ({len(loop)} edges)")
+                break
+
+    # 扇形封闭找到的边界环
+    new_vertices = [mesh.vertices]
+    new_faces = [faces]
+    for loop in loops:
+        if len(loop) > max_loop_edges:
+            if verbose:
+                print(f"  Skipping large boundary loop ({len(loop)} edges).")
+            continue
+        loop_pts = mesh.vertices[np.array(loop)]
+        centroid = loop_pts.mean(axis=0)
+        c_idx = sum(len(v) for v in new_vertices)
+        new_vertices.append(centroid[None, :])
+        tris = []
+        for i in range(len(loop)):
+            tris.append([c_idx, loop[i], loop[(i + 1) % len(loop)]])
+        new_faces.append(np.array(tris))
+        if verbose:
+            print(f"  Filled boundary loop with {len(loop)} edges.")
+
+    vertices = np.vstack(new_vertices)
+    faces = np.vstack(new_faces)
+    out = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    out.fix_normals()
+    return out
