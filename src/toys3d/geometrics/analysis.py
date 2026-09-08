@@ -575,3 +575,181 @@ def build_box_aligned_frame_mesh(mesh, distance_thr_ratio=0.02,
     fit_info = evaluate_obb_fit(mesh, origin, axes, extents)
 
     return T_w2l, T_l2w, u_x, u_y, u_z, origin, extents, fit_info
+
+
+def fit_line_3d(points):
+    """
+    三维点最小二乘直线拟合。
+
+    Returns
+    -------
+    rmse : float
+    direction : (3,) ndarray or None
+    center : (3,) ndarray
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    n = len(pts)
+    if n < 2:
+        return np.inf, None, pts.mean(axis=0) if n > 0 else None
+
+    center = pts.mean(axis=0)
+    centered = pts - center
+    if n == 2:
+        direction = centered[1] - centered[0]
+        norm = np.linalg.norm(direction)
+        if norm < 1e-12:
+            return np.inf, None, center
+        direction = direction / norm
+        return 0.0, direction, center
+
+    _, s, vh = np.linalg.svd(centered, full_matrices=False)
+    if s[0] < 1e-12:
+        return np.inf, None, center
+
+    direction = vh[0]
+    projections = centered @ direction
+    residuals = centered - projections[:, None] * direction
+    rmse = np.sqrt(np.mean(np.sum(residuals ** 2, axis=1)))
+    return rmse, direction, center
+
+
+def fit_circle_3d(points):
+    """
+    三维点最小二乘圆拟合。先投影到最佳拟合平面，再在平面内做圆拟合。
+
+    Returns
+    -------
+    rmse : float
+    center : (3,) ndarray or None
+    normal : (3,) ndarray or None
+    radius : float
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    n = len(pts)
+    if n < 4:
+        return np.inf, None, None, 0.0
+
+    center = pts.mean(axis=0)
+    centered = pts - center
+    _, s, vh = np.linalg.svd(centered, full_matrices=False)
+    if s[1] < 1e-12:
+        return np.inf, None, None, 0.0
+
+    normal = vh[2]
+    basis_u = vh[0]
+    basis_v = vh[1]
+
+    coords = np.column_stack([centered @ basis_u, centered @ basis_v])
+
+    A = np.column_stack([coords[:, 0], coords[:, 1], np.ones(n)])
+    b = coords[:, 0] ** 2 + coords[:, 1] ** 2
+    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+
+    cx, cy = sol[0] / 2.0, sol[1] / 2.0
+    radius = np.sqrt(cx * cx + cy * cy + sol[2])
+    center3d = center + cx * basis_u + cy * basis_v
+
+    radii = np.linalg.norm(coords - np.array([cx, cy]), axis=1)
+    rmse = np.sqrt(np.mean((radii - radius) ** 2))
+    return rmse, center3d, normal, float(radius)
+
+
+def ransac_plane_fitting(points, max_iter=500, inlier_threshold=0.1,
+                         rng=None):
+    """
+    Fit a single plane to 3D points using RANSAC.
+    Returns (normal, point_on_plane), inlier_mask.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.shape[0] < 3:
+        return None, np.zeros(pts.shape[0], dtype=bool)
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    best_inliers = None
+    best_n = None
+    best_p = None
+    best_score = -1
+
+    n = pts.shape[0]
+    for _ in range(max_iter):
+        idxs = rng.choice(n, 3, replace=False)
+        p0, p1, p2 = pts[idxs]
+        normal = np.cross(p1 - p0, p2 - p0)
+        norm_len = np.linalg.norm(normal)
+        if norm_len < 1e-12:
+            continue
+        normal = normal / norm_len
+        dists = np.abs(np.dot(pts - p0, normal))
+        inliers = dists <= inlier_threshold
+        score = int(np.sum(inliers))
+        if score > best_score:
+            best_score = score
+            best_inliers = inliers
+            best_n = normal
+            best_p = p0
+
+    if best_inliers is None:
+        return None, np.zeros(n, dtype=bool)
+
+    # refine plane using all inliers
+    inlier_pts = pts[best_inliers]
+    centroid = inlier_pts.mean(axis=0)
+    cov = (inlier_pts - centroid).T @ (inlier_pts - centroid)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    refined_normal = eigvecs[:, np.argmin(eigvals)]
+    if np.dot(refined_normal, best_n) < 0:
+        refined_normal = -refined_normal
+    return (refined_normal, centroid), best_inliers
+
+
+def multi_ransac_planes(points, max_planes=3, inlier_threshold=0.1,
+                        min_points_per_plane=5, max_iter=500, rng=None):
+    """
+    Sequentially extract up to max_planes dominant planes from points.
+    Returns list of (normal, point, inlier_mask).
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    remaining = np.ones(len(pts), dtype=bool)
+    planes = []
+
+    for _ in range(max_planes):
+        if np.sum(remaining) < min_points_per_plane:
+            break
+        sub_pts = pts[remaining]
+        plane_params, inliers_sub = ransac_plane_fitting(
+            sub_pts, max_iter=max_iter,
+            inlier_threshold=inlier_threshold, rng=rng
+        )
+        if plane_params is None:
+            break
+        global_inliers = np.zeros(len(pts), dtype=bool)
+        global_inliers[remaining] = inliers_sub
+        if np.sum(global_inliers) < min_points_per_plane:
+            break
+        planes.append((plane_params[0], plane_params[1], global_inliers))
+        remaining &= ~global_inliers
+
+    return planes
+
+
+def map_labels_from_proxy(original_mesh, proxy_mesh, proxy_labels):
+    """
+    将代理网格上的薄板标签映射回原始网格。
+
+    Returns
+    -------
+    labels : (N,) ndarray
+    """
+    from scipy.spatial import cKDTree
+
+    proxy_centers = np.asarray(proxy_mesh.triangles_center, dtype=np.float64)
+    original_centers = np.asarray(original_mesh.triangles_center, dtype=np.float64)
+
+    if len(proxy_centers) == 0 or len(original_centers) == 0:
+        return np.zeros(len(original_centers), dtype=int)
+
+    tree = cKDTree(proxy_centers)
+    _, indices = tree.query(original_centers, k=1)
+    return np.asarray(proxy_labels, dtype=int)[indices]
