@@ -267,7 +267,7 @@ def process_brick(mesh, method='voxel', num_passes=2, repair_mode=False,
     """
     # 0. 基本统计
     stats = compute_mesh_stats(mesh)
-    print("Yo, mesh stats:")
+    print("Hey, mesh stats:")
     for k, v in stats.items():
         print(f"  {k}: {v}")
 
@@ -420,7 +420,7 @@ def main():
     if not isinstance(mesh, trimesh.Trimesh):
         mesh = mesh.dump(concatenate=True)
         print("Multiple meshes detected, merged.")
-    print(f"Yo, loading model: {args.input_file}")
+    print(f"Hey, loading model: {args.input_file}")
 
     # 解析 --shell 参数
     shell_depths = None

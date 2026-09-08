@@ -1033,7 +1033,7 @@ def process_handlebar(mesh,
     """
     # 1. 基本统计
     stats = compute_mesh_stats(mesh)
-    print("Yo, mesh stats:")
+    print("Hey, mesh stats:")
     for k, v in stats.items():
         print(f"  {k}: {v}")
 
@@ -1152,7 +1152,7 @@ def process_handlebar(mesh,
         min_faces=50, max_regions=5, max_iterations=2000
     )
     unique_labels = np.unique(labels_ransac)
-    print(f"Yo, RANSAC found regions: {unique_labels}, axes count: {len(axes_ransac)}")
+    print(f"Hey, RANSAC found regions: {unique_labels}, axes count: {len(axes_ransac)}")
 
     if aero_mode:
         if len(axes_ransac) < 2:
@@ -1613,7 +1613,7 @@ def main():
     if not isinstance(mesh, trimesh.Trimesh):
         mesh = mesh.dump(concatenate=True)
         print("Multiple meshes detected, merged.")
-    print(f"Yo, loading model: {args.input_file}")
+    print(f"Hey, loading model: {args.input_file}")
 
     # 处理
     transformed_scene, world_scene, transformed_mesh, stats = process_handlebar(
