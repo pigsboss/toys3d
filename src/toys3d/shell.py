@@ -919,6 +919,88 @@ def segment_plates_by_plane_fitting(mesh, radius=5.0,
     return labels
 
 
+def segment_plates_by_smoothness(mesh, angle_threshold_deg=30.0, min_faces=10):
+    """
+    基于相邻面片二面角进行区域增长，分割出光滑薄板区域。
+    使用向量化图连通分量算法，避免 Python DFS 开销。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+    angle_threshold_deg : float   二面角阈值（度）
+    min_faces : int               最小面片数
+
+    Returns
+    -------
+    labels : (N,) ndarray, int   面片区域标签（-1 为被合并/舍弃）
+    """
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
+    N = len(faces)
+    angle_thr = np.deg2rad(angle_threshold_deg)
+    cos_thr = np.cos(angle_thr)
+
+    # 构建相邻面片对（仅保留恰好被 2 个面片共享的边）
+    edge_map = {}
+    for fi, (v1, v2, v3) in enumerate(faces):
+        for a, b in [(v1, v2), (v2, v3), (v3, v1)]:
+            key = (a, b) if a < b else (b, a)
+            edge_map.setdefault(key, []).append(fi)
+
+    pairs = []
+    for fl in edge_map.values():
+        if len(fl) == 2:
+            pairs.append((fl[0], fl[1]))
+
+    pair_count = len(pairs)
+
+    if pair_count == 0:
+        labels = np.arange(N, dtype=int)
+    else:
+        pairs = np.array(pairs, dtype=np.int64)
+        i = pairs[:, 0]
+        j = pairs[:, 1]
+        normals = mesh.face_normals
+        dots = normals[i, 0] * normals[j, 0] + \
+               normals[i, 1] * normals[j, 1] + \
+               normals[i, 2] * normals[j, 2]
+
+        # 保留二面角小于阈值的边（点积 > cos(theta)）
+        mask = dots >= cos_thr
+
+        n_keep = int(np.sum(mask))
+        if n_keep == 0:
+            labels = np.arange(N, dtype=int)
+        else:
+            rows = np.empty(2 * n_keep, dtype=np.int64)
+            cols = np.empty(2 * n_keep, dtype=np.int64)
+            rows[:n_keep] = i[mask]
+            cols[:n_keep] = j[mask]
+            rows[n_keep:] = j[mask]
+            cols[n_keep:] = i[mask]
+            data = np.ones(2 * n_keep, dtype=np.int8)
+            graph = csr_matrix((data, (rows, cols)), shape=(N, N))
+            _, labels = connected_components(graph, directed=False)
+
+    # 移除过小的区域
+    unique, counts = np.unique(labels, return_counts=True)
+    small_mask = counts < min_faces
+    if np.any(small_mask):
+        small_labels = unique[small_mask]
+        for lbl in small_labels:
+            labels[labels == lbl] = -1
+
+    # 重新编号（紧凑的从 0 开始）
+    valid = labels >= 0
+    if np.any(valid):
+        _, new_labels = np.unique(labels[valid], return_inverse=True)
+        labels[valid] = new_labels
+
+    return labels
+
+
 # ------------------------------------------------------------------
 #  Timer class
 # ------------------------------------------------------------------
