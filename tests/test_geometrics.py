@@ -32,13 +32,13 @@ from toys3d.geometrics.topology import (
     group_faces_by_topology_codes,
     code_to_hex,
     hex_to_code,
-    build_hole_diagnosis_data,
-    analyze_uncovered_open_edge_components,
 )
 from toys3d.geometrics.utilities import (
     compute_hole_area_stats,
     repair_mesh_by_removing_duplicates,
     weld_small_holes,
+    build_hole_diagnosis_data,
+    analyze_uncovered_open_edge_components,
 )
 
 
