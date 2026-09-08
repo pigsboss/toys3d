@@ -19,3 +19,22 @@ def polygon_area_from_3d_ccw(points):
         v2 = points[(i + 1) % len(points)]
         total += np.dot(np.cross(v1, v2), normal)
     return float(abs(total) / (2.0 * norm))
+
+
+def point_in_polygon_2d(pt, poly):
+    """二维射线法判断点是否在多边形内部。"""
+    x, y = pt
+    inside = False
+    n = len(poly)
+    j = n - 1
+
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / ((yj - yi) + 1e-30) + xi
+        ):
+            inside = not inside
+        j = i
+
+    return inside

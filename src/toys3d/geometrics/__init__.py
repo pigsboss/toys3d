@@ -1,6 +1,9 @@
 # src/toys3d/geometrics/__init__.py
 
-from .euclidean import polygon_area_from_3d_ccw
+from .euclidean import (
+    polygon_area_from_3d_ccw,
+    point_in_polygon_2d,
+)
 
 from .topology import (
     analyze_mesh_defects,
@@ -30,11 +33,20 @@ from .topology import (
     validate_code,
     build_manifold_face_adjacency,
     is_manifold_closed_boundary,
+    expand_face_neighborhood,
+    compute_face_distances,
+    reconstruct_loop_from_edges,
 )
 
 from .discrete import (
     compute_mesh_stats,
     repair_to_watertight,
+    compute_face_area_stats,
+    compute_bounding_box_stats,
+    compute_volume_if_closed,
+    build_cotangent_laplacian,
+    laplacian_smooth_fixed_boundary,
+    compute_curvature_statistics,
 )
 
 from .utilities import (
@@ -48,4 +60,6 @@ from .utilities import (
     build_hole_diagnosis_data,
     analyze_uncovered_open_edge_components,
     find_minimal_enclosing_manifold_boundary_greedy,
+    generate_initial_seifert_disk,
+    extract_intersection_faces_by_vertex_state,
 )

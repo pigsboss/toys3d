@@ -800,3 +800,111 @@ def find_minimal_enclosing_manifold_boundary_greedy(
         'boundary_vertices': [],
         'boundary_edges': [],
     }
+
+
+def generate_initial_seifert_disk(mesh, loop_vertices):
+    """
+    以健康孔洞边界环为边界生成初始拓扑圆盘。
+    """
+    loop_vertices = [int(v) for v in loop_vertices]
+    if len(loop_vertices) < 3:
+        return None, []
+
+    pts = np.asarray(mesh.vertices[loop_vertices], dtype=np.float64)
+
+    try:
+        from shapely.geometry import Polygon
+
+        centroid = pts.mean(axis=0)
+        _, _, vh = np.linalg.svd(pts - centroid)
+        u = vh[0]
+        v = vh[1]
+
+        poly2d = np.column_stack([
+            (pts - centroid) @ u,
+            (pts - centroid) @ v,
+        ])
+
+        polygon = Polygon(poly2d)
+        if not polygon.is_valid:
+            polygon = polygon.buffer(0)
+
+        triangulated = trimesh.creation.triangulate_polygon(polygon)
+        if triangulated is None:
+            raise ValueError("triangulate_polygon returned None")
+
+        tri_vertices_2d, tri_faces = triangulated
+        tri_vertices_2d = np.asarray(tri_vertices_2d, dtype=np.float64)
+        tri_faces = np.asarray(tri_faces, dtype=np.int64)
+
+        if tri_vertices_2d.ndim != 2 or tri_vertices_2d.shape[1] != 2:
+            raise ValueError("triangulate_polygon returned invalid 2D vertices")
+        if tri_faces.ndim != 2 or tri_faces.shape[1] != 3 or len(tri_faces) == 0:
+            raise ValueError("triangulate_polygon returned empty or invalid faces")
+
+        v3d = centroid + tri_vertices_2d[:, 0:1] * u + tri_vertices_2d[:, 1:2] * v
+
+        boundary_indices = []
+        for p2d in poly2d:
+            dists = np.linalg.norm(tri_vertices_2d - p2d, axis=1)
+            idx = int(np.argmin(dists))
+            if dists[idx] > 1e-8:
+                raise ValueError("boundary point not found in triangulation")
+            boundary_indices.append(idx)
+
+        disk = trimesh.Trimesh(
+            vertices=v3d,
+            faces=tri_faces,
+            process=False,
+        )
+
+        if len(boundary_indices) != len(poly2d):
+            raise ValueError("boundary indices mismatch")
+
+        return disk, boundary_indices
+
+    except Exception as e:
+        print(f"  [WARN] 初始 Seifert 圆盘生成失败: {e}")
+        return None, []
+
+
+def extract_intersection_faces_by_vertex_state(W, N, eps=None):
+    """
+    基于顶点内外状态，提取邻域网格 N 中与水密包络 W 相交的面片。
+    """
+    n_verts = len(N.vertices)
+    n_faces = len(N.faces)
+
+    if n_verts == 0 or n_faces == 0:
+        return np.zeros(n_faces, dtype=bool), np.array([], dtype=np.int64), np.zeros(n_verts, dtype=np.int8)
+
+    closest, dist, _ = W.nearest.on_surface(N.vertices)
+    inside = W.contains(N.vertices)
+
+    if eps is None:
+        median_w = np.median(W.edges_unique_length) if len(W.edges_unique) else 0.0
+        median_n = np.median(N.edges_unique_length) if len(N.edges_unique) else 0.0
+        eps = max(median_w, median_n) * 1e-6
+
+    on_surface = dist <= eps
+    outside = (~inside) & (~on_surface)
+    inside_only = inside & (~on_surface)
+
+    vertex_state = np.zeros(n_verts, dtype=np.int8)
+    vertex_state[inside_only] = 0
+    vertex_state[outside] = 1
+    vertex_state[on_surface] = 2
+
+    face_mask = np.zeros(n_faces, dtype=bool)
+
+    faces = np.asarray(N.faces, dtype=np.int64)
+    for fid, tri in enumerate(faces):
+        vs = vertex_state[tri]
+        has_inside = np.any(vs == 0)
+        has_outside = np.any(vs == 1)
+        has_surface = np.any(vs == 2)
+
+        if has_surface or (has_inside and has_outside):
+            face_mask[fid] = True
+
+    return face_mask, np.where(face_mask)[0], vertex_state

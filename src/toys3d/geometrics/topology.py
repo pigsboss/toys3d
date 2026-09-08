@@ -938,3 +938,80 @@ def _expand_face_neighborhood_geometrics(mesh, seed_faces, depth):
         if not current:
             break
     return visited
+
+
+def expand_face_neighborhood(mesh, seed_faces, depth):
+    """
+    公开的邻域扩展接口，内部调用已有私有实现。
+    """
+    return _expand_face_neighborhood_geometrics(mesh, seed_faces, depth)
+
+
+def compute_face_distances(mesh, source_mask):
+    """
+    计算每个面片到源面片集的最短拓扑距离。
+    """
+    n_faces = len(mesh.faces)
+    if n_faces == 0:
+        return np.zeros(0, dtype=np.int32)
+    if not np.any(source_mask):
+        return np.full(n_faces, np.iinfo(np.int32).max, dtype=np.int32)
+
+    face_adj = mesh.face_adjacency
+    rows = np.concatenate([face_adj[:, 0], face_adj[:, 1]])
+    cols = np.concatenate([face_adj[:, 1], face_adj[:, 0]])
+    data = np.ones(len(rows), dtype=np.int8)
+    adj = csr_matrix((data, (rows, cols)), shape=(n_faces, n_faces))
+
+    dist = np.full(n_faces, -1, dtype=np.int32)
+    q = deque()
+
+    for i in np.where(source_mask)[0]:
+        dist[i] = 0
+        q.append(int(i))
+
+    while q:
+        cur = q.popleft()
+        start = adj.indptr[cur]
+        end = adj.indptr[cur + 1]
+        for idx in range(start, end):
+            nb = adj.indices[idx]
+            if dist[nb] == -1:
+                dist[nb] = dist[cur] + 1
+                q.append(int(nb))
+
+    dist[dist == -1] = np.iinfo(np.int32).max
+    return dist
+
+
+def reconstruct_loop_from_edges(edge_vertex_pairs):
+    """
+    从无序边集恢复闭合顶点环。
+    """
+    if not edge_vertex_pairs:
+        return []
+
+    adj = {}
+    for a, b in edge_vertex_pairs:
+        adj.setdefault(int(a), []).append(int(b))
+        adj.setdefault(int(b), []).append(int(a))
+
+    start = next(iter(adj))
+    loop = [start]
+    prev = None
+    cur = start
+
+    while True:
+        nxts = [v for v in adj[cur] if v != prev]
+        if not nxts:
+            break
+        nxt = nxts[0]
+        if nxt == start:
+            break
+        loop.append(nxt)
+        prev, cur = cur, nxt
+
+        if len(loop) > len(adj):
+            break
+
+    return loop
