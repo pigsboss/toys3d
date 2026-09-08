@@ -1055,6 +1055,7 @@ def extract_component_package(mesh, args):
         args.boundary_type,
         args.boundary_id,
         args.boundary_neighborhood_depth,
+        print_distribution=args.print_neighborhood_distribution,
     )
 
     seed_faces = comp.get("face_ids", [])
@@ -1188,7 +1189,8 @@ def extract_component_package(mesh, args):
     )
 
 
-def _print_boundary_component_diagnostics(mesh, comp, boundary_type, boundary_id, neighborhood_depth):
+def _print_boundary_component_diagnostics(mesh, comp, boundary_type, boundary_id,
+                                         neighborhood_depth, print_distribution=False):
     """
     打印指定边界组件/健康孔洞的基础诊断信息。
     """
@@ -1219,7 +1221,7 @@ def _print_boundary_component_diagnostics(mesh, comp, boundary_type, boundary_id
     seed_faces = comp.get("face_ids", [])
     print(f"  种子面片数: {len(seed_faces)}")
 
-    if neighborhood_depth > 0:
+    if print_distribution and neighborhood_depth > 0:
         print("  邻域面片距离分布（距离0=种子面片）:")
         max_display = min(neighborhood_depth, 20)  # 最多显示到20层
         prev_set = set(seed_faces)
@@ -1535,7 +1537,8 @@ def visualize_boundary_component(mesh, args):
     # 打印组件诊断信息
     _print_boundary_component_diagnostics(
         mesh, comp, effective_boundary_type, boundary_id,
-        args.boundary_neighborhood_depth
+        args.boundary_neighborhood_depth,
+        print_distribution=args.print_neighborhood_distribution
     )
 
     # 优先使用当前边集导出的顶点，避免 hole_diagnosis.json 中旧索引/异常索引
@@ -3125,6 +3128,11 @@ def main():
                         help="边界圆柱半径（默认自动计算）")
     parser.add_argument("--boundary-show-original", action="store_true",
                         help="同时显示原始网格（半透明背景）")
+    parser.add_argument(
+        "--print-neighborhood-distribution",
+        action="store_true",
+        help="打印边界组件邻域面片距离分布（默认关闭，开启会增加耗时）",
+    )
     parser.add_argument("--debug-scene", action="store_true",
                         help="在显示或导出边界组件场景前，打印场景内所有几何对象的位置与大小")
     parser.add_argument("--fit-watertight-patch", action="store_true",
