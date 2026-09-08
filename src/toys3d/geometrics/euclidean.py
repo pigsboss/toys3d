@@ -406,3 +406,20 @@ def average_antiparallel_directions(d1, d2):
         d2 = -d2
     avg = d1 + d2
     return avg / (np.linalg.norm(avg) + 1e-12)
+
+
+def normalize(v):
+    """返回单位向量；零向量返回原数组。"""
+    v = np.asarray(v, dtype=np.float64)
+    n = np.linalg.norm(v)
+    if n < 1e-12:
+        return v
+    return v / n
+
+
+def signed_distance_to_plane(points, plane_origin, plane_normal):
+    """计算三维点到平面的有向距离（点在法向同侧为正）。"""
+    n = np.asarray(plane_normal, dtype=np.float64)
+    n = n / (np.linalg.norm(n) + 1e-12)
+    pts = np.asarray(points, dtype=np.float64)
+    return np.dot(pts - np.asarray(plane_origin, dtype=np.float64), n)

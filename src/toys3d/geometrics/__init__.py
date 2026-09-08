@@ -11,6 +11,8 @@ from .euclidean import (
     intersect_line_plane,
     kmeans_1d,
     average_antiparallel_directions,
+    normalize,
+    signed_distance_to_plane,
 )
 
 from .topology import (
@@ -58,9 +60,19 @@ from .discrete import (
     estimate_symmetry_plane_voxel,
 )
 
+from .analysis import (
+    build_box_aligned_frame_voxel,
+    build_box_aligned_frame_mesh,
+)
+
+from .generation import (
+    repair_mesh_by_removing_duplicates,
+    repair_nonmanifold_edges,
+    fill_small_holes,
+)
+
 from .utilities import (
     compute_hole_area_stats,
-    repair_mesh_by_removing_duplicates,
     project_vertices_to_shell,
     weld_small_holes,
     trim_isolated_faces,
@@ -72,6 +84,4 @@ from .utilities import (
     generate_initial_seifert_disk,
     extract_intersection_faces_by_vertex_state,
     segment_tubular_regions,
-    repair_nonmanifold_edges,
-    fill_small_holes,
 )
