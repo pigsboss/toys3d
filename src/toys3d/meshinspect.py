@@ -1808,7 +1808,7 @@ def visualize_boundary_component(mesh, args):
         _show_scene_with_camera_info(
             show_scene,
             args,
-            scene_translation=-camera_center,
+            scene_translation=(-camera_center if camera_center is not None else None),
         )
 
 
