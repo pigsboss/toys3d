@@ -5,6 +5,7 @@
 import numpy as np
 import trimesh
 from scipy.sparse import csr_matrix
+from collections import deque
 
 from .euclidean import polygon_area_from_3d_ccw
 from .topology import (
