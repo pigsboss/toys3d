@@ -39,6 +39,7 @@ from toys3d.geometrics import (
     project_vertices_to_shell,
     weld_small_holes,
     compute_vertex_face_counts,
+    build_vertex_face_csr,
     compute_face_edge_types,
     compute_face_topology_codes,
     compute_edge_to_faces,
@@ -57,6 +58,13 @@ from toys3d.geometrics import (
     is_manifold_closed_boundary,
     find_minimal_enclosing_manifold_boundary_greedy,
     fit_watertight_patch_from_component,
+    compute_face_area_stats,
+    compute_bounding_box_stats,
+    compute_volume_if_closed,
+    expand_face_neighborhood,
+    compute_face_distances,
+    point_in_polygon_2d,
+    normalize,
 )
 
 from toys3d.meshrepair import (
@@ -65,108 +73,6 @@ from toys3d.meshrepair import (
     print_seifert_fill_stats,
     compute_seifert_curvature_stats,
 )
-
-
-def compute_face_area_stats(mesh):
-    """
-    计算三角面片面积的统计量。
-    """
-    areas = mesh.area_faces
-    stats = {}
-    if len(areas) == 0:
-        stats['count'] = 0
-        for key in ['mean', 'min', 'max', 'p1', 'p5', 'p10',
-                    'p25', 'p50', 'p75', 'p90', 'p95', 'p99']:
-            stats[key] = 0.0
-        return stats
-
-    stats['count'] = int(len(areas))
-    stats['mean'] = float(np.mean(areas))
-    stats['min'] = float(np.min(areas))
-    stats['max'] = float(np.max(areas))
-    for p in [1, 5, 10, 25, 50, 75, 90, 95, 99]:
-        stats[f'p{p}'] = float(np.percentile(areas, p))
-    return stats
-
-
-def compute_bounding_box_stats(mesh):
-    """
-    计算包围盒相关统计。
-
-    直接使用 mesh.vertices 计算，避免在超大网格上依赖
-    trimesh 的 mesh.bounding_box / mesh.bounds 缓存属性。
-    """
-    vertices = np.asarray(mesh.vertices, dtype=np.float64)
-    if len(vertices) == 0:
-        return {
-            'min': np.zeros(3),
-            'max': np.zeros(3),
-            'extents': np.zeros(3),
-            'diagonal': 0.0,
-            'centroid': np.zeros(3),
-        }
-
-    vmin = vertices.min(axis=0)
-    vmax = vertices.max(axis=0)
-    extents = vmax - vmin
-
-    return {
-        'min': vmin,
-        'max': vmax,
-        'extents': extents,
-        'diagonal': float(np.linalg.norm(extents)),
-        'centroid': (vmin + vmax) / 2.0,
-    }
-
-
-def compute_volume_if_closed(mesh):
-    """
-    若网格水密，返回体积；否则返回 NaN。
-    """
-    if mesh.is_watertight:
-        return float(mesh.volume)
-    return float(np.nan)
-
-
-def compute_face_distances(mesh, source_mask):
-    """
-    计算每个面片到源面片集（例如缺陷面）的最短拓扑距离。
-
-    使用 scipy.sparse.csr_matrix 存储面邻接关系，避免为每个面片
-    构建 Python list，从而大幅降低内存占用。
-    """
-    n_faces = len(mesh.faces)
-    if n_faces == 0:
-        return np.zeros(0, dtype=np.int32)
-    if not np.any(source_mask):
-        return np.full(n_faces, np.iinfo(np.int32).max, dtype=np.int32)
-
-    face_adj = mesh.face_adjacency
-    rows = np.concatenate([face_adj[:, 0], face_adj[:, 1]])
-    cols = np.concatenate([face_adj[:, 1], face_adj[:, 0]])
-    data = np.ones(len(rows), dtype=np.int8)
-    adj = csr_matrix((data, (rows, cols)), shape=(n_faces, n_faces))
-
-    dist = np.full(n_faces, -1, dtype=np.int32)
-    q = deque()
-
-    for i in np.where(source_mask)[0]:
-        dist[i] = 0
-        q.append(int(i))
-
-    while q:
-        cur = q.popleft()
-        start = adj.indptr[cur]
-        end = adj.indptr[cur + 1]
-        for idx in range(start, end):
-            nb = adj.indices[idx]
-            if dist[nb] == -1:
-                dist[nb] = dist[cur] + 1
-                q.append(int(nb))
-
-    # 没有路径到达的面片（理论上极少出现）设为最大距离
-    dist[dist == -1] = np.iinfo(np.int32).max
-    return dist
 
 
 def build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask):
@@ -440,25 +346,6 @@ def add_hole_boundaries_to_scene(scene, mesh, radius=None,
             scene.add_geometry(seg)
 
 
-def _point_in_polygon_2d(pt, poly):
-    """二维射线法判断点是否在多边形内部。"""
-    x, y = pt
-    inside = False
-    n = len(poly)
-    j = n - 1
-
-    for i in range(n):
-        xi, yi = poly[i]
-        xj, yj = poly[j]
-        if ((yi > y) != (yj > y)) and (
-            x < (xj - xi) * (y - yi) / ((yj - yi) + 1e-30) + xi
-        ):
-            inside = not inside
-        j = i
-
-    return inside
-
-
 def _print_projected_boundary_diagnostics(
     loops,
     vertex_to_projected,
@@ -521,7 +408,7 @@ def _print_projected_boundary_diagnostics(
             ])
 
             inside_mask = [
-                _point_in_polygon_2d(tuple(p), poly2d)
+                point_in_polygon_2d(tuple(p), poly2d)
                 for p in cand2d
             ]
 
@@ -905,55 +792,6 @@ def _generate_component_3d_diagram(component, mesh, output_path):
     plt.close(fig)
 
 
-def _build_vertex_face_csr(mesh):
-    """
-    构建 (n_vertices, n_faces) 的 CSR 矩阵，行内存储包含该顶点的面索引。
-    """
-    faces = np.asarray(mesh.faces, dtype=np.int64)
-    n_vertices = len(mesh.vertices)
-    n_faces = len(faces)
-    row_idx = faces.ravel()
-    col_idx = np.repeat(np.arange(n_faces), 3)
-    data = np.ones(3 * n_faces, dtype=np.int8)
-    return csr_matrix((data, (row_idx, col_idx)), shape=(n_vertices, n_faces))
-
-
-def expand_face_neighborhood(mesh, seed_faces, depth):
-    """
-    从种子面片出发，返回拓扑邻域扩展 depth 层后的面片索引集合。
-    depth=0 返回空集合；depth=1 返回 seed_faces 本身；
-    depth>=2 依次加入直接邻居、邻居的邻居等。
-    """
-    if depth <= 0:
-        return set()
-    seed_faces = set(map(int, seed_faces))
-    if depth == 1:
-        return seed_faces.copy()
-
-    n_faces = len(mesh.faces)
-    adjacency = [[] for _ in range(n_faces)]
-    for f0, f1 in mesh.face_adjacency:
-        adjacency[int(f0)].append(int(f1))
-        adjacency[int(f1)].append(int(f0))
-
-    # 初始层就是种子面片
-    current = list(seed_faces)
-    visited = set(seed_faces)
-
-    # 已经占用了 depth=1，因此需要再向外扩展 depth-1 层
-    for _ in range(depth - 1):
-        next_layer = []
-        for f in current:
-            for nb in adjacency[f]:
-                if nb not in visited:
-                    visited.add(nb)
-                    next_layer.append(nb)
-        current = next_layer
-        if not current:
-            break
-    return visited
-
-
 def load_boundary_component_data(data_dir, boundary_id, boundary_type="uncovered"):
     """
     从 hole diagnosis 输出目录加载指定边界组件或健康孔洞的数据。
@@ -1301,12 +1139,6 @@ def print_scene_debug_info(scene, title="Scene Debug Info"):
         print(f"      diagonal={sdiag:.6f}")
 
 
-def _normalize_vector(v):
-    v = np.asarray(v, dtype=np.float64)
-    n = np.linalg.norm(v)
-    return v if n < 1e-12 else v / n
-
-
 def _print_camera_info(info):
     """命令行打印摄像机信息。"""
     print("\n[Camera Info]")
@@ -1378,7 +1210,7 @@ def _capture_vedo_camera_info(plotter_or_viewer):
         info["camera_position_display"] = pos.tolist()
         info["focal_point_display"] = focal.tolist()
         info["view_up"] = up.tolist()
-        info["view_direction"] = _normalize_vector(view_dir).tolist()
+        info["view_direction"] = normalize(view_dir).tolist()
         info["camera_distance"] = dist
 
         cr = cam.GetClippingRange()
@@ -1925,7 +1757,7 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces,
         return {}
 
     # 预计算共享数据
-    vertex_faces_csr = _build_vertex_face_csr(mesh)
+    vertex_faces_csr = build_vertex_face_csr(mesh)
     vertex_face_counts = compute_vertex_face_counts(mesh)
     edge_keys, edge_faces = compute_edge_to_faces(mesh)
     edge_to_faces = {int(k): v for k, v in zip(edge_keys, edge_faces)}

@@ -20,6 +20,7 @@ from .topology import (
     extract_boundary_loops,
     compute_topological_reliable_face_mask,
     compute_vertex_face_counts,
+    build_vertex_face_csr,
     compute_face_edge_types,
     compute_edge_to_faces,
     compute_face_edge_keys,

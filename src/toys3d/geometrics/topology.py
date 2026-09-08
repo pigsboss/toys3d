@@ -257,6 +257,23 @@ def compute_vertex_face_counts(mesh):
     return np.bincount(mesh.faces.ravel(), minlength=len(mesh.vertices))
 
 
+def build_vertex_face_csr(mesh):
+    """
+    构建 (n_vertices, n_faces) 的 CSR 矩阵，行内存储包含该顶点的面索引。
+    """
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    n_vertices = len(mesh.vertices)
+    n_faces = len(faces)
+
+    if n_faces == 0:
+        return csr_matrix((n_vertices, 0), dtype=np.int8)
+
+    row_idx = faces.ravel()
+    col_idx = np.repeat(np.arange(n_faces), 3)
+    data = np.ones(3 * n_faces, dtype=np.int8)
+    return csr_matrix((data, (row_idx, col_idx)), shape=(n_vertices, n_faces))
+
+
 def compute_face_edge_types(mesh):
     faces = np.asarray(mesh.faces, dtype=np.int64)
     n_faces = len(faces)
