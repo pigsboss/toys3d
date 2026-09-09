@@ -2,6 +2,7 @@
 """生成/修复类工具。"""
 import numpy as np
 import trimesh
+from .euclidean import polygon_area_from_3d_ccw
 from .discrete import (
     build_cotangent_laplacian,
     laplacian_smooth_fixed_boundary,
@@ -201,67 +202,144 @@ def fill_small_holes(mesh, max_loop_edges=50, verbose=True):
 # Seifert 曲面生成与修补
 # ---------------------------------------------------------------------------
 
+def _project_points_to_plane(points, normal):
+    pts = np.asarray(points, dtype=np.float64)
+    centroid = pts.mean(axis=0)
+
+    n = np.asarray(normal, dtype=np.float64)
+    n = n / (np.linalg.norm(n) + 1e-12)
+
+    helper = np.array([0.0, 0.0, 1.0])
+    if abs(np.dot(n, helper)) > 0.9:
+        helper = np.array([1.0, 0.0, 0.0])
+
+    u = np.cross(n, helper)
+    u = u / (np.linalg.norm(u) + 1e-12)
+    v = np.cross(n, u)
+    v = v / (np.linalg.norm(v) + 1e-12)
+
+    flat = np.column_stack([
+        (pts - centroid) @ u,
+        (pts - centroid) @ v,
+    ])
+    return flat, u, v, centroid
+
+
+def _candidate_projection_normals(points, mesh=None, loop_vertices=None):
+    pts = np.asarray(points, dtype=np.float64)
+    centroid = pts.mean(axis=0)
+    _, _, vh = np.linalg.svd(pts - centroid)
+
+    normals = []
+    # 最小主成分方向与旧实现一致，放在第一位
+    normals.append(vh[2].copy())
+    normals.append(vh[0].copy())
+    normals.append(vh[1].copy())
+    normals.extend([
+        np.array([1.0, 0.0, 0.0]),
+        np.array([0.0, 1.0, 0.0]),
+        np.array([0.0, 0.0, 1.0]),
+    ])
+
+    if mesh is not None and loop_vertices is not None:
+        face_normals = []
+        if hasattr(mesh, 'vertex_faces'):
+            for v in loop_vertices:
+                faces = mesh.vertex_faces[v]
+                for f in faces:
+                    if f >= 0:
+                        face_normals.append(mesh.face_normals[f])
+        if face_normals:
+            avg = np.mean(face_normals, axis=0)
+            norm = np.linalg.norm(avg)
+            if norm > 1e-12:
+                normals.append(avg / norm)
+
+    return normals
+
+
 def generate_initial_seifert_disk(mesh, loop_vertices):
     loop_vertices = [int(v) for v in loop_vertices]
     if len(loop_vertices) < 3:
         return None, []
 
     pts = np.asarray(mesh.vertices[loop_vertices], dtype=np.float64)
+    original_area = polygon_area_from_3d_ccw(pts)
 
     try:
         from shapely.geometry import Polygon
-
-        centroid = pts.mean(axis=0)
-        _, _, vh = np.linalg.svd(pts - centroid)
-        u = vh[0]
-        v = vh[1]
-
-        poly2d = np.column_stack([
-            (pts - centroid) @ u,
-            (pts - centroid) @ v,
-        ])
-
-        polygon = Polygon(poly2d)
-        if not polygon.is_valid:
-            polygon = polygon.buffer(0)
-
-        triangulated = trimesh.creation.triangulate_polygon(polygon)
-        if triangulated is None:
-            raise ValueError("triangulate_polygon returned None")
-
-        tri_vertices_2d, tri_faces = triangulated
-        tri_vertices_2d = np.asarray(tri_vertices_2d, dtype=np.float64)
-        tri_faces = np.asarray(tri_faces, dtype=np.int64)
-
-        if tri_vertices_2d.ndim != 2 or tri_vertices_2d.shape[1] != 2:
-            raise ValueError("invalid 2D vertices")
-        if tri_faces.ndim != 2 or tri_faces.shape[1] != 3 or len(tri_faces) == 0:
-            raise ValueError("empty or invalid faces")
-
-        v3d = centroid + tri_vertices_2d[:, 0:1] * u + tri_vertices_2d[:, 1:2] * v
-
-        boundary_indices = []
-        for p2d in poly2d:
-            dists = np.linalg.norm(tri_vertices_2d - p2d, axis=1)
-            idx = int(np.argmin(dists))
-            if dists[idx] > 1e-8:
-                raise ValueError("boundary point not found in triangulation")
-            boundary_indices.append(idx)
-
-        disk = trimesh.Trimesh(
-            vertices=v3d,
-            faces=tri_faces,
-            process=False,
-        )
-
-        if len(boundary_indices) != len(poly2d):
-            raise ValueError("boundary indices mismatch")
-
-        return disk, boundary_indices
-
-    except Exception as e:
-        print(f"  [WARN] 初始 Seifert 圆盘生成失败: {e}")
+    except Exception:
         return None, []
+
+    for normal in _candidate_projection_normals(pts, mesh, loop_vertices):
+        try:
+            flat, u, v, centroid = _project_points_to_plane(pts, normal)
+
+            polygon = Polygon(flat)
+            if not polygon.is_valid:
+                polygon = polygon.buffer(0)
+
+            if not isinstance(polygon, Polygon) or polygon.is_empty:
+                continue
+
+            projected_area = float(polygon.area)
+            if projected_area < 1e-12:
+                continue
+
+            # 投影退化检查：投影面积不得低于原始 3D 孔洞面积的 20%
+            if original_area > 1e-12:
+                if projected_area / original_area < 0.2:
+                    continue
+
+            triangulated = trimesh.creation.triangulate_polygon(polygon)
+            if triangulated is None:
+                continue
+
+            tri_vertices_2d, tri_faces = triangulated
+            tri_vertices_2d = np.asarray(tri_vertices_2d, dtype=np.float64)
+            tri_faces = np.asarray(tri_faces, dtype=np.int64)
+
+            if tri_vertices_2d.ndim != 2 or tri_vertices_2d.shape[1] != 2:
+                continue
+            if tri_faces.ndim != 2 or tri_faces.shape[1] != 3 or len(tri_faces) == 0:
+                continue
+
+            v3d = centroid + tri_vertices_2d[:, 0:1] * u + tri_vertices_2d[:, 1:2] * v
+
+            boundary_indices = []
+            ok = True
+            for p2d in flat:
+                dists = np.linalg.norm(tri_vertices_2d - p2d, axis=1)
+                idx = int(np.argmin(dists))
+                if dists[idx] > 1e-8:
+                    ok = False
+                    break
+                boundary_indices.append(idx)
+
+            if not ok:
+                continue
+
+            if len(boundary_indices) != len(flat):
+                continue
+
+            if len(set(boundary_indices)) != len(flat):
+                continue
+
+            disk = trimesh.Trimesh(
+                vertices=v3d,
+                faces=tri_faces,
+                process=False,
+            )
+
+            if len(disk.faces) == 0 or np.any(disk.area_faces <= 1e-12):
+                continue
+
+            return disk, boundary_indices
+
+        except Exception:
+            continue
+
+    return None, []
 
 
 def generate_seifert_surface(mesh, hole_vertex_indices,
