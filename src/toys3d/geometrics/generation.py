@@ -7,7 +7,6 @@ from .discrete import (
     laplacian_smooth_fixed_boundary,
     compute_curvature_statistics,
 )
-from .euclidean import polygon_area_from_3d_ccw
 
 
 def repair_mesh_by_removing_duplicates(mesh):
@@ -202,404 +201,67 @@ def fill_small_holes(mesh, max_loop_edges=50, verbose=True):
 # Seifert 曲面生成与修补
 # ---------------------------------------------------------------------------
 
-def _project_points_to_plane(points, plane_normal, centroid=None):
-    n = np.asarray(plane_normal, dtype=np.float64)
-    n = n / (np.linalg.norm(n) + 1e-12)
-
-    if centroid is None:
-        centroid = points.mean(axis=0)
-
-    helper = np.array([0.0, 0.0, 1.0])
-    if abs(np.dot(n, helper)) > 0.9:
-        helper = np.array([1.0, 0.0, 0.0])
-
-    u = np.cross(n, helper)
-    u = u / (np.linalg.norm(u) + 1e-12)
-    v = np.cross(n, u)
-    v = v / (np.linalg.norm(v) + 1e-12)
-
-    flat = np.column_stack([
-        (points - centroid) @ u,
-        (points - centroid) @ v,
-    ])
-    return flat, u, v, centroid
-
-
-def _is_valid_simple_projection(flat, original_area, min_area_ratio=0.2):
-    from shapely.geometry import Polygon
-
-    try:
-        polygon = Polygon(flat)
-    except Exception:
-        return False, 0.0, None
-
-    if not polygon.is_valid or polygon.is_empty:
-        return False, 0.0, None
-
-    area2d = float(polygon.area)
-    if area2d < 1e-12:
-        return False, 0.0, None
-
-    if original_area < 1e-12:
-        return False, 0.0, None
-
-    if area2d / original_area < min_area_ratio:
-        return False, area2d, None
-
-    return True, area2d, polygon
-
-
-def _candidate_projection_normals(points, mesh=None, loop_vertices=None):
-    centroid = points.mean(axis=0)
-    _, _, vh = np.linalg.svd(points - centroid)
-
-    normals = []
-    # 所有主成分方向
-    for i in range(3):
-        normals.append(vh[i].copy())
-    # 三个坐标轴
-    normals.extend([
-        np.array([1.0, 0.0, 0.0]),
-        np.array([0.0, 1.0, 0.0]),
-        np.array([0.0, 0.0, 1.0]),
-    ])
-    # 边界顶点所在面片的加权平均法向
-    if mesh is not None and loop_vertices is not None:
-        face_normals = []
-        if hasattr(mesh, 'vertex_faces'):
-            for v in loop_vertices:
-                faces = mesh.vertex_faces[v]
-                for f in faces:
-                    if f >= 0:
-                        face_normals.append(mesh.face_normals[f])
-        if face_normals:
-            avg = np.mean(face_normals, axis=0)
-            if np.linalg.norm(avg) > 1e-12:
-                normals.append(avg / np.linalg.norm(avg))
-    return normals
-
-
-def _find_valid_boundary_projection(pts, mesh=None, loop_vertices=None):
-    original_area = polygon_area_from_3d_ccw(pts)
-    if original_area < 1e-12:
-        return None
-
-    for n in _candidate_projection_normals(pts, mesh, loop_vertices):
-        flat, u, v, centroid = _project_points_to_plane(pts, n)
-        valid, _area2d, polygon = _is_valid_simple_projection(
-            flat, original_area
-        )
-        if valid and polygon is not None:
-            return flat, u, v, centroid, polygon
-
-    return None
-
-
-def _is_simple_planar_loop(mesh, loop_vertices, max_vertices=50, planar_ratio=0.1):
-    if len(loop_vertices) > max_vertices:
-        return False
-
-    pts = mesh.vertices[np.asarray(loop_vertices, dtype=np.int64)]
-    centroid = pts.mean(axis=0)
-    _, _, vh = np.linalg.svd(pts - centroid)
-    normal = vh[2]
-    dists = np.abs((pts - centroid) @ normal)
-    extent = np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))
-    if extent < 1e-12:
-        return False
-    max_dist = np.max(dists)
-    return max_dist / extent < planar_ratio
-
-
-def _point_in_triangle(pt, a, b, c):
-    """判断二维点 pt 是否在三角形 abc 内部（不含边界）。"""
-    def sign(p1, p2, p3):
-        return (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1])
-
-    d1 = sign(pt, a, b)
-    d2 = sign(pt, b, c)
-    d3 = sign(pt, c, a)
-
-    has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
-    has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
-
-    return not (has_neg and has_pos)
-
-
-def _ear_clip_triangulate(poly2d):
-    """
-    对简单多边形进行 ear clipping 三角化。
-
-    输入：poly2d 形状 (n,2)，按边界顺序排列。
-    输出：三角形索引数组形状 (n-2,3)，索引指向输入数组。
-    如果失败（退化或找不到耳），返回 None。
-    """
-    n = len(poly2d)
-    if n < 3:
-        return None
-    if n == 3:
-        return np.array([[0, 1, 2]], dtype=np.int64)
-
-    # 计算有向面积来判断方向
-    area = 0.0
-    for i in range(n):
-        x1, y1 = poly2d[i]
-        x2, y2 = poly2d[(i + 1) % n]
-        area += x1 * y2 - x2 * y1
-    if abs(area) < 1e-12:
-        return None
-
-    ccw = area > 0
-    indices = list(range(n))
-    triangles = []
-    max_guard = n * n * 10
-    guard = 0
-
-    while len(indices) > 3 and guard < max_guard:
-        guard += 1
-        ear_found = False
-        m = len(indices)
-
-        for i in range(m):
-            prev_idx = indices[(i - 1) % m]
-            curr_idx = indices[i]
-            next_idx = indices[(i + 1) % m]
-
-            p_prev = poly2d[prev_idx]
-            p_curr = poly2d[curr_idx]
-            p_next = poly2d[next_idx]
-
-            # 叉积判断凸性
-            cross = ((p_curr[0] - p_prev[0]) * (p_next[1] - p_curr[1]) -
-                     (p_curr[1] - p_prev[1]) * (p_next[0] - p_curr[0]))
-
-            if ccw:
-                is_convex = cross > 1e-12
-            else:
-                is_convex = cross < -1e-12
-
-            if not is_convex:
-                continue
-
-            # 检查三角形内部是否包含其他顶点
-            contains_point = False
-            for j in range(m):
-                if j == (i - 1) % m or j == i or j == (i + 1) % m:
-                    continue
-                pt = poly2d[indices[j]]
-                if _point_in_triangle(pt, p_prev, p_curr, p_next):
-                    contains_point = True
-                    break
-
-            if contains_point:
-                continue
-
-            # 记录耳三角形并移除当前顶点
-            triangles.append([prev_idx, curr_idx, next_idx])
-            indices.pop(i)
-            ear_found = True
-            break
-
-        if not ear_found:
-            return None
-
-    if len(indices) == 3:
-        triangles.append([indices[0], indices[1], indices[2]])
-    else:
-        return None
-
-    return np.array(triangles, dtype=np.int64)
-
-
-def _generate_fallback_fan_disk(mesh, loop_vertices):
-    pts = mesh.vertices[np.asarray(loop_vertices, dtype=np.int64)]
-    centroid = pts.mean(axis=0)
-    n = len(loop_vertices)
-
-    vertices = np.vstack([pts, centroid])
-    faces = []
-    c_idx = n
-    for i in range(n):
-        faces.append([c_idx, i, (i + 1) % n])
-    faces = np.array(faces, dtype=np.int64)
-
-    disk = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    # 边界索引就是前 n 个顶点，顺序与输入 loop_vertices 一致
-    boundary_indices = list(range(n))
-    return disk, boundary_indices
-
-
-def generate_initial_seifert_disk(mesh, loop_vertices, verbose=False):
+def generate_initial_seifert_disk(mesh, loop_vertices):
     loop_vertices = [int(v) for v in loop_vertices]
-
-    # 快速去除连续重复顶点
-    loop = []
-    for v in loop_vertices:
-        if not loop or loop[-1] != v:
-            loop.append(v)
-    if len(loop) >= 2 and loop[0] == loop[-1]:
-        loop = loop[:-1]
-
-    if verbose:
-        print(f"  [Seifert 初始圆盘] 输入边界顶点数: {len(loop_vertices)}")
-        print(f"  [Seifert 初始圆盘] 去重后边界顶点数: {len(loop)}")
-
-    if len(loop) < 3:
-        if verbose:
-            print("  [Seifert 初始圆盘] 失败: 去重后有效顶点数 < 3")
+    if len(loop_vertices) < 3:
         return None, []
 
-    loop_vertices = loop
     pts = np.asarray(mesh.vertices[loop_vertices], dtype=np.float64)
 
-    if verbose:
-        print(f"  [Seifert 初始圆盘] 原始边界面积: "
-              f"{polygon_area_from_3d_ccw(pts):.6f}")
-
-    projection = _find_valid_boundary_projection(pts, mesh, loop_vertices)
-    if projection is None:
-        if _is_simple_planar_loop(mesh, loop_vertices):
-            if verbose:
-                print("  [Seifert 初始圆盘] 投影失败，尝试简单平面 fallback")
-                print("  [Seifert 初始圆盘] 使用质心扇形三角化作为初始圆盘")
-            return _generate_fallback_fan_disk(mesh, loop_vertices)
-        else:
-            if verbose:
-                print("  [Seifert 初始圆盘] 失败: 未找到有效投影且不满足简单平面条件")
-                print(f"  [DEBUG] 原始面积={polygon_area_from_3d_ccw(pts):.6f}")
-                for n in _candidate_projection_normals(pts, mesh, loop_vertices):
-                    flat, _, _, _ = _project_points_to_plane(pts, n)
-                    valid, area2d, _ = _is_valid_simple_projection(
-                        flat, polygon_area_from_3d_ccw(pts)
-                    )
-                    print(f"  [DEBUG] 法向 {n}, valid={valid}, area2d={area2d:.6f}")
-            return None, []
-    else:
-        if verbose:
-            flat, u, v, centroid, polygon = projection
-            print("  [Seifert 初始圆盘] 找到有效投影：")
-            print(f"    centroid = {centroid}")
-            print(f"    u = {u}")
-            print(f"    v = {v}")
-            print(f"    polygon.area = {polygon.area:.6f}")
-
-    flat, u, v, centroid, polygon = projection
-
-    tri_vertices_2d = flat
-    tri_faces = _ear_clip_triangulate(flat)
-
-    if tri_faces is None:
-        if verbose:
-            print("  [Seifert 初始圆盘] 失败: ear clipping 三角化失败")
-        if _is_simple_planar_loop(mesh, loop_vertices):
-            if verbose:
-                print("  [Seifert 初始圆盘] 尝试简单平面 fallback")
-            return _generate_fallback_fan_disk(mesh, loop_vertices)
-        return None, []
-
-    if verbose:
-        print(f"  [Seifert 初始圆盘] 三角化成功: "
-              f"顶点数={len(tri_vertices_2d)}, 面片数={len(tri_faces)}")
-
-    # 严格对照原始投影点，不允许近似匹配失败或重复
-    boundary_indices = []
-    for i, p2d in enumerate(flat):
-        dists = np.linalg.norm(tri_vertices_2d - p2d, axis=1)
-        idx = int(np.argmin(dists))
-        if dists[idx] > 1e-8:
-            if verbose:
-                print(f"  [Seifert 初始圆盘] 失败: 投影点 {i} 无法在三角化顶点中匹配")
-                print(f"    原投影点: {p2d}")
-                print(f"    最近距离: {dists[idx]:.6e}")
-                print(f"    最近顶点: {tri_vertices_2d[idx]}")
-            return None, []
-        boundary_indices.append(idx)
-
-    if len(set(boundary_indices)) != len(flat):
-        if verbose:
-            print("  [Seifert 初始圆盘] 失败: 边界顶点映射存在重复")
-            print(f"    boundary_indices = {boundary_indices}")
-        return None, []
-
-    # 确保边界边按原始顺序存在，防止三角化打乱边界
-    edge_set = set()
-    for face in tri_faces:
-        for j in range(3):
-            a = int(face[j])
-            b = int(face[(j + 1) % 3])
-            edge_set.add((a, b))
-            edge_set.add((b, a))
-
-    for i in range(len(boundary_indices)):
-        a = boundary_indices[i]
-        b = boundary_indices[(i + 1) % len(boundary_indices)]
-        if (a, b) not in edge_set:
-            if verbose:
-                print("  [Seifert 初始圆盘] 失败: 边界边顺序检查未通过")
-                print(f"    segment {i}: ({a}, {b}) 不在三角化边集中")
-            if _is_simple_planar_loop(mesh, loop_vertices):
-                if verbose:
-                    print("  [Seifert 初始圆盘] 尝试简单平面 fallback")
-                return _generate_fallback_fan_disk(mesh, loop_vertices)
-            return None, []
-
-    v3d = centroid + tri_vertices_2d[:, 0:1] * u + tri_vertices_2d[:, 1:2] * v
-
-    disk = trimesh.Trimesh(
-        vertices=v3d,
-        faces=tri_faces,
-        process=False,
-    )
-
-    # 初始圆盘质量硬检查：不满足快速失败，不进入后续迭代
-    if len(disk.faces) == 0:
-        if verbose:
-            print("  [Seifert 初始圆盘] 失败: 初始圆盘面片数为 0")
-        return None, []
-
-    areas = disk.area_faces
-    if np.any(areas <= 1e-12):
-        if verbose:
-            print("  [Seifert 初始圆盘] 失败: 初始圆盘存在零面积面片")
-            print(f"    zero_area_count = {int(np.sum(areas <= 1e-12))}")
-        return None, []
-
-    area_ratio = np.max(areas) / max(float(np.min(areas)), 1e-12)
-    if area_ratio > 1000.0 and verbose:
-        print(f"  [Seifert 初始圆盘] 警告: 面积比很大 ({area_ratio:.1f})，继续尝试优化")
-
-    if not np.allclose(disk.vertices[boundary_indices], pts, atol=1e-8):
-        if verbose:
-            diff = disk.vertices[boundary_indices] - pts
-            print("  [Seifert 初始圆盘] 失败: 初始圆盘边界与原始孔洞边界不一致")
-            print(f"    max_abs_diff = {np.max(np.abs(diff)):.6e}")
-        return None, []
-
-    if verbose:
-        print(f"  [Seifert 初始圆盘] 成功: "
-              f"面片数={len(disk.faces)}, 顶点数={len(disk.vertices)}")
-
-    return disk, boundary_indices
-
-
-def _validate_seifert_patch(mesh, hole_vertex_indices, seifert_mesh, boundary_indices):
-    if len(seifert_mesh.faces) == 0:
-        return False
-
-    areas = seifert_mesh.area_faces
-    if np.any(areas <= 1e-12):
-        return False
-
     try:
-        boundary_positions = seifert_mesh.vertices[boundary_indices]
-        original_positions = mesh.vertices[np.asarray(hole_vertex_indices, dtype=np.int64)]
-    except Exception:
-        return False
+        from shapely.geometry import Polygon
 
-    if not np.allclose(boundary_positions, original_positions, atol=1e-8):
-        return False
+        centroid = pts.mean(axis=0)
+        _, _, vh = np.linalg.svd(pts - centroid)
+        u = vh[0]
+        v = vh[1]
 
-    return True
+        poly2d = np.column_stack([
+            (pts - centroid) @ u,
+            (pts - centroid) @ v,
+        ])
+
+        polygon = Polygon(poly2d)
+        if not polygon.is_valid:
+            polygon = polygon.buffer(0)
+
+        triangulated = trimesh.creation.triangulate_polygon(polygon)
+        if triangulated is None:
+            raise ValueError("triangulate_polygon returned None")
+
+        tri_vertices_2d, tri_faces = triangulated
+        tri_vertices_2d = np.asarray(tri_vertices_2d, dtype=np.float64)
+        tri_faces = np.asarray(tri_faces, dtype=np.int64)
+
+        if tri_vertices_2d.ndim != 2 or tri_vertices_2d.shape[1] != 2:
+            raise ValueError("invalid 2D vertices")
+        if tri_faces.ndim != 2 or tri_faces.shape[1] != 3 or len(tri_faces) == 0:
+            raise ValueError("empty or invalid faces")
+
+        v3d = centroid + tri_vertices_2d[:, 0:1] * u + tri_vertices_2d[:, 1:2] * v
+
+        boundary_indices = []
+        for p2d in poly2d:
+            dists = np.linalg.norm(tri_vertices_2d - p2d, axis=1)
+            idx = int(np.argmin(dists))
+            if dists[idx] > 1e-8:
+                raise ValueError("boundary point not found in triangulation")
+            boundary_indices.append(idx)
+
+        disk = trimesh.Trimesh(
+            vertices=v3d,
+            faces=tri_faces,
+            process=False,
+        )
+
+        if len(boundary_indices) != len(poly2d):
+            raise ValueError("boundary indices mismatch")
+
+        return disk, boundary_indices
+
+    except Exception as e:
+        print(f"  [WARN] 初始 Seifert 圆盘生成失败: {e}")
+        return None, []
 
 
 def generate_seifert_surface(mesh, hole_vertex_indices,
@@ -607,6 +269,9 @@ def generate_seifert_surface(mesh, hole_vertex_indices,
                              step_size=1.0,
                              tol=1e-7,
                              verbose=False):
+    """
+    为健康孔洞生成固定边界的 Seifert 极小曲面。
+    """
     hole_vertex_indices = [int(v) for v in hole_vertex_indices]
     if len(hole_vertex_indices) < 3:
         return {
@@ -617,51 +282,30 @@ def generate_seifert_surface(mesh, hole_vertex_indices,
         }
 
     disk_mesh, boundary_indices = generate_initial_seifert_disk(
-        mesh, hole_vertex_indices, verbose=verbose
+        mesh, hole_vertex_indices
     )
     if disk_mesh is None:
         return {
             "success": False,
             "mesh": None,
             "boundary_indices": [],
-            "message": "当前孔洞边界过于复杂，未找到有效投影/初始圆盘，已快速失败",
+            "message": "无法生成初始 Seifert 圆盘",
         }
 
-    seifert_mesh, opt_info = laplacian_smooth_fixed_boundary(
+    seifert_mesh = laplacian_smooth_fixed_boundary(
         disk_mesh,
         boundary_indices,
         iterations=optimize_iterations,
         step_size=step_size,
         tol=tol,
         verbose=verbose,
-        return_info=True,
     )
-
-    if seifert_mesh is None or not opt_info.get("success", False):
-        msg = opt_info.get("message", "极小曲面优化失败")
-        return {
-            "success": False,
-            "mesh": None,
-            "boundary_indices": boundary_indices,
-            "message": msg,
-        }
-
-    if not _validate_seifert_patch(
-        mesh, hole_vertex_indices, seifert_mesh, boundary_indices
-    ):
-        return {
-            "success": False,
-            "mesh": None,
-            "boundary_indices": boundary_indices,
-            "message": "生成后的补丁未通过边界或几何验证",
-        }
 
     return {
         "success": True,
         "mesh": seifert_mesh,
         "boundary_indices": boundary_indices,
         "message": "Seifert 曲面生成成功",
-        "diagnostics": opt_info,
     }
 
 
