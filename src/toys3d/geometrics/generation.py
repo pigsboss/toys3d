@@ -311,6 +311,106 @@ def _is_simple_planar_loop(mesh, loop_vertices, max_vertices=50, planar_ratio=0.
     return max_dist / extent < planar_ratio
 
 
+def _point_in_triangle(pt, a, b, c):
+    """判断二维点 pt 是否在三角形 abc 内部（不含边界）。"""
+    def sign(p1, p2, p3):
+        return (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1])
+
+    d1 = sign(pt, a, b)
+    d2 = sign(pt, b, c)
+    d3 = sign(pt, c, a)
+
+    has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
+    has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
+
+    return not (has_neg and has_pos)
+
+
+def _ear_clip_triangulate(poly2d):
+    """
+    对简单多边形进行 ear clipping 三角化。
+
+    输入：poly2d 形状 (n,2)，按边界顺序排列。
+    输出：三角形索引数组形状 (n-2,3)，索引指向输入数组。
+    如果失败（退化或找不到耳），返回 None。
+    """
+    n = len(poly2d)
+    if n < 3:
+        return None
+    if n == 3:
+        return np.array([[0, 1, 2]], dtype=np.int64)
+
+    # 计算有向面积来判断方向
+    area = 0.0
+    for i in range(n):
+        x1, y1 = poly2d[i]
+        x2, y2 = poly2d[(i + 1) % n]
+        area += x1 * y2 - x2 * y1
+    if abs(area) < 1e-12:
+        return None
+
+    ccw = area > 0
+    indices = list(range(n))
+    triangles = []
+    max_guard = n * n * 10
+    guard = 0
+
+    while len(indices) > 3 and guard < max_guard:
+        guard += 1
+        ear_found = False
+        m = len(indices)
+
+        for i in range(m):
+            prev_idx = indices[(i - 1) % m]
+            curr_idx = indices[i]
+            next_idx = indices[(i + 1) % m]
+
+            p_prev = poly2d[prev_idx]
+            p_curr = poly2d[curr_idx]
+            p_next = poly2d[next_idx]
+
+            # 叉积判断凸性
+            cross = ((p_curr[0] - p_prev[0]) * (p_next[1] - p_curr[1]) -
+                     (p_curr[1] - p_prev[1]) * (p_next[0] - p_curr[0]))
+
+            if ccw:
+                is_convex = cross > 1e-12
+            else:
+                is_convex = cross < -1e-12
+
+            if not is_convex:
+                continue
+
+            # 检查三角形内部是否包含其他顶点
+            contains_point = False
+            for j in range(m):
+                if j == (i - 1) % m or j == i or j == (i + 1) % m:
+                    continue
+                pt = poly2d[indices[j]]
+                if _point_in_triangle(pt, p_prev, p_curr, p_next):
+                    contains_point = True
+                    break
+
+            if contains_point:
+                continue
+
+            # 记录耳三角形并移除当前顶点
+            triangles.append([prev_idx, curr_idx, next_idx])
+            indices.pop(i)
+            ear_found = True
+            break
+
+        if not ear_found:
+            return None
+
+    if len(indices) == 3:
+        triangles.append([indices[0], indices[1], indices[2]])
+    else:
+        return None
+
+    return np.array(triangles, dtype=np.int64)
+
+
 def _generate_fallback_fan_disk(mesh, loop_vertices):
     pts = mesh.vertices[np.asarray(loop_vertices, dtype=np.int64)]
     centroid = pts.mean(axis=0)
@@ -385,31 +485,21 @@ def generate_initial_seifert_disk(mesh, loop_vertices, verbose=False):
 
     flat, u, v, centroid, polygon = projection
 
-    try:
-        triangulated = trimesh.creation.triangulate_polygon(polygon)
-        if triangulated is None:
-            raise ValueError("triangulate_polygon returned None")
+    tri_vertices_2d = flat
+    tri_faces = _ear_clip_triangulate(flat)
 
-        tri_vertices_2d, tri_faces = triangulated
-        tri_vertices_2d = np.asarray(tri_vertices_2d, dtype=np.float64)
-        tri_faces = np.asarray(tri_faces, dtype=np.int64)
-
-        if tri_vertices_2d.ndim != 2 or tri_vertices_2d.shape[1] != 2:
-            raise ValueError("invalid 2D vertex array")
-        if tri_faces.ndim != 2 or tri_faces.shape[1] != 3 or len(tri_faces) == 0:
-            raise ValueError("invalid face array")
-
+    if tri_faces is None:
         if verbose:
-            print(f"  [Seifert 初始圆盘] 三角化成功: "
-                  f"顶点数={len(tri_vertices_2d)}, 面片数={len(tri_faces)}")
-    except Exception as e:
-        if verbose:
-            print(f"  [Seifert 初始圆盘] 失败: 平面三角化异常: {e}")
+            print("  [Seifert 初始圆盘] 失败: ear clipping 三角化失败")
         if _is_simple_planar_loop(mesh, loop_vertices):
             if verbose:
                 print("  [Seifert 初始圆盘] 尝试简单平面 fallback")
             return _generate_fallback_fan_disk(mesh, loop_vertices)
         return None, []
+
+    if verbose:
+        print(f"  [Seifert 初始圆盘] 三角化成功: "
+              f"顶点数={len(tri_vertices_2d)}, 面片数={len(tri_faces)}")
 
     # 严格对照原始投影点，不允许近似匹配失败或重复
     boundary_indices = []
