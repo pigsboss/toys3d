@@ -225,7 +225,7 @@ def _project_points_to_plane(points, plane_normal, centroid=None):
     return flat, u, v, centroid
 
 
-def _is_valid_simple_projection(flat, original_area, min_area_ratio=0.5):
+def _is_valid_simple_projection(flat, original_area, min_area_ratio=0.2):
     from shapely.geometry import Polygon
 
     try:
@@ -234,7 +234,13 @@ def _is_valid_simple_projection(flat, original_area, min_area_ratio=0.5):
         return False, 0.0, None
 
     if not polygon.is_valid or polygon.is_empty:
-        return False, 0.0, None
+        # 尝试修复常见浮点自交问题
+        try:
+            polygon = polygon.buffer(0)
+        except Exception:
+            return False, 0.0, None
+        if not isinstance(polygon, Polygon) or polygon.is_empty or not polygon.is_valid:
+            return False, 0.0, None
 
     area2d = float(polygon.area)
     if area2d < 1e-12:
@@ -249,24 +255,42 @@ def _is_valid_simple_projection(flat, original_area, min_area_ratio=0.5):
     return True, area2d, polygon
 
 
-def _candidate_projection_normals(points):
+def _candidate_projection_normals(points, mesh=None, loop_vertices=None):
     centroid = points.mean(axis=0)
     _, _, vh = np.linalg.svd(points - centroid)
 
     normals = []
-    normals.append(vh[2].copy())
-    normals.append(np.array([1.0, 0.0, 0.0]))
-    normals.append(np.array([0.0, 1.0, 0.0]))
-    normals.append(np.array([0.0, 0.0, 1.0]))
+    # 所有主成分方向
+    for i in range(3):
+        normals.append(vh[i].copy())
+    # 三个坐标轴
+    normals.extend([
+        np.array([1.0, 0.0, 0.0]),
+        np.array([0.0, 1.0, 0.0]),
+        np.array([0.0, 0.0, 1.0]),
+    ])
+    # 边界顶点所在面片的加权平均法向
+    if mesh is not None and loop_vertices is not None:
+        face_normals = []
+        if hasattr(mesh, 'vertex_faces'):
+            for v in loop_vertices:
+                faces = mesh.vertex_faces[v]
+                for f in faces:
+                    if f >= 0:
+                        face_normals.append(mesh.face_normals[f])
+        if face_normals:
+            avg = np.mean(face_normals, axis=0)
+            if np.linalg.norm(avg) > 1e-12:
+                normals.append(avg / np.linalg.norm(avg))
     return normals
 
 
-def _find_valid_boundary_projection(pts):
+def _find_valid_boundary_projection(pts, mesh=None, loop_vertices=None):
     original_area = polygon_area_from_3d_ccw(pts)
     if original_area < 1e-12:
         return None
 
-    for n in _candidate_projection_normals(pts):
+    for n in _candidate_projection_normals(pts, mesh, loop_vertices):
         flat, u, v, centroid = _project_points_to_plane(pts, n)
         valid, _area2d, polygon = _is_valid_simple_projection(
             flat, original_area
@@ -293,8 +317,15 @@ def generate_initial_seifert_disk(mesh, loop_vertices):
     loop_vertices = loop
     pts = np.asarray(mesh.vertices[loop_vertices], dtype=np.float64)
 
-    projection = _find_valid_boundary_projection(pts)
+    projection = _find_valid_boundary_projection(pts, mesh, loop_vertices)
     if projection is None:
+        print(f"  [DEBUG] 原始面积={polygon_area_from_3d_ccw(pts):.6f}")
+        for n in _candidate_projection_normals(pts, mesh, loop_vertices):
+            flat, _, _, _ = _project_points_to_plane(pts, n)
+            valid, area2d, _ = _is_valid_simple_projection(
+                flat, polygon_area_from_3d_ccw(pts)
+            )
+            print(f"  [DEBUG] 法向 {n}, valid={valid}, area2d={area2d:.6f}")
         return None, []
 
     flat, u, v, centroid, polygon = projection
