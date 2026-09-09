@@ -26,15 +26,12 @@ _src_parent = os.path.dirname(_project_root)
 if _src_parent not in sys.path:
     sys.path.insert(0, _src_parent)
 
+from toys3d.geometrics import expand_face_neighborhood
+
 
 def load_mesh(input_file):
-    """加载网格并返回 trimesh.Trimesh（跳过慢速顶点合并）。"""
-    mesh = trimesh.load(
-        input_file,
-        force="mesh",
-        process=False,      # 跳过 merge_vertices，大幅加速千万级网格加载
-        validate=False,
-    )
+    """加载网格并返回 trimesh.Trimesh，与 meshinspect.py 保持一致。"""
+    mesh = trimesh.load(input_file, force="mesh")
     if isinstance(mesh, trimesh.Scene):
         mesh = mesh.dump(concatenate=True)
     return mesh
@@ -93,42 +90,6 @@ def load_uncovered_components(diag_dir):
         comp.setdefault("candidate_breaks", [])
         comp.setdefault("edge_vertex_pairs", [])
     return components
-
-
-def expand_face_neighborhood(mesh, seed_faces, depth):
-    """
-    从种子面片出发，返回拓扑邻域扩展 depth 层后的面片索引集合。
-    depth<=0: 空集合
-    depth==1: 种子面片本身
-    depth>=2: 依次加入直接邻居等
-    """
-    if depth <= 0:
-        return set()
-
-    seed_faces = set(map(int, seed_faces))
-    if depth == 1:
-        return seed_faces.copy()
-
-    adjacency = [[] for _ in range(len(mesh.faces))]
-    for f0, f1 in mesh.face_adjacency:
-        adjacency[int(f0)].append(int(f1))
-        adjacency[int(f1)].append(int(f0))
-
-    current = list(seed_faces)
-    visited = set(seed_faces)
-
-    for _ in range(depth - 1):
-        next_layer = []
-        for fid in current:
-            for nb in adjacency[fid]:
-                if nb not in visited:
-                    visited.add(nb)
-                    next_layer.append(nb)
-        current = next_layer
-        if not current:
-            break
-
-    return visited
 
 
 def extract_component_by_id(
