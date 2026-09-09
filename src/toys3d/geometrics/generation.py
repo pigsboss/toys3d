@@ -335,7 +335,7 @@ def _generate_fallback_fan_disk(mesh, loop_vertices):
     return disk, boundary_indices
 
 
-def generate_initial_seifert_disk(mesh, loop_vertices):
+def generate_initial_seifert_disk(mesh, loop_vertices, verbose=False):
     loop_vertices = [int(v) for v in loop_vertices]
 
     # 快速去除连续重复顶点
@@ -345,27 +345,49 @@ def generate_initial_seifert_disk(mesh, loop_vertices):
             loop.append(v)
     if len(loop) >= 2 and loop[0] == loop[-1]:
         loop = loop[:-1]
+
+    if verbose:
+        print(f"  [Seifert 初始圆盘] 输入边界顶点数: {len(loop_vertices)}")
+        print(f"  [Seifert 初始圆盘] 去重后边界顶点数: {len(loop)}")
+
     if len(loop) < 3:
+        if verbose:
+            print("  [Seifert 初始圆盘] 失败: 去重后有效顶点数 < 3")
         return None, []
 
     loop_vertices = loop
     pts = np.asarray(mesh.vertices[loop_vertices], dtype=np.float64)
 
+    if verbose:
+        print(f"  [Seifert 初始圆盘] 原始边界面积: "
+              f"{polygon_area_from_3d_ccw(pts):.6f}")
+
     projection = _find_valid_boundary_projection(pts, mesh, loop_vertices)
     if projection is None:
-        # 简单边界 fallback
         if _is_simple_planar_loop(mesh, loop_vertices):
-            print("  [INFO] 使用质心扇形三角化作为初始圆盘")
+            if verbose:
+                print("  [Seifert 初始圆盘] 投影失败，尝试简单平面 fallback")
+                print("  [Seifert 初始圆盘] 使用质心扇形三角化作为初始圆盘")
             return _generate_fallback_fan_disk(mesh, loop_vertices)
         else:
-            print(f"  [DEBUG] 原始面积={polygon_area_from_3d_ccw(pts):.6f}")
-            for n in _candidate_projection_normals(pts, mesh, loop_vertices):
-                flat, _, _, _ = _project_points_to_plane(pts, n)
-                valid, area2d, _ = _is_valid_simple_projection(
-                    flat, polygon_area_from_3d_ccw(pts)
-                )
-                print(f"  [DEBUG] 法向 {n}, valid={valid}, area2d={area2d:.6f}")
+            if verbose:
+                print("  [Seifert 初始圆盘] 失败: 未找到有效投影且不满足简单平面条件")
+                print(f"  [DEBUG] 原始面积={polygon_area_from_3d_ccw(pts):.6f}")
+                for n in _candidate_projection_normals(pts, mesh, loop_vertices):
+                    flat, _, _, _ = _project_points_to_plane(pts, n)
+                    valid, area2d, _ = _is_valid_simple_projection(
+                        flat, polygon_area_from_3d_ccw(pts)
+                    )
+                    print(f"  [DEBUG] 法向 {n}, valid={valid}, area2d={area2d:.6f}")
             return None, []
+    else:
+        if verbose:
+            flat, u, v, centroid, polygon = projection
+            print("  [Seifert 初始圆盘] 找到有效投影：")
+            print(f"    centroid = {centroid}")
+            print(f"    u = {u}")
+            print(f"    v = {v}")
+            print(f"    polygon.area = {polygon.area:.6f}")
 
     flat, u, v, centroid, polygon = projection
 
@@ -382,23 +404,37 @@ def generate_initial_seifert_disk(mesh, loop_vertices):
             raise ValueError("invalid 2D vertex array")
         if tri_faces.ndim != 2 or tri_faces.shape[1] != 3 or len(tri_faces) == 0:
             raise ValueError("invalid face array")
+
+        if verbose:
+            print(f"  [Seifert 初始圆盘] 三角化成功: "
+                  f"顶点数={len(tri_vertices_2d)}, 面片数={len(tri_faces)}")
     except Exception as e:
-        print(f"  [WARN] 平面三角化失败: {e}")
+        if verbose:
+            print(f"  [Seifert 初始圆盘] 失败: 平面三角化异常: {e}")
         if _is_simple_planar_loop(mesh, loop_vertices):
-            print("  [INFO] 使用质心扇形三角化作为初始圆盘")
+            if verbose:
+                print("  [Seifert 初始圆盘] 尝试简单平面 fallback")
             return _generate_fallback_fan_disk(mesh, loop_vertices)
         return None, []
 
     # 严格对照原始投影点，不允许近似匹配失败或重复
     boundary_indices = []
-    for p2d in flat:
+    for i, p2d in enumerate(flat):
         dists = np.linalg.norm(tri_vertices_2d - p2d, axis=1)
         idx = int(np.argmin(dists))
         if dists[idx] > 1e-8:
+            if verbose:
+                print(f"  [Seifert 初始圆盘] 失败: 投影点 {i} 无法在三角化顶点中匹配")
+                print(f"    原投影点: {p2d}")
+                print(f"    最近距离: {dists[idx]:.6e}")
+                print(f"    最近顶点: {tri_vertices_2d[idx]}")
             return None, []
         boundary_indices.append(idx)
 
     if len(set(boundary_indices)) != len(flat):
+        if verbose:
+            print("  [Seifert 初始圆盘] 失败: 边界顶点映射存在重复")
+            print(f"    boundary_indices = {boundary_indices}")
         return None, []
 
     # 确保边界边按原始顺序存在，防止三角化打乱边界
@@ -414,6 +450,9 @@ def generate_initial_seifert_disk(mesh, loop_vertices):
         a = boundary_indices[i]
         b = boundary_indices[(i + 1) % len(boundary_indices)]
         if (a, b) not in edge_set:
+            if verbose:
+                print("  [Seifert 初始圆盘] 失败: 边界边顺序检查未通过")
+                print(f"    segment {i}: ({a}, {b}) 不在三角化边集中")
             return None, []
 
     v3d = centroid + tri_vertices_2d[:, 0:1] * u + tri_vertices_2d[:, 1:2] * v
@@ -426,18 +465,31 @@ def generate_initial_seifert_disk(mesh, loop_vertices):
 
     # 初始圆盘质量硬检查：不满足快速失败，不进入后续迭代
     if len(disk.faces) == 0:
+        if verbose:
+            print("  [Seifert 初始圆盘] 失败: 初始圆盘面片数为 0")
         return None, []
 
     areas = disk.area_faces
     if np.any(areas <= 1e-12):
+        if verbose:
+            print("  [Seifert 初始圆盘] 失败: 初始圆盘存在零面积面片")
+            print(f"    zero_area_count = {int(np.sum(areas <= 1e-12))}")
         return None, []
 
     area_ratio = np.max(areas) / max(float(np.min(areas)), 1e-12)
-    if area_ratio > 1000.0:
-        print(f"  [WARN] 初始圆盘面积比很大 ({area_ratio:.1f})，继续尝试优化")
+    if area_ratio > 1000.0 and verbose:
+        print(f"  [Seifert 初始圆盘] 警告: 面积比很大 ({area_ratio:.1f})，继续尝试优化")
 
     if not np.allclose(disk.vertices[boundary_indices], pts, atol=1e-8):
+        if verbose:
+            diff = disk.vertices[boundary_indices] - pts
+            print("  [Seifert 初始圆盘] 失败: 初始圆盘边界与原始孔洞边界不一致")
+            print(f"    max_abs_diff = {np.max(np.abs(diff)):.6e}")
         return None, []
+
+    if verbose:
+        print(f"  [Seifert 初始圆盘] 成功: "
+              f"面片数={len(disk.faces)}, 顶点数={len(disk.vertices)}")
 
     return disk, boundary_indices
 
@@ -477,7 +529,7 @@ def generate_seifert_surface(mesh, hole_vertex_indices,
         }
 
     disk_mesh, boundary_indices = generate_initial_seifert_disk(
-        mesh, hole_vertex_indices
+        mesh, hole_vertex_indices, verbose=verbose
     )
     if disk_mesh is None:
         return {
