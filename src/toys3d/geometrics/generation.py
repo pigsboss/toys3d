@@ -301,6 +301,40 @@ def _find_valid_boundary_projection(pts, mesh=None, loop_vertices=None):
     return None
 
 
+def _is_simple_planar_loop(mesh, loop_vertices, max_vertices=50, planar_ratio=0.1):
+    if len(loop_vertices) > max_vertices:
+        return False
+
+    pts = mesh.vertices[np.asarray(loop_vertices, dtype=np.int64)]
+    centroid = pts.mean(axis=0)
+    _, _, vh = np.linalg.svd(pts - centroid)
+    normal = vh[2]
+    dists = np.abs((pts - centroid) @ normal)
+    extent = np.linalg.norm(pts.max(axis=0) - pts.min(axis=0))
+    if extent < 1e-12:
+        return False
+    max_dist = np.max(dists)
+    return max_dist / extent < planar_ratio
+
+
+def _generate_fallback_fan_disk(mesh, loop_vertices):
+    pts = mesh.vertices[np.asarray(loop_vertices, dtype=np.int64)]
+    centroid = pts.mean(axis=0)
+    n = len(loop_vertices)
+
+    vertices = np.vstack([pts, centroid])
+    faces = []
+    c_idx = n
+    for i in range(n):
+        faces.append([c_idx, i, (i + 1) % n])
+    faces = np.array(faces, dtype=np.int64)
+
+    disk = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    # 边界索引就是前 n 个顶点，顺序与输入 loop_vertices 一致
+    boundary_indices = list(range(n))
+    return disk, boundary_indices
+
+
 def generate_initial_seifert_disk(mesh, loop_vertices):
     loop_vertices = [int(v) for v in loop_vertices]
 
@@ -319,31 +353,40 @@ def generate_initial_seifert_disk(mesh, loop_vertices):
 
     projection = _find_valid_boundary_projection(pts, mesh, loop_vertices)
     if projection is None:
-        print(f"  [DEBUG] 原始面积={polygon_area_from_3d_ccw(pts):.6f}")
-        for n in _candidate_projection_normals(pts, mesh, loop_vertices):
-            flat, _, _, _ = _project_points_to_plane(pts, n)
-            valid, area2d, _ = _is_valid_simple_projection(
-                flat, polygon_area_from_3d_ccw(pts)
-            )
-            print(f"  [DEBUG] 法向 {n}, valid={valid}, area2d={area2d:.6f}")
-        return None, []
+        # 简单边界 fallback
+        if _is_simple_planar_loop(mesh, loop_vertices):
+            print("  [INFO] 使用质心扇形三角化作为初始圆盘")
+            return _generate_fallback_fan_disk(mesh, loop_vertices)
+        else:
+            print(f"  [DEBUG] 原始面积={polygon_area_from_3d_ccw(pts):.6f}")
+            for n in _candidate_projection_normals(pts, mesh, loop_vertices):
+                flat, _, _, _ = _project_points_to_plane(pts, n)
+                valid, area2d, _ = _is_valid_simple_projection(
+                    flat, polygon_area_from_3d_ccw(pts)
+                )
+                print(f"  [DEBUG] 法向 {n}, valid={valid}, area2d={area2d:.6f}")
+            return None, []
 
     flat, u, v, centroid, polygon = projection
 
     try:
         triangulated = trimesh.creation.triangulate_polygon(polygon)
         if triangulated is None:
-            return None, []
+            raise ValueError("triangulate_polygon returned None")
 
         tri_vertices_2d, tri_faces = triangulated
         tri_vertices_2d = np.asarray(tri_vertices_2d, dtype=np.float64)
         tri_faces = np.asarray(tri_faces, dtype=np.int64)
 
         if tri_vertices_2d.ndim != 2 or tri_vertices_2d.shape[1] != 2:
-            return None, []
+            raise ValueError("invalid 2D vertex array")
         if tri_faces.ndim != 2 or tri_faces.shape[1] != 3 or len(tri_faces) == 0:
-            return None, []
-    except Exception:
+            raise ValueError("invalid face array")
+    except Exception as e:
+        print(f"  [WARN] 平面三角化失败: {e}")
+        if _is_simple_planar_loop(mesh, loop_vertices):
+            print("  [INFO] 使用质心扇形三角化作为初始圆盘")
+            return _generate_fallback_fan_disk(mesh, loop_vertices)
         return None, []
 
     # 严格对照原始投影点，不允许近似匹配失败或重复
@@ -389,8 +432,9 @@ def generate_initial_seifert_disk(mesh, loop_vertices):
     if np.any(areas <= 1e-12):
         return None, []
 
-    if np.max(areas) / max(float(np.min(areas)), 1e-12) > 200.0:
-        return None, []
+    area_ratio = np.max(areas) / max(float(np.min(areas)), 1e-12)
+    if area_ratio > 1000.0:
+        print(f"  [WARN] 初始圆盘面积比很大 ({area_ratio:.1f})，继续尝试优化")
 
     if not np.allclose(disk.vertices[boundary_indices], pts, atol=1e-8):
         return None, []
