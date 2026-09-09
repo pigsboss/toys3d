@@ -222,6 +222,32 @@ def build_cotangent_laplacian(mesh):
     return L
 
 
+def _dirichlet_energy_from_laplacian(L, vertices):
+    vec = L @ vertices
+    return float(np.sum(vec * vertices))
+
+
+def _mesh_has_valid_positive_areas(vertices, faces, min_area_ratio=1e-8):
+    if len(faces) == 0:
+        return False, None
+
+    tri = np.asarray(vertices, dtype=np.float64)[faces]
+    cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    areas = 0.5 * np.linalg.norm(cross, axis=1)
+
+    if np.any(~np.isfinite(areas)) or np.any(areas <= 0):
+        return False, areas
+
+    median_area = float(np.median(areas))
+    if median_area < 1e-12:
+        return False, areas
+
+    if np.any(areas < min_area_ratio * median_area):
+        return False, areas
+
+    return True, areas
+
+
 def laplacian_smooth_fixed_boundary(
     mesh,
     boundary_vertex_indices,
@@ -229,18 +255,29 @@ def laplacian_smooth_fixed_boundary(
     step_size=1.0,
     tol=1e-7,
     verbose=False,
+    return_info=False,
+    max_backtracking=8,
+    min_area_ratio=1e-8,
 ):
-    """
-    固定边界顶点，内部顶点按离散 Plateau 问题迭代求解。
-    与旧 geometrics.py 中 laplacian_smooth_fixed_boundary 行为一致。
-    """
     faces = np.asarray(mesh.faces, dtype=np.int64)
     vertices = mesh.vertices.copy()
     n_vertices = len(vertices)
     boundary_set = set(int(v) for v in boundary_vertex_indices)
 
+    info = {
+        "success": False,
+        "iterations": 0,
+        "converged": False,
+        "max_move": 0.0,
+        "energy": None,
+        "message": "",
+    }
+
     if n_vertices == 0 or len(faces) == 0:
-        return mesh.copy()
+        info["message"] = "空网格，无法优化"
+        if return_info:
+            return mesh, info
+        return mesh
 
     all_indices = np.arange(n_vertices, dtype=np.int64)
     interior_indices = np.array(
@@ -250,7 +287,10 @@ def laplacian_smooth_fixed_boundary(
     boundary_indices = np.array(sorted(boundary_set), dtype=np.int64)
 
     if len(interior_indices) == 0:
-        return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        info.update({"success": True, "message": "没有内部顶点"})
+        if return_info:
+            return mesh, info
+        return mesh
 
     step_size = float(np.clip(step_size, 0.0, 1.0))
 
@@ -263,18 +303,68 @@ def laplacian_smooth_fixed_boundary(
 
         n_int = len(interior_indices)
         eps_reg = 1e-10
-        Lint = Lint + csr_matrix(
-            np.eye(n_int, dtype=np.float64) * eps_reg
-        )
+        Lint = Lint + csr_matrix(np.eye(n_int, dtype=np.float64) * eps_reg)
 
         rhs = -Lbnd @ vertices[boundary_indices]
-        sol = spsolve(Lint, rhs)
 
+        try:
+            sol = spsolve(Lint, rhs)
+        except Exception as e:
+            info["message"] = f"线性求解失败: {e}"
+            info["iterations"] = it
+            if verbose:
+                print(f"    Seifert 优化中止: {info['message']}")
+            if return_info:
+                return mesh, info
+            return mesh
+
+        if not np.all(np.isfinite(sol)):
+            info["message"] = "线性求解出现 NaN/Inf，已中止"
+            info["iterations"] = it
+            if verbose:
+                print(f"    Seifert 优化中止: {info['message']}")
+            if return_info:
+                return mesh, info
+            return mesh
+
+        current_int = vertices[interior_indices]
+        old_energy = _dirichlet_energy_from_laplacian(L, vertices)
+
+        accepted = False
+        alpha = step_size
         new_vertices = vertices.copy()
-        new_vertices[interior_indices] = (
-            vertices[interior_indices]
-            + step_size * (sol - vertices[interior_indices])
-        )
+
+        for _ in range(max_backtracking + 1):
+            trial_int = current_int + alpha * (sol - current_int)
+            trial_vertices = vertices.copy()
+            trial_vertices[interior_indices] = trial_int
+
+            valid_areas, _areas = _mesh_has_valid_positive_areas(
+                trial_vertices, faces, min_area_ratio
+            )
+            if not valid_areas:
+                alpha *= 0.5
+                continue
+
+            trial_energy = _dirichlet_energy_from_laplacian(L, trial_vertices)
+
+            if trial_energy <= old_energy:
+                new_vertices = trial_vertices
+                energy = trial_energy
+                accepted = True
+                break
+
+            alpha *= 0.5
+
+        if not accepted:
+            info["message"] = "优化失败：能量未下降或网格退化，已快速中止"
+            info["iterations"] = it
+            info["energy"] = old_energy
+            if verbose:
+                print(f"    {info['message']}")
+            if return_info:
+                return mesh, info
+            return mesh
 
         moves = np.linalg.norm(
             new_vertices[interior_indices] - vertices[interior_indices],
@@ -283,12 +373,32 @@ def laplacian_smooth_fixed_boundary(
         max_move = float(np.max(moves)) if len(moves) > 0 else 0.0
         vertices = new_vertices
 
+        info["iterations"] = it + 1
+        info["energy"] = energy
+        info["max_move"] = max_move
+
+        if verbose:
+            print(
+                f"    Seifert 迭代 {it+1}: energy={energy:.10e}, "
+                f"max_move={max_move:.6e}"
+            )
+
         if max_move < tol:
-            if verbose:
-                print(f"    Seifert 优化在第 {it+1} 次迭代收敛，最大位移 {max_move:.6e}")
+            info["success"] = True
+            info["converged"] = True
+            info["message"] = "已收敛"
             break
 
-    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    else:
+        info["success"] = True
+        info["converged"] = False
+        info["message"] = "达到最大迭代次数"
+
+    result_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    if return_info:
+        return result_mesh, info
+    return result_mesh
 
 
 def compute_curvature_statistics(mesh, boundary_vertex_indices):

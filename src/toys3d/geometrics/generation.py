@@ -7,6 +7,7 @@ from .discrete import (
     laplacian_smooth_fixed_boundary,
     compute_curvature_statistics,
 )
+from .euclidean import polygon_area_from_3d_ccw
 
 
 def repair_mesh_by_removing_duplicates(mesh):
@@ -201,67 +202,189 @@ def fill_small_holes(mesh, max_loop_edges=50, verbose=True):
 # Seifert 曲面生成与修补
 # ---------------------------------------------------------------------------
 
-def generate_initial_seifert_disk(mesh, loop_vertices):
-    loop_vertices = [int(v) for v in loop_vertices]
-    if len(loop_vertices) < 3:
-        return None, []
+def _project_points_to_plane(points, plane_normal, centroid=None):
+    n = np.asarray(plane_normal, dtype=np.float64)
+    n = n / (np.linalg.norm(n) + 1e-12)
 
-    pts = np.asarray(mesh.vertices[loop_vertices], dtype=np.float64)
+    if centroid is None:
+        centroid = points.mean(axis=0)
+
+    helper = np.array([0.0, 0.0, 1.0])
+    if abs(np.dot(n, helper)) > 0.9:
+        helper = np.array([1.0, 0.0, 0.0])
+
+    u = np.cross(n, helper)
+    u = u / (np.linalg.norm(u) + 1e-12)
+    v = np.cross(n, u)
+    v = v / (np.linalg.norm(v) + 1e-12)
+
+    flat = np.column_stack([
+        (points - centroid) @ u,
+        (points - centroid) @ v,
+    ])
+    return flat, u, v, centroid
+
+
+def _is_valid_simple_projection(flat, original_area, min_area_ratio=0.5):
+    from shapely.geometry import Polygon
 
     try:
-        from shapely.geometry import Polygon
+        polygon = Polygon(flat)
+    except Exception:
+        return False, 0.0, None
 
-        centroid = pts.mean(axis=0)
-        _, _, vh = np.linalg.svd(pts - centroid)
-        u = vh[0]
-        v = vh[1]
+    if not polygon.is_valid or polygon.is_empty:
+        return False, 0.0, None
 
-        poly2d = np.column_stack([
-            (pts - centroid) @ u,
-            (pts - centroid) @ v,
-        ])
+    area2d = float(polygon.area)
+    if area2d < 1e-12:
+        return False, 0.0, None
 
-        polygon = Polygon(poly2d)
-        if not polygon.is_valid:
-            polygon = polygon.buffer(0)
+    if original_area < 1e-12:
+        return False, 0.0, None
 
+    if area2d / original_area < min_area_ratio:
+        return False, area2d, None
+
+    return True, area2d, polygon
+
+
+def _candidate_projection_normals(points):
+    centroid = points.mean(axis=0)
+    _, _, vh = np.linalg.svd(points - centroid)
+
+    normals = []
+    normals.append(vh[2].copy())
+    normals.append(np.array([1.0, 0.0, 0.0]))
+    normals.append(np.array([0.0, 1.0, 0.0]))
+    normals.append(np.array([0.0, 0.0, 1.0]))
+    return normals
+
+
+def _find_valid_boundary_projection(pts):
+    original_area = polygon_area_from_3d_ccw(pts)
+    if original_area < 1e-12:
+        return None
+
+    for n in _candidate_projection_normals(pts):
+        flat, u, v, centroid = _project_points_to_plane(pts, n)
+        valid, _area2d, polygon = _is_valid_simple_projection(
+            flat, original_area
+        )
+        if valid and polygon is not None:
+            return flat, u, v, centroid, polygon
+
+    return None
+
+
+def generate_initial_seifert_disk(mesh, loop_vertices):
+    loop_vertices = [int(v) for v in loop_vertices]
+
+    # 快速去除连续重复顶点
+    loop = []
+    for v in loop_vertices:
+        if not loop or loop[-1] != v:
+            loop.append(v)
+    if len(loop) >= 2 and loop[0] == loop[-1]:
+        loop = loop[:-1]
+    if len(loop) < 3:
+        return None, []
+
+    loop_vertices = loop
+    pts = np.asarray(mesh.vertices[loop_vertices], dtype=np.float64)
+
+    projection = _find_valid_boundary_projection(pts)
+    if projection is None:
+        return None, []
+
+    flat, u, v, centroid, polygon = projection
+
+    try:
         triangulated = trimesh.creation.triangulate_polygon(polygon)
         if triangulated is None:
-            raise ValueError("triangulate_polygon returned None")
+            return None, []
 
         tri_vertices_2d, tri_faces = triangulated
         tri_vertices_2d = np.asarray(tri_vertices_2d, dtype=np.float64)
         tri_faces = np.asarray(tri_faces, dtype=np.int64)
 
         if tri_vertices_2d.ndim != 2 or tri_vertices_2d.shape[1] != 2:
-            raise ValueError("invalid 2D vertices")
+            return None, []
         if tri_faces.ndim != 2 or tri_faces.shape[1] != 3 or len(tri_faces) == 0:
-            raise ValueError("empty or invalid faces")
-
-        v3d = centroid + tri_vertices_2d[:, 0:1] * u + tri_vertices_2d[:, 1:2] * v
-
-        boundary_indices = []
-        for p2d in poly2d:
-            dists = np.linalg.norm(tri_vertices_2d - p2d, axis=1)
-            idx = int(np.argmin(dists))
-            if dists[idx] > 1e-8:
-                raise ValueError("boundary point not found in triangulation")
-            boundary_indices.append(idx)
-
-        disk = trimesh.Trimesh(
-            vertices=v3d,
-            faces=tri_faces,
-            process=False,
-        )
-
-        if len(boundary_indices) != len(poly2d):
-            raise ValueError("boundary indices mismatch")
-
-        return disk, boundary_indices
-
-    except Exception as e:
-        print(f"  [WARN] 初始 Seifert 圆盘生成失败: {e}")
+            return None, []
+    except Exception:
         return None, []
+
+    # 严格对照原始投影点，不允许近似匹配失败或重复
+    boundary_indices = []
+    for p2d in flat:
+        dists = np.linalg.norm(tri_vertices_2d - p2d, axis=1)
+        idx = int(np.argmin(dists))
+        if dists[idx] > 1e-8:
+            return None, []
+        boundary_indices.append(idx)
+
+    if len(set(boundary_indices)) != len(flat):
+        return None, []
+
+    # 确保边界边按原始顺序存在，防止三角化打乱边界
+    edge_set = set()
+    for face in tri_faces:
+        for j in range(3):
+            a = int(face[j])
+            b = int(face[(j + 1) % 3])
+            edge_set.add((a, b))
+            edge_set.add((b, a))
+
+    for i in range(len(boundary_indices)):
+        a = boundary_indices[i]
+        b = boundary_indices[(i + 1) % len(boundary_indices)]
+        if (a, b) not in edge_set:
+            return None, []
+
+    v3d = centroid + tri_vertices_2d[:, 0:1] * u + tri_vertices_2d[:, 1:2] * v
+
+    disk = trimesh.Trimesh(
+        vertices=v3d,
+        faces=tri_faces,
+        process=False,
+    )
+
+    # 初始圆盘质量硬检查：不满足快速失败，不进入后续迭代
+    if len(disk.faces) == 0:
+        return None, []
+
+    areas = disk.area_faces
+    if np.any(areas <= 1e-12):
+        return None, []
+
+    if np.max(areas) / max(float(np.min(areas)), 1e-12) > 200.0:
+        return None, []
+
+    if not np.allclose(disk.vertices[boundary_indices], pts, atol=1e-8):
+        return None, []
+
+    return disk, boundary_indices
+
+
+def _validate_seifert_patch(mesh, hole_vertex_indices, seifert_mesh, boundary_indices):
+    if len(seifert_mesh.faces) == 0:
+        return False
+
+    areas = seifert_mesh.area_faces
+    if np.any(areas <= 1e-12):
+        return False
+
+    try:
+        boundary_positions = seifert_mesh.vertices[boundary_indices]
+        original_positions = mesh.vertices[np.asarray(hole_vertex_indices, dtype=np.int64)]
+    except Exception:
+        return False
+
+    if not np.allclose(boundary_positions, original_positions, atol=1e-8):
+        return False
+
+    return True
 
 
 def generate_seifert_surface(mesh, hole_vertex_indices,
@@ -269,9 +392,6 @@ def generate_seifert_surface(mesh, hole_vertex_indices,
                              step_size=1.0,
                              tol=1e-7,
                              verbose=False):
-    """
-    为健康孔洞生成固定边界的 Seifert 极小曲面。
-    """
     hole_vertex_indices = [int(v) for v in hole_vertex_indices]
     if len(hole_vertex_indices) < 3:
         return {
@@ -289,23 +409,44 @@ def generate_seifert_surface(mesh, hole_vertex_indices,
             "success": False,
             "mesh": None,
             "boundary_indices": [],
-            "message": "无法生成初始 Seifert 圆盘",
+            "message": "当前孔洞边界过于复杂，未找到有效投影/初始圆盘，已快速失败",
         }
 
-    seifert_mesh = laplacian_smooth_fixed_boundary(
+    seifert_mesh, opt_info = laplacian_smooth_fixed_boundary(
         disk_mesh,
         boundary_indices,
         iterations=optimize_iterations,
         step_size=step_size,
         tol=tol,
         verbose=verbose,
+        return_info=True,
     )
+
+    if seifert_mesh is None or not opt_info.get("success", False):
+        msg = opt_info.get("message", "极小曲面优化失败")
+        return {
+            "success": False,
+            "mesh": None,
+            "boundary_indices": boundary_indices,
+            "message": msg,
+        }
+
+    if not _validate_seifert_patch(
+        mesh, hole_vertex_indices, seifert_mesh, boundary_indices
+    ):
+        return {
+            "success": False,
+            "mesh": None,
+            "boundary_indices": boundary_indices,
+            "message": "生成后的补丁未通过边界或几何验证",
+        }
 
     return {
         "success": True,
         "mesh": seifert_mesh,
         "boundary_indices": boundary_indices,
         "message": "Seifert 曲面生成成功",
+        "diagnostics": opt_info,
     }
 
 
