@@ -234,13 +234,7 @@ def _is_valid_simple_projection(flat, original_area, min_area_ratio=0.2):
         return False, 0.0, None
 
     if not polygon.is_valid or polygon.is_empty:
-        # 尝试修复常见浮点自交问题
-        try:
-            polygon = polygon.buffer(0)
-        except Exception:
-            return False, 0.0, None
-        if not isinstance(polygon, Polygon) or polygon.is_empty or not polygon.is_valid:
-            return False, 0.0, None
+        return False, 0.0, None
 
     area2d = float(polygon.area)
     if area2d < 1e-12:
@@ -453,6 +447,10 @@ def generate_initial_seifert_disk(mesh, loop_vertices, verbose=False):
             if verbose:
                 print("  [Seifert 初始圆盘] 失败: 边界边顺序检查未通过")
                 print(f"    segment {i}: ({a}, {b}) 不在三角化边集中")
+            if _is_simple_planar_loop(mesh, loop_vertices):
+                if verbose:
+                    print("  [Seifert 初始圆盘] 尝试简单平面 fallback")
+                return _generate_fallback_fan_disk(mesh, loop_vertices)
             return None, []
 
     v3d = centroid + tri_vertices_2d[:, 0:1] * u + tri_vertices_2d[:, 1:2] * v
