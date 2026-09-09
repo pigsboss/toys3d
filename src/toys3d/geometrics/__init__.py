@@ -91,5 +91,6 @@ from .utilities import (
     analyze_uncovered_open_edge_components,
     find_minimal_enclosing_manifold_boundary_greedy,
     extract_intersection_faces_by_vertex_state,
+    extract_component_submesh,
     segment_tubular_regions,
 )

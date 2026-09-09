@@ -15,7 +15,6 @@ if os.path.exists(os.path.join(os.getcwd(), 'inspect.py')):
         sys.path.remove('')
 
 import argparse
-import colorsys
 import json
 from pathlib import Path
 import numpy as np
@@ -65,385 +64,83 @@ from toys3d.geometrics import (
     compute_face_distances,
     point_in_polygon_2d,
     normalize,
+    extract_component_submesh,
 )
 
-from toys3d.meshrepair import (
-    generate_seifert_surface,
-    compute_seifert_fill_stats,
-    print_seifert_fill_stats,
-    compute_seifert_curvature_stats,
+from toys3d.reporting import (
+    _generate_component_3d_diagram,
+    generate_html_report_from_json,
+    load_boundary_component_data,
+)
+
+from toys3d.visualization import (
+    _parse_color_string,
+    _parse_color_string_flexible,
+    _print_boundary_component_diagnostics,
+    _show_scene_with_camera_info,
+    add_boundary_projection_to_scene,
+    add_hole_boundaries_to_scene,
+    add_proxy_overlay_to_scene as _add_proxy_overlay_to_scene,
+    add_uncovered_edges_to_scene,
+    add_wireframe_to_scene,
+    build_defect_visualization,
+    build_reliable_visualization,
+    load_proxy_mesh as _load_proxy_mesh,
+    make_double_sided,
+    set_face_alpha,
+    visualize_boundary_component,
 )
 
 
-def build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask):
-    """
-    生成缺陷可视化网格：
-    - 灰色：正常面片
-    - 黄色：开放边界附近面片
-    - 红色：非流形边附近面片
-    - 橙色：同时具有两种缺陷的面片
-    """
-    vis = mesh.copy()
-    N = len(vis.faces)
+def load_proxy_mesh(args):
+    return _load_proxy_mesh(args.overlay_proxy)
 
-    colors = np.full((N, 4), 200, dtype=np.uint8)
-    colors[:, 3] = 255
 
-    open_only = open_face_mask & ~nonmanifold_face_mask
-    nonmanifold_only = nonmanifold_face_mask & ~open_face_mask
-    both = open_face_mask & nonmanifold_face_mask
-
-    colors[open_only] = [255, 220, 0, 255]      # 黄
-    colors[nonmanifold_only] = [255, 0, 0, 255]  # 红
-    colors[both] = [255, 128, 0, 255]            # 橙
-
-    vis.visual.face_colors = colors
-    return vis
+def add_proxy_overlay_to_scene(scene, args, proxy):
+    return _add_proxy_overlay_to_scene(
+        scene,
+        proxy,
+        color=args.proxy_color,
+        alpha=args.proxy_alpha,
+        double_sided=args.proxy_double_sided,
+    )
 
 
 def build_reliable_visualization(mesh, distances, min_distance):
-    """
-    根据拓扑距离生成可视化网格。
-    - 绿色：可靠（距离 >= min_distance）
-    - 黄色：中间状态（0 < 距离 < min_distance）
-    - 红色：缺陷面（距离 == 0）
-    """
-    vis = mesh.copy()
-    N = len(vis.faces)
+    """Compatibility wrapper; the actual implementation lives in visualization.py."""
+    import toys3d.visualization as _vis
+    return _vis.build_reliable_visualization(mesh, distances, min_distance)
 
-    colors = np.full((N, 4), [255, 0, 0, 255], dtype=np.uint8)  # 默认红（缺陷面）
-    intermediate = (distances > 0) & (distances < min_distance)
-    reliable = distances >= min_distance
-    colors[intermediate] = [255, 220, 0, 255]  # 黄
-    colors[reliable] = [0, 200, 0, 255]        # 绿
 
-    vis.visual.face_colors = colors
-    return vis
+def build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask):
+    """Compatibility wrapper; implementation is in visualization.py."""
+    import toys3d.visualization as _vis
+    return _vis.build_defect_visualization(mesh, open_face_mask, nonmanifold_face_mask)
 
 
 def make_double_sided(mesh, backface_color=None):
-    """
-    将网格渲染为双面几何，避免薄壳背面被背面剔除而显示为透明。
-
-    Parameters
-    ----------
-    mesh : trimesh.Trimesh
-    backface_color : list or None
-        背面子颜色（RGBA）。
-        若为 None，则根据每个正面颜色自动生成同色系暗色：
-        保持 Hue 不变，Saturation * 0.8，Value * 0.5。
-    """
-    faces = np.asarray(mesh.faces, dtype=np.int64).reshape(-1, 3)
-    if len(faces) == 0:
-        return mesh.copy()
-
-    double_faces = np.vstack([
-        faces,
-        faces[:, ::-1],
-    ])
-
-    vis = trimesh.Trimesh(
-        vertices=mesh.vertices.copy(),
-        faces=double_faces,
-        process=False,
-    )
-
-    if hasattr(mesh.visual, 'face_colors') and mesh.visual.face_colors.shape[0] == len(faces):
-        colors = np.asarray(mesh.visual.face_colors)
-    else:
-        colors = np.full((len(faces), 4), [200, 200, 200, 255], dtype=np.uint8)
-
-    if backface_color is None:
-        # 根据每个正面颜色自动生成同色系暗色背面颜色
-        n = len(colors)
-        back_colors = np.empty_like(colors)
-        for i in range(n):
-            r, g, b, a = colors[i].astype(np.float64) / 255.0
-            h, s, v = colorsys.rgb_to_hsv(r, g, b)
-            back_s = np.clip(s * 0.8, 0.0, 1.0)
-            back_v = np.clip(v * 0.5, 0.0, 1.0)
-            br, bg, bb = colorsys.hsv_to_rgb(h, back_s, back_v)
-            back_colors[i] = np.array([
-                br * 255.0,
-                bg * 255.0,
-                bb * 255.0,
-                a * 255.0,
-            ], dtype=np.uint8)
-    else:
-        back_colors = np.full_like(colors, np.asarray(backface_color, dtype=np.uint8))
-
-    vis.visual.face_colors = np.vstack([colors, back_colors])
-    return vis
+    """Compatibility wrapper for visualization.make_double_sided."""
+    import toys3d.visualization as _vis
+    return _vis.make_double_sided(mesh, backface_color)
 
 
 def set_face_alpha(mesh, alpha):
-    """将网格所有面片颜色的 alpha 通道设置为指定透明度。"""
-    if hasattr(mesh.visual, 'face_colors') and \
-            mesh.visual.face_colors.shape[0] == len(mesh.faces):
-        mesh.visual.face_colors[:, 3] = int(np.clip(alpha, 0.0, 1.0) * 255)
-    return mesh
+    """Compatibility wrapper for visualization.set_face_alpha."""
+    import toys3d.visualization as _vis
+    return _vis.set_face_alpha(mesh, alpha)
 
 
 def add_wireframe_to_scene(scene, mesh, color=None, radius=None):
-    """
-    将网格的边以圆柱线段形式加入场景，用于观察三角剖分。
-
-    Parameters
-    ----------
-    scene : trimesh.Scene
-    mesh : trimesh.Trimesh
-    color : list or tuple or ndarray or None
-        RGBA 颜色，默认纯黑不透明 [0, 0, 0, 255]。
-    radius : float or None
-        圆柱半径，默认基于包围盒对角线的 0.05%。
-    """
-    if color is None:
-        color = np.array([0, 0, 0, 255], dtype=np.uint8)
-    else:
-        color = np.asarray(color, dtype=np.uint8)
-
-    edges_unique = mesh.edges_unique
-    if len(edges_unique) == 0:
-        return
-
-    if radius is None or radius <= 0:
-        if len(mesh.vertices) == 0:
-            radius = 1e-6
-        else:
-            vmin = mesh.vertices.min(axis=0)
-            vmax = mesh.vertices.max(axis=0)
-            diag = float(np.linalg.norm(vmax - vmin))
-            radius = max(diag * 0.0005, 1e-6)
-
-    for e in edges_unique:
-        v0, v1 = mesh.vertices[e[0]], mesh.vertices[e[1]]
-        seg = trimesh.creation.cylinder(
-            radius=radius,
-            segment=[v0, v1],
-            sections=4,
-        )
-        seg.visual.face_colors = color
-        scene.add_geometry(seg)
-
-
-def _high_saturation_hole_palette():
-    """
-    返回一组高饱和度、且相互区分的 RGBA 颜色。
-    """
-    palette = [
-        (255,   0,   0, 255),   # 红
-        (  0, 255,   0, 255),   # 绿
-        (  0, 128, 255, 255),   # 蓝
-        (255, 255,   0, 255),   # 黄
-        (255,   0, 255, 255),   # 品红
-        (  0, 255, 255, 255),   # 青
-        (255, 128,   0, 255),   # 橙
-        (128,   0, 255, 255),   # 紫
-        (  0, 255, 128, 255),   # 春绿
-        (255,   0, 128, 255),   # 粉红
-    ]
-    return [np.array(c, dtype=np.uint8) for c in palette]
-
-
-def _greedy_color_hole_loops(loops):
-    """
-    为孔洞边界环分配调色板颜色索引。
-
-    如果两个孔洞共享顶点，则认为它们相邻，应使用不同颜色。
-    使用贪心染色。返回 (color_indices, palette)。
-    """
-    n = len(loops)
-    if n == 0:
-        return [], _high_saturation_hole_palette()
-
-    vertex_to_loops = {}
-    for i, loop in enumerate(loops):
-        for v in loop:
-            vertex_to_loops.setdefault(int(v), []).append(i)
-
-    adjacency = [set() for _ in range(n)]
-    for loop_indices in vertex_to_loops.values():
-        if len(loop_indices) <= 1:
-            continue
-        for i in loop_indices:
-            for j in loop_indices:
-                if i != j:
-                    adjacency[i].add(j)
-                    adjacency[j].add(i)
-
-    palette = _high_saturation_hole_palette()
-    color_indices = [None] * n
-
-    for i in range(n):
-        used = {color_indices[j] for j in adjacency[i]
-                if color_indices[j] is not None}
-        chosen = None
-        for c in range(len(palette)):
-            if c not in used:
-                chosen = c
-                break
-        if chosen is None:
-            chosen = i % len(palette)
-        color_indices[i] = chosen
-
-    return color_indices, palette
+    """Compatibility wrapper for visualization.add_wireframe_to_scene."""
+    import toys3d.visualization as _vis
+    return _vis.add_wireframe_to_scene(scene, mesh, color, radius)
 
 
 def add_hole_boundaries_to_scene(scene, mesh, radius=None,
-                                 min_edges=3, min_area=0.0,
-                                 verbose=False):
-    """
-    检测网格中的闭合孔洞边界环，并在场景中用高饱和度颜色绘制。
-
-    只绘制边长和面积均满足阈值的闭合环。
-    """
-    loops = extract_boundary_loops(mesh)
-
-    filtered_loops = []
-    for loop in loops:
-        if len(loop) < min_edges:
-            continue
-        pts = mesh.vertices[np.array(loop)]
-        area = polygon_area_from_3d_ccw(pts)
-        if area < min_area:
-            continue
-        filtered_loops.append(loop)
-
-    if not filtered_loops:
-        if verbose:
-            print("  No closed hole boundary loops matching thresholds.")
-        return
-
-    color_indices, palette = _greedy_color_hole_loops(filtered_loops)
-
-    if radius is None or radius <= 0:
-        if len(mesh.vertices) == 0:
-            radius = 1e-6
-        else:
-            vmin = mesh.vertices.min(axis=0)
-            vmax = mesh.vertices.max(axis=0)
-            diag = float(np.linalg.norm(vmax - vmin))
-            radius = max(diag * 0.001, 1e-6)
-
-    if verbose:
-        print(f"  Drawing {len(filtered_loops)} hole boundary loops "
-              f"(filtered from {len(loops)} total):")
-
-    for loop_idx, loop in enumerate(filtered_loops):
-        color = palette[color_indices[loop_idx]]
-        if verbose:
-            print(f"    hole {loop_idx}: {len(loop)} edges, color={color.tolist()}")
-
-        for k in range(len(loop)):
-            v0 = mesh.vertices[int(loop[k])]
-            v1 = mesh.vertices[int(loop[(k + 1) % len(loop)])]
-            seg = trimesh.creation.cylinder(
-                radius=radius,
-                segment=[v0, v1],
-                sections=4,
-            )
-            seg.visual.face_colors = color
-            scene.add_geometry(seg)
-
-
-def _print_projected_boundary_diagnostics(
-    loops,
-    vertex_to_projected,
-    vertex_to_tri,
-    vertex_to_dist,
-    proxy_mesh,
-    source_mesh,
-    max_report_loops=None,
-    max_report_vertices=20,
-):
-    """
-    打印投影孔洞边界包围的代理网格顶点信息。
-    """
-    from scipy.spatial import cKDTree
-
-    proxy_vertices = np.asarray(proxy_mesh.vertices, dtype=np.float64)
-    if len(proxy_vertices) == 0:
-        return
-
-    tree = cKDTree(proxy_vertices)
-
-    if max_report_loops is None or max_report_loops <= 0:
-        max_report_loops = len(loops)
-
-    report_loops = loops[:max_report_loops]
-    print(f"  Projected boundary diagnostics for {len(report_loops)} loops:")
-
-    for loop_idx, loop in enumerate(report_loops):
-        ids = np.array(loop, dtype=np.int64)
-        pts = np.array([vertex_to_projected[int(v)] for v in ids], dtype=np.float64)
-        original_pts = source_mesh.vertices[ids]
-
-        if len(pts) < 3:
-            print(f"  [loop {loop_idx}] skipped: only {len(pts)} projected points")
-            continue
-
-        tri_ids = [int(vertex_to_tri[int(v)]) for v in ids]
-        dists = [float(vertex_to_dist[int(v)]) for v in ids]
-
-        centroid = pts.mean(axis=0)
-        _, _, vh = np.linalg.svd(pts - centroid)
-        u = vh[0]
-        v = vh[1]
-
-        poly2d = np.column_stack([
-            (pts - centroid) @ u,
-            (pts - centroid) @ v,
-        ])
-
-        radius = float(np.linalg.norm(pts - centroid, axis=1).max()) + 1e-12
-        candidate_indices = tree.query_ball_point(centroid, r=radius)
-
-        if not candidate_indices:
-            inside_indices = np.array([], dtype=np.int64)
-        else:
-            cand_pts = proxy_vertices[candidate_indices]
-            cand2d = np.column_stack([
-                (cand_pts - centroid) @ u,
-                (cand_pts - centroid) @ v,
-            ])
-
-            inside_mask = [
-                point_in_polygon_2d(tuple(p), poly2d)
-                for p in cand2d
-            ]
-
-            inside_indices = np.asarray(candidate_indices, dtype=np.int64)[inside_mask]
-
-        unique_tri_ids = sorted(set(tri_ids))
-
-        input_hole_area = polygon_area_from_3d_ccw(original_pts)
-        projected_area = polygon_area_from_3d_ccw(pts)
-
-        if input_hole_area < 1e-12:
-            status = "PSEUDO_HOLE"
-        elif projected_area < 1e-12:
-            status = "PROJECTION_DEGENERATE"
-        else:
-            status = "REAL_HOLE"
-
-        print(f"  [loop {loop_idx}]")
-        print(f"    status={status}")
-        print(f"    boundary_edges={len(ids)}")
-        print(f"    input_hole_area={input_hole_area:.6f}")
-        print(f"    projected_area={projected_area:.6f}")
-        print(f"    projection_dist: "
-              f"mean={np.mean(dists):.6f}, max={np.max(dists):.6f}")
-        print(f"    projected_boundary_triangles={unique_tri_ids}")
-        print(f"    enclosed_proxy_vertices={len(inside_indices)}")
-
-        if len(inside_indices) > 0:
-            shown = inside_indices[:max_report_vertices]
-            print(f"    enclosed_vertex_indices={shown.tolist()}")
-
-            if len(inside_indices) > max_report_vertices:
-                print(
-                    f"    ... {len(inside_indices) - max_report_vertices} more"
-                )
+                                 min_edges=3, min_area=0.0, verbose=False):
+    """Compatibility wrapper for visualization.add_hole_boundaries_to_scene."""
+    import toys3d.visualization as _vis
+    return _vis.add_hole_boundaries_to_scene(scene, mesh, radius, min_edges, min_area, verbose)
 
 
 def add_boundary_projection_to_scene(scene, boundary_mesh, proxy_mesh,
@@ -451,442 +148,132 @@ def add_boundary_projection_to_scene(scene, boundary_mesh, proxy_mesh,
                                      print_enclosed_vertices=False,
                                      max_report_loops=None,
                                      max_report_vertices=20):
-    """
-    将 boundary_mesh 的闭合孔洞边界环投影到 proxy_mesh 表面，
-    并在场景中绘制投影线段。
-    """
-    loops = extract_boundary_loops(boundary_mesh)
-    if not loops:
-        if verbose:
-            print("  No boundary loops to project.")
-        return
-
-    try:
-        # 收集所有边界环上的唯一顶点
-        all_boundary_verts = np.unique(
-            np.concatenate([np.array(loop, dtype=np.int64) for loop in loops])
-        )
-        points = boundary_mesh.vertices[all_boundary_verts]
-
-        projected_points, distances, triangle_indices = project_vertices_to_shell(
-            points, proxy_mesh
-        )
-    except Exception as e:
-        if verbose:
-            print(f"  Boundary projection failed: {e}")
-        return
-
-    # 建立原始顶点索引到投影点的映射
-    vertex_to_projected = {
-        int(v): projected_points[i]
-        for i, v in enumerate(all_boundary_verts)
-    }
-
-    vertex_to_tri = {
-        int(v): triangle_indices[i]
-        for i, v in enumerate(all_boundary_verts)
-    }
-
-    vertex_to_dist = {
-        int(v): distances[i]
-        for i, v in enumerate(all_boundary_verts)
-    }
-
-    if radius is None or radius <= 0:
-        if len(proxy_mesh.vertices) == 0:
-            radius = 1e-6
-        else:
-            vmin = proxy_mesh.vertices.min(axis=0)
-            vmax = proxy_mesh.vertices.max(axis=0)
-            diag = float(np.linalg.norm(vmax - vmin))
-            radius = max(diag * 0.001, 1e-6)
-
-    color = np.array([0, 255, 255, 255], dtype=np.uint8)  # 青色
-
-    if print_enclosed_vertices:
-        _print_projected_boundary_diagnostics(
-            loops,
-            vertex_to_projected,
-            vertex_to_tri,
-            vertex_to_dist,
-            proxy_mesh,
-            source_mesh=boundary_mesh,
-            max_report_loops=max_report_loops,
-            max_report_vertices=max_report_vertices,
-        )
-
-    for loop in loops:
-        pts = [vertex_to_projected[int(v)] for v in loop]
-        if len(pts) < 2:
-            continue
-
-        pts.append(pts[0])  # 闭合环首尾相连
-        for i in range(len(pts) - 1):
-            seg = trimesh.creation.cylinder(
-                radius=radius,
-                segment=[pts[i], pts[i + 1]],
-                sections=4,
-            )
-            seg.visual.face_colors = color
-            scene.add_geometry(seg)
-
-    if verbose:
-        print(f"  Projected {len(loops)} boundary loops onto proxy mesh.")
+    """Compatibility wrapper for visualization.add_boundary_projection_to_scene."""
+    import toys3d.visualization as _vis
+    return _vis.add_boundary_projection_to_scene(
+        scene, boundary_mesh, proxy_mesh, radius, verbose,
+        print_enclosed_vertices, max_report_loops, max_report_vertices
+    )
 
 
-def load_uncovered_edge_data(data_dir):
-    """
-    从 hole diagnosis 输出目录加载未覆盖开放边数据。
-
-    返回:
-        uncovered_ids : (U,) int64，未覆盖开放边 ID
-        all_vertex_pairs : (E,2) int64，所有开放边的顶点对
-        categories : (U,) int8，未覆盖开放边的分类
-    """
-    data_dir = Path(data_dir)
-    npz_path = data_dir / "hole_diagnosis_data.npz"
-    if not npz_path.exists():
-        raise FileNotFoundError(f"未找到 {npz_path}")
-    npz = np.load(npz_path)
-    uncovered_ids = npz["uncovered_edge_ids"]
-    all_vertex_pairs = npz["open_edge_vertex_pairs"]
-    categories = npz["uncovered_category"]
-    return uncovered_ids, all_vertex_pairs, categories
+def add_uncovered_edges_to_scene(scene, mesh, data_dir, radius=None, verbose=False):
+    """Compatibility wrapper for visualization.add_uncovered_edges_to_scene."""
+    import toys3d.visualization as _vis
+    return _vis.add_uncovered_edges_to_scene(scene, mesh, data_dir, radius, verbose)
 
 
-def add_uncovered_edges_to_scene(scene, mesh, data_dir,
-                                 radius=None, verbose=False):
-    """
-    将 hole diagnosis 中未覆盖的开放边高亮添加到场景。
-
-    分类颜色：
-        0: 孤立开放链 -> 蓝色
-        1: 悬空开放边 -> 黄色
-        2: 分支内部开放边 -> 橙色
-        4: 非流形关联开放边 -> 红色
-        5: 其他复杂开放边 -> 灰色
-    """
-    try:
-        uncovered_ids, all_vertex_pairs, categories = load_uncovered_edge_data(data_dir)
-    except FileNotFoundError as e:
-        if verbose:
-            print(f"[WARNING] {e}")
-        return
-
-    if len(uncovered_ids) == 0:
-        if verbose:
-            print("没有未覆盖开放边。")
-        return
-
-    uncovered_vertex_pairs = all_vertex_pairs[uncovered_ids]
-
-    category_colors = {
-        0: (0, 0, 255, 255),       # 孤立开放链 -> 蓝色
-        1: (255, 255, 0, 255),     # 悬空开放边 -> 黄色
-        2: (255, 128, 0, 255),     # 分支内部开放边 -> 橙色
-        4: (255, 0, 0, 255),       # 非流形关联开放边 -> 红色
-        5: (128, 128, 128, 255),   # 其他复杂开放边 -> 灰色
-    }
-
-    if radius is None or radius <= 0:
-        bounds = mesh.bounds
-        diag = np.linalg.norm(bounds[1] - bounds[0])
-        radius = max(diag * 0.0005, 1e-6)
-
-    if verbose:
-        print(f"高亮未覆盖开放边 {len(uncovered_vertex_pairs)} 条")
-
-    for i, (v0, v1) in enumerate(uncovered_vertex_pairs):
-        cat = int(categories[i])
-        color = category_colors.get(cat, (255, 255, 255, 255))
-        seg = trimesh.creation.cylinder(
-            radius=radius,
-            segment=[mesh.vertices[v0], mesh.vertices[v1]],
-            sections=4,
-        )
-        seg.visual.face_colors = color
-        scene.add_geometry(seg)
+def _show_scene_with_camera_info(scene, args, scene_translation=None):
+    """Compatibility wrapper for visualization._show_scene_with_camera_info."""
+    import toys3d.visualization as _vis
+    return _vis._show_scene_with_camera_info(scene, args, scene_translation)
 
 
-def load_proxy_mesh(args):
-    """根据参数加载代理网格，返回代理网格或 None。"""
-    if not args.overlay_proxy:
-        return None
-
-    proxy = trimesh.load(args.overlay_proxy, force="mesh")
-    if isinstance(proxy, trimesh.Scene):
-        proxy = proxy.dump(concatenate=True)
-
-    if len(proxy.faces) == 0:
-        print("[WARNING] Proxy mesh is empty; skipping overlay")
-        return None
-
-    return proxy
+def print_scene_debug_info(scene, title="Scene Debug Info"):
+    """Compatibility wrapper for visualization.print_scene_debug_info."""
+    import toys3d.visualization as _vis
+    return _vis.print_scene_debug_info(scene, title)
 
 
-def add_proxy_overlay_to_scene(scene, args, proxy):
-    """将代理网格以半透明方式叠加到场景。"""
-    if proxy is None:
-        return
+def _print_camera_info(info):
+    """Compatibility wrapper for visualization._print_camera_info."""
+    import toys3d.visualization as _vis
+    return _vis._print_camera_info(info)
 
-    # 解析代理颜色
-    if args.proxy_color is not None:
-        color_components = args.proxy_color
-        if len(color_components) == 3:
-            alpha = int(np.clip(args.proxy_alpha, 0.0, 1.0) * 255)
-            color = [*color_components, alpha]
-        else:
-            color = color_components
-    else:
-        base = [128, 180, 255]
-        alpha = int(np.clip(args.proxy_alpha, 0.0, 1.0) * 255)
-        color = [*base, alpha]
 
-    color_arr = np.array(color, dtype=np.uint8)
-    proxy.visual.face_colors = np.tile(color_arr, (len(proxy.faces), 1))
+def _capture_vedo_camera_info(plotter_or_viewer):
+    """Compatibility wrapper."""
+    import toys3d.visualization as _vis
+    return _vis._capture_vedo_camera_info(plotter_or_viewer)
 
-    if args.proxy_double_sided:
-        proxy = make_double_sided(proxy, backface_color=None)
 
-    scene.add_geometry(proxy)
+def _try_get_trimesh_vedo_viewer():
+    """Compatibility wrapper."""
+    import toys3d.visualization as _vis
+    return _vis._try_get_trimesh_vedo_viewer()
+
+
+def _show_scene_with_vedo(scene):
+    """Compatibility wrapper."""
+    import toys3d.visualization as _vis
+    return _vis._show_scene_with_vedo(scene)
+
+
+def _filter_camera_core_points(points):
+    """Compatibility wrapper."""
+    import toys3d.visualization as _vis
+    return _vis._filter_camera_core_points(points)
 
 
 def _generate_topology_diagram(code, output_path):
-    """
-    根据拓扑编码生成三角形的点-线示意图。
-    编码格式：A, AB, B, BC, C, CA，每个字段为 uint8 数值。
-    顶点元：1 实心，其他空心。
-    边元：1 蓝色，2 绿色，3 红色。
-    """
-    # 将输入统一为整数列表
-    if isinstance(code, bytes):
-        fields = list(code)
-    elif hasattr(code, 'tolist'):
-        fields = [int(x) for x in code.tolist()]
-    else:
-        fields = [int(x) for x in code]
-
-    if len(fields) != 6:
-        raise ValueError("code must have exactly 6 fields")
-
-    vA, eAB, vB, eBC, vC, eCA = fields
-
-    fig, ax = plt.subplots(figsize=(2.0, 2.0), dpi=120)
-    pts = {
-        'A': (0, 0),
-        'B': (1, 0),
-        'C': (0.5, np.sqrt(3) / 2)
-    }
-
-    edge_styles = {
-        1: ('blue', 'solid'),
-        2: ('green', 'solid'),
-        3: ('red', 'solid')
-    }
-    for (p1, p2, ecode) in [
-        (pts['A'], pts['B'], eAB),
-        (pts['B'], pts['C'], eBC),
-        (pts['C'], pts['A'], eCA)
-    ]:
-        color, ls = edge_styles.get(ecode, ('black', 'dashed'))
-        line = Line2D([p1[0], p2[0]], [p1[1], p2[1]],
-                      color=color, linewidth=2, linestyle=ls)
-        ax.add_line(line)
-
-    for (pt, vcode) in [(pts['A'], vA), (pts['B'], vB), (pts['C'], vC)]:
-        fill = (vcode == 1)
-        circle = Circle(pt, radius=0.05, fill=fill,
-                        color='black', linewidth=2)
-        ax.add_patch(circle)
-
-    height = np.sqrt(3) / 2
-    margin_x = 0.2
-    margin_y = 0.15
-    ax.set_xlim(0 - margin_x, 1 + margin_x)
-    ax.set_ylim(0 - margin_y, height + margin_y)
-    ax.set_aspect('equal')
-    ax.axis('off')
-    plt.tight_layout(pad=0)
-    plt.savefig(output_path, format='svg', bbox_inches='tight', pad_inches=0.1)
-    plt.close(fig)
+    """Compatibility wrapper delegating to reporting._generate_topology_diagram."""
+    from toys3d.reporting import _generate_topology_diagram as _rep
+    return _rep(code, output_path)
 
 
 def _generate_component_3d_diagram(component, mesh, output_path):
-    """
-    为单个未覆盖开放边连通分量生成三维 SVG 图。
-
-    - 边：蓝色线段
-    - 端点（度数为1）：绿色圆点
-    - 分支点（度数>=3）：红色方块
-    - 候选断裂点对：橙色虚线
-    """
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-
-    vertex_pairs = component.get('edge_vertex_pairs', [])
-    if not vertex_pairs:
-        return
-
-    vertices = mesh.vertices
-    # 提取组件所有顶点索引，用于确定坐标范围
-    involved_vertices = list(set(sum(vertex_pairs, [])))
-
-    v_coords = vertices[involved_vertices]
-    vmin = v_coords.min(axis=0)
-    vmax = v_coords.max(axis=0)
-    center = (vmin + vmax) / 2.0
-    max_extent = (vmax - vmin).max()
-    extra = max_extent * 0.1 + 1e-12
-
-    fig = plt.figure(figsize=(3.0, 3.0), dpi=120)
-    ax = fig.add_subplot(111, projection='3d')
-
-    # 绘制边
-    for v0, v1 in vertex_pairs:
-        p0 = vertices[v0]
-        p1 = vertices[v1]
-        ax.plot(
-            [p0[0], p1[0]], [p0[1], p1[1]], [p0[2], p1[2]],
-            color='blue', linewidth=0.8, alpha=0.7
-        )
-
-    # 端点
-    endpoints = component.get('endpoints', [])
-    if endpoints:
-        ep = vertices[endpoints]
-        ax.scatter(ep[:, 0], ep[:, 1], ep[:, 2],
-                   c='green', marker='o', s=20, label='Endpoints')
-
-    # 分支点
-    branch_vertices = component.get('branch_vertices', [])
-    if branch_vertices:
-        bv = vertices[branch_vertices]
-        ax.scatter(bv[:, 0], bv[:, 1], bv[:, 2],
-                   c='red', marker='s', s=30, label='Branch vertices')
-
-    # 候选断裂点对
-    candidate_breaks = component.get('candidate_breaks', [])
-    for cand in candidate_breaks:
-        p0 = vertices[cand['v0']]
-        p1 = vertices[cand['v1']]
-        ax.plot(
-            [p0[0], p1[0]], [p0[1], p1[1]], [p0[2], p1[2]],
-            '--', color='orange', linewidth=0.8, alpha=0.9
-        )
-
-    # 设置坐标轴范围，使图居中
-    ax.set_xlim([center[0] - max_extent/2 - extra, center[0] + max_extent/2 + extra])
-    ax.set_ylim([center[1] - max_extent/2 - extra, center[1] + max_extent/2 + extra])
-    ax.set_zlim([center[2] - max_extent/2 - extra, center[2] + max_extent/2 + extra])
-
-    # 隐藏坐标轴
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_zticks([])
-    ax.set_axis_off()
-
-    if endpoints or branch_vertices:
-        ax.legend(loc='upper right', fontsize=6)
-
-    plt.tight_layout(pad=0)
-    plt.savefig(output_path, format='svg', bbox_inches='tight', pad_inches=0.1)
-    plt.close(fig)
+    """Compatibility wrapper delegating to reporting function."""
+    from toys3d.reporting import _generate_component_3d_diagram as _rep
+    return _rep(component, mesh, output_path)
 
 
-def load_boundary_component_data(data_dir, boundary_id, boundary_type="uncovered"):
-    """
-    从 hole diagnosis 输出目录加载指定边界组件或健康孔洞的数据。
+def load_uncovered_edge_data(data_dir):
+    """Compatibility wrapper delegating to reporting."""
+    from toys3d.reporting import load_uncovered_edge_data as _rep
+    return _rep(data_dir)
 
-    boundary_type:
-        "uncovered" : 未覆盖开放边分量
-        "healthy"   : 健康孔洞
 
-    返回统一的组件字典，包含边、面、端点、分支点、候选断裂等信息。
-    """
-    data_dir = Path(data_dir)
+def generate_html_report(output_dir, id_to_code, results):
+    """Compatibility wrapper delegating to reporting.generate_html_report."""
+    from toys3d.reporting import generate_html_report as _rep
+    return _rep(output_dir, id_to_code, results)
 
-    if boundary_type == "uncovered":
-        component_json = data_dir / "uncovered_component_analysis.json"
-        if not component_json.exists():
-            raise FileNotFoundError(f"未找到 {component_json}")
-        with open(component_json, "r") as f:
-            comp_data = json.load(f)
-        components = comp_data.get("components", [])
-        if boundary_id < 0 or boundary_id >= len(components):
-            raise ValueError(
-                f"无效的未覆盖分量 ID: {boundary_id}，共 {len(components)} 个分量"
-            )
-        comp = components[boundary_id]
-        # 确保字段以 list 形式存在
-        comp.setdefault("endpoints", [])
-        comp.setdefault("branch_vertices", [])
-        comp.setdefault("candidate_breaks", [])
-        return comp
 
-    elif boundary_type == "healthy":
-        npz_path = data_dir / "hole_diagnosis_data.npz"
-        json_path = data_dir / "hole_diagnosis.json"
-        if not npz_path.exists() or not json_path.exists():
-            raise FileNotFoundError(f"未找到 {npz_path} 或 {json_path}")
+def generate_latex_report(output_dir, id_to_code, results):
+    """Compatibility wrapper delegating to reporting.generate_latex_report."""
+    from toys3d.reporting import generate_latex_report as _rep
+    return _rep(output_dir, id_to_code, results)
 
-        npz = np.load(npz_path)
-        with open(json_path, "r") as f:
-            diag_json = json.load(f)
 
-        healthy_holes = diag_json.get("healthy_holes", [])
-        if boundary_id < 0 or boundary_id >= len(healthy_holes):
-            raise ValueError(
-                f"无效的健康孔洞 ID: {boundary_id}，共 {len(healthy_holes)} 个孔洞"
-            )
+def generate_html_report_from_json(output_dir):
+    """Compatibility wrapper delegating to reporting.generate_html_report_from_json."""
+    from toys3d.reporting import generate_html_report_from_json as _rep
+    return _rep(output_dir)
 
-        hole_vertex_list = healthy_holes[boundary_id]["vertex_indices"]
-        hole_ids_per_edge = npz["hole_ids_per_edge"]
-        open_edge_vertex_pairs = npz["open_edge_vertex_pairs"]
-        open_edge_face_ids = npz["open_edge_face_ids"]
 
-        # 筛选属于该孔洞的开放边
-        edge_mask = hole_ids_per_edge == boundary_id
-        edge_indices = np.where(edge_mask)[0]
-        comp_edges = open_edge_vertex_pairs[edge_indices]
-        comp_face_ids = np.unique(open_edge_face_ids[edge_indices])
+def _parse_color_string(s):
+    """Compatibility wrapper for visualization._parse_color_string."""
+    import toys3d.visualization as _vis
+    return _vis._parse_color_string(s)
 
-        # 构造统一结构
-        vertices_set = set()
-        for v0, v1 in comp_edges:
-            vertices_set.add(int(v0))
-            vertices_set.add(int(v1))
 
-        component = {
-            "component_id": boundary_id,
-            "num_edges": int(len(comp_edges)),
-            "num_vertices": int(len(vertices_set)),
-            "vertices": sorted(vertices_set),
-            "edge_vertex_pairs": comp_edges.tolist(),
-            "endpoints": [],
-            "branch_vertices": [],
-            "is_cycle": True,      # 健康孔洞本质上是闭合环
-            "face_ids": comp_face_ids.tolist(),
-            "open_face_count": int(len(comp_face_ids)),
-            "nonmanifold_face_count": 0,
-            "candidate_breaks": [],
-            "healthy_hole_vertex_indices": hole_vertex_list,
-        }
-        return component
+def _parse_color_string_flexible(s):
+    """Compatibility wrapper for visualization._parse_color_string_flexible."""
+    import toys3d.visualization as _vis
+    return _vis._parse_color_string_flexible(s)
 
-    else:
-        raise ValueError(f"未知的边界类型: {boundary_type}")
+
+def _print_boundary_component_diagnostics(mesh, comp, boundary_type, boundary_id,
+                                         neighborhood_depth, print_distribution=False):
+    """Compatibility wrapper for visualization._print_boundary_component_diagnostics."""
+    import toys3d.visualization as _vis
+    return _vis._print_boundary_component_diagnostics(
+        mesh, comp, boundary_type, boundary_id, neighborhood_depth, print_distribution
+    )
+
+
+def visualize_boundary_component(mesh, args):
+    """Compatibility wrapper for visualization.visualize_boundary_component."""
+    import toys3d.visualization as _vis
+    return _vis.visualize_boundary_component(mesh, args)
 
 
 def extract_component_package(mesh, args):
-    """
-    提取指定边界组件/健康孔洞的局部网格，并将重映射后的组件数据保存为 JSON。
-    """
     comp = load_boundary_component_data(
         args.boundary_data_dir,
         args.boundary_id,
         args.boundary_type,
     )
 
-    # 估计组件诊断信息
     _print_boundary_component_diagnostics(
         mesh,
         comp,
@@ -896,104 +283,19 @@ def extract_component_package(mesh, args):
         print_distribution=args.print_neighborhood_distribution,
     )
 
-    seed_faces = comp.get("face_ids", [])
-    expanded = expand_face_neighborhood(
+    local_mesh, _faces_idx, _old_to_new, comp_new = extract_component_submesh(
         mesh,
-        seed_faces,
-        args.boundary_neighborhood_depth,
+        comp,
+        neighborhood_depth=args.boundary_neighborhood_depth,
     )
 
-    if not expanded:
-        expanded = set(seed_faces)
-
-    if not expanded:
+    if local_mesh is None:
         print("[ERROR] 没有可提取的面片")
         return
 
-    faces_idx = np.array(sorted(expanded), dtype=np.int64)
-    original_faces = np.asarray(mesh.faces, dtype=np.int64)[faces_idx]
+    local_vertices = local_mesh.vertices
+    local_faces = local_mesh.faces
 
-    # 局部顶点重映射
-    unique_old_vertices = np.unique(original_faces.ravel())
-    old_to_new = {
-        int(old_v): int(new_v)
-        for new_v, old_v in enumerate(unique_old_vertices)
-    }
-
-    local_vertices = mesh.vertices[unique_old_vertices]
-    local_faces = np.array(
-        [
-            [old_to_new[int(v)] for v in face]
-            for face in original_faces
-        ],
-        dtype=np.int64,
-    )
-
-    local_mesh = trimesh.Trimesh(
-        vertices=local_vertices,
-        faces=local_faces,
-        process=False,
-    )
-
-    # 重映射组件内部索引
-    comp_new = comp.copy()
-
-    face_idx_to_local = {
-        int(old_fid): int(local_fid)
-        for local_fid, old_fid in enumerate(faces_idx)
-    }
-
-    comp_new["face_ids"] = [
-        face_idx_to_local[int(f)]
-        for f in comp.get("face_ids", [])
-        if int(f) in face_idx_to_local
-    ]
-
-    def remap_v(v):
-        return old_to_new.get(int(v), -1)
-
-    comp_new["vertices"] = [
-        remap_v(v)
-        for v in comp.get("vertices", [])
-        if remap_v(v) >= 0
-    ]
-
-    comp_new["edge_vertex_pairs"] = [
-        [remap_v(v0), remap_v(v1)]
-        for v0, v1 in comp.get("edge_vertex_pairs", [])
-        if remap_v(v0) >= 0 and remap_v(v1) >= 0
-    ]
-
-    comp_new["endpoints"] = [
-        remap_v(v)
-        for v in comp.get("endpoints", [])
-        if remap_v(v) >= 0
-    ]
-
-    comp_new["branch_vertices"] = [
-        remap_v(v)
-        for v in comp.get("branch_vertices", [])
-        if remap_v(v) >= 0
-    ]
-
-    comp_new["candidate_breaks"] = [
-        {
-            "v0": remap_v(c.get("v0", -1)),
-            "v1": remap_v(c.get("v1", -1)),
-            "distance": c.get("distance", 0.0),
-        }
-        for c in comp.get("candidate_breaks", [])
-        if remap_v(c.get("v0", -1)) >= 0 and remap_v(c.get("v1", -1)) >= 0
-    ]
-
-    if "healthy_hole_vertex_indices" in comp_new:
-        comp_new["healthy_hole_vertex_indices"] = [
-            remap_v(v)
-            for v in comp_new.get("healthy_hole_vertex_indices", [])
-            if remap_v(v) >= 0
-        ]
-
-    # 输出路径
     input_stem = Path(args.input_file).stem
     ply_path = Path(
         args.component_output
@@ -1025,633 +327,6 @@ def extract_component_package(mesh, args):
         f"提取完成：局部面片数 {len(local_faces)}，"
         f"局部顶点数 {len(local_vertices)}"
     )
-
-
-def _print_boundary_component_diagnostics(mesh, comp, boundary_type, boundary_id,
-                                         neighborhood_depth, print_distribution=False):
-    """
-    打印指定边界组件/健康孔洞的基础诊断信息。
-    """
-    print(f"\n[DIAGNOSTICS] 可视化原始网格组件 (boundary_id={boundary_id}, type={boundary_type})")
-
-    edges = comp.get("edge_vertex_pairs", [])
-    vertices_set = set()
-    for v0, v1 in edges:
-        vertices_set.add(int(v0))
-        vertices_set.add(int(v1))
-
-    print(f"  边界边数: {len(edges)}")
-    print(f"  边界顶点数: {len(vertices_set)}")
-
-    # 顶点度数分布
-    degree = Counter()
-    for v0, v1 in edges:
-        degree[int(v0)] += 1
-        degree[int(v1)] += 1
-
-    deg1 = sum(1 for d in degree.values() if d == 1)
-    deg2 = sum(1 for d in degree.values() if d == 2)
-    deg3plus = sum(1 for d in degree.values() if d >= 3)
-    print(f"  度为1的顶点数: {deg1}")
-    print(f"  度为2的顶点数: {deg2}")
-    print(f"  度为3及以上的顶点数: {deg3plus}")
-
-    seed_faces = comp.get("face_ids", [])
-    print(f"  种子面片数: {len(seed_faces)}")
-
-    if print_distribution and neighborhood_depth > 0:
-        print("  邻域面片距离分布（距离0=种子面片）:")
-        max_display = min(neighborhood_depth, 20)  # 最多显示到20层
-        prev_set = set(seed_faces)
-        print(f"    距离 0: {len(prev_set)}")
-        for d in range(1, max_display + 1):
-            cur_set = expand_face_neighborhood(mesh, seed_faces, d + 1)
-            new_count = len(cur_set - prev_set)
-            print(f"    距离 {d}: {new_count}")
-            prev_set = cur_set
-
-
-def print_scene_debug_info(scene, title="Scene Debug Info"):
-    """
-    打印场景中所有几何对象的名称、类型、尺寸与包围盒。
-    """
-    print_separator(title)
-
-    geometry_items = list(scene.geometry.items())
-    if not geometry_items:
-        print("  scene is empty")
-        return
-
-    print(f"  geometry count: {len(geometry_items)}")
-
-    scene_bounds = None
-    for i, (name, geom) in enumerate(geometry_items):
-        geom_type = type(geom).__name__
-
-        n_vertices = len(getattr(geom, "vertices", [])) if hasattr(geom, "vertices") else 0
-        n_faces = len(getattr(geom, "faces", [])) if hasattr(geom, "faces") else 0
-
-        try:
-            bounds = geom.bounds
-        except Exception:
-            bounds = None
-
-        if bounds is not None:
-            bmin = bounds[0]
-            bmax = bounds[1]
-            extents = bmax - bmin
-            center = (bmin + bmax) / 2.0
-            diag = float(np.linalg.norm(extents))
-        else:
-            bmin = np.zeros(3)
-            bmax = np.zeros(3)
-            extents = np.zeros(3)
-            center = np.zeros(3)
-            diag = 0.0
-
-        print(f"  [{i}] name={name}")
-        print(f"      type={geom_type}")
-        print(f"      vertices={n_vertices}, faces={n_faces}")
-        print(f"      bounds.min=[{bmin[0]:.6f}, {bmin[1]:.6f}, {bmin[2]:.6f}]")
-        print(f"      bounds.max=[{bmax[0]:.6f}, {bmax[1]:.6f}, {bmax[2]:.6f}]")
-        print(f"      extents=[{extents[0]:.6f}, {extents[1]:.6f}, {extents[2]:.6f}]")
-        print(f"      center=[{center[0]:.6f}, {center[1]:.6f}, {center[2]:.6f}]")
-        print(f"      diagonal={diag:.6f}")
-
-        if bounds is not None:
-            if scene_bounds is None:
-                scene_bounds = bounds.copy()
-            else:
-                scene_bounds[0] = np.minimum(scene_bounds[0], bmin)
-                scene_bounds[1] = np.maximum(scene_bounds[1], bmax)
-
-    if scene_bounds is not None:
-        sbmin = scene_bounds[0]
-        sbmax = scene_bounds[1]
-        sext = sbmax - sbmin
-        scent = (sbmin + sbmax) / 2.0
-        sdiag = float(np.linalg.norm(sext))
-        print("  [scene]")
-        print(f"      bounds.min=[{sbmin[0]:.6f}, {sbmin[1]:.6f}, {sbmin[2]:.6f}]")
-        print(f"      bounds.max=[{sbmax[0]:.6f}, {sbmax[1]:.6f}, {sbmax[2]:.6f}]")
-        print(f"      extents=[{sext[0]:.6f}, {sext[1]:.6f}, {sext[2]:.6f}]")
-        print(f"      center=[{scent[0]:.6f}, {scent[1]:.6f}, {scent[2]:.6f}]")
-        print(f"      diagonal={sdiag:.6f}")
-
-
-def _print_camera_info(info):
-    """命令行打印摄像机信息。"""
-    print("\n[Camera Info]")
-    ws = info.get("window_size")
-    if ws:
-        print(f"  window_size:        {ws[0]} x {ws[1]}")
-
-    if "camera_position_display" in info:
-        c = info["camera_position_display"]
-        print(f"  camera_position (display): [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
-    if "focal_point_display" in info:
-        c = info["focal_point_display"]
-        print(f"  focal_point (display):     [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
-    if "view_up" in info:
-        c = info["view_up"]
-        print(f"  view_up:            [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
-    if "view_direction" in info:
-        c = info["view_direction"]
-        print(f"  view_direction:     [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
-    if "camera_distance" in info:
-        print(f"  camera_distance:    {info['camera_distance']:.6f}")
-    if "clipping_range" in info:
-        c = info["clipping_range"]
-        print(f"  clipping_range:     [{c[0]:.6f}, {c[1]:.6f}]")
-
-    if "scene_translation" in info:
-        c = info["scene_translation"]
-        print(f"  scene_translation:  [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
-
-    if "camera_position_world" in info:
-        c = info["camera_position_world"]
-        print(f"  camera_position (world):   [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
-    if "focal_point_world" in info:
-        c = info["focal_point_world"]
-        print(f"  focal_point (world):       [{c[0]:.6f}, {c[1]:.6f}, {c[2]:.6f}]")
-
-    err = info.get("error")
-    if err:
-        print(f"  [ERROR] {err}")
-
-
-def _capture_vedo_camera_info(plotter_or_viewer):
-    """从 vedo Plotter 或 trimesh vedo viewer 捕获相机/窗口信息。"""
-    info = {}
-    try:
-        # 兼容 trimesh VedoViewer（有 .plotter）和 vedo Plotter 本身
-        plt = getattr(plotter_or_viewer, "plotter", plotter_or_viewer)
-
-        win = getattr(plt, "window", None)
-        if win is not None:
-            sz = win.GetSize()
-            info["window_size"] = [int(sz[0]), int(sz[1])]
-
-        cam = getattr(plt, "camera", None)
-        if cam is None:
-            return {"error": "plotter has no camera"}
-
-        pos = np.asarray(cam.GetPosition(), dtype=np.float64)
-        focal = np.asarray(cam.GetFocalPoint(), dtype=np.float64)
-        # vtkOpenGLCamera (vedo 2026+) 没有 GetUp，使用 GetViewUp
-        if hasattr(cam, "GetViewUp"):
-            up = np.asarray(cam.GetViewUp(), dtype=np.float64)
-        else:
-            up = np.asarray(cam.GetUp(), dtype=np.float64)
-
-        view_dir = focal - pos
-        dist = float(np.linalg.norm(view_dir))
-
-        info["camera_position_display"] = pos.tolist()
-        info["focal_point_display"] = focal.tolist()
-        info["view_up"] = up.tolist()
-        info["view_direction"] = normalize(view_dir).tolist()
-        info["camera_distance"] = dist
-
-        cr = cam.GetClippingRange()
-        info["clipping_range"] = [float(cr[0]), float(cr[1])]
-
-    except Exception as e:
-        info["error"] = str(e)
-
-    return info
-
-
-def _try_get_trimesh_vedo_viewer():
-    """尝试导入 trimesh 内置的 VedoViewer（旧版本才有）。"""
-    for module_path in ("trimesh.viewers.vedo_viewer", "trimesh.viewer.vedo_viewer"):
-        try:
-            mod = __import__(module_path, fromlist=["VedoViewer"])
-            return getattr(mod, "VedoViewer", None)
-        except Exception:
-            continue
-    return None
-
-
-def _show_scene_with_vedo(scene):
-    """使用 vedo 直接显示 trimesh.Scene，并返回相机信息。"""
-    import vedo
-
-    merged = scene.to_geometry()
-    actor = vedo.Mesh(merged)
-
-    if (hasattr(merged.visual, "face_colors") and
-            merged.visual.face_colors.shape[0] == len(merged.faces)):
-        colors = np.asarray(merged.visual.face_colors)
-        actor.cellcolors = colors[:, :3]
-
-    plt = vedo.Plotter()
-    plt.show(actor, interactive=True)
-
-    return _capture_vedo_camera_info(plt)
-
-
-def _show_scene_with_camera_info(scene, args, scene_translation=None):
-    """
-    统一封装 scene.show()，使用 vedo 显示，并按需捕获/打印相机信息。
-    """
-    info = None
-
-    # 1. 旧版 trimesh 有 VedoViewer，优先使用
-    VedoViewer = _try_get_trimesh_vedo_viewer()
-    if VedoViewer is not None:
-        class _CameraInfoViewer(VedoViewer):
-            def __init__(self, *a, **kw):
-                super().__init__(*a, **kw)
-                self.camera_info = None
-
-            def show(self, **kw):
-                result = super().show(**kw)
-                self.camera_info = _capture_vedo_camera_info(self)
-                return result
-
-        viewer = _CameraInfoViewer(scene)
-        viewer.show()
-        info = viewer.camera_info or {}
-
-    # 2. trimesh 4.x 没有 viewer 模块，直接用 vedo
-    else:
-        try:
-            info = _show_scene_with_vedo(scene)
-        except ImportError as e:
-            print(f"[WARN] vedo 未安装，回退到默认显示: {e}")
-            scene.show()
-            return
-        except Exception as e:
-            print(f"[WARN] vedo 直接显示失败，回退到默认显示: {e}")
-            scene.show()
-            return
-
-    if info and scene_translation is not None and "error" not in info:
-        t = np.asarray(scene_translation, dtype=np.float64)
-        if "camera_position_display" in info:
-            info["camera_position_world"] = (
-                np.asarray(info["camera_position_display"]) - t
-            ).tolist()
-        if "focal_point_display" in info:
-            info["focal_point_world"] = (
-                np.asarray(info["focal_point_display"]) - t
-            ).tolist()
-        info["scene_translation"] = t.tolist()
-
-    # 只有用户要求时才打印/保存相机信息
-    if info and (args.print_camera_info or args.camera_info_output):
-        _print_camera_info(info)
-        if args.camera_info_output:
-            out = Path(args.camera_info_output)
-            out.write_text(
-                json.dumps(info, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            print(f"相机信息已保存: {out}")
-
-
-def _filter_camera_core_points(points):
-    """
-    根据中位数绝对偏差过滤离群点，避免个别原点/错误点拉偏相机。
-    """
-    points = np.asarray(points, dtype=np.float64)
-    if points.ndim != 2 or points.shape[1] != 3 or len(points) < 4:
-        return points
-
-    med = np.median(points, axis=0)
-    dist = np.linalg.norm(points - med, axis=1)
-    med_dist = np.median(dist)
-
-    if med_dist < 1e-12:
-        return points
-
-    ratio = dist / med_dist
-    kept = ratio <= 3.0
-    return points[kept]
-
-
-def visualize_boundary_component(mesh, args):
-    """
-    可视化健康孔洞或未覆盖开放边分量及其局部三角面片。
-    默认不显示整个网格，只显示目标边界和指定邻域深度内的面片。
-    """
-    # 自动查找与输入 PLY 同名的组件包 JSON
-    if not args.component_package:
-        candidate = Path(args.input_file).with_suffix('.json')
-        if candidate.exists():
-            args.component_package = str(candidate)
-            print(f"自动找到组件包: {candidate}")
-
-    boundary_id = args.boundary_id
-
-    if args.component_package:
-        package_path = Path(args.component_package)
-        if not package_path.exists():
-            raise FileNotFoundError(f"未找到组件包文件: {package_path}")
-
-        with open(package_path, "r", encoding="utf-8") as f:
-            package_data = json.load(f)
-
-        comp = package_data.get("component", {})
-        effective_boundary_type = package_data.get("boundary_type", args.boundary_type)
-        boundary_id = package_data.get("boundary_id", args.boundary_id)
-
-        # 确保必要字段存在
-        comp.setdefault("edge_vertex_pairs", [])
-        comp.setdefault("vertices", [])
-        comp.setdefault("face_ids", [])
-        comp.setdefault("endpoints", [])
-        comp.setdefault("branch_vertices", [])
-        comp.setdefault("candidate_breaks", [])
-        comp.setdefault("healthy_hole_vertex_indices", [])
-    else:
-        comp = load_boundary_component_data(
-            args.boundary_data_dir,
-            args.boundary_id,
-            args.boundary_type,
-        )
-        effective_boundary_type = args.boundary_type
-
-    # 打印组件诊断信息
-    _print_boundary_component_diagnostics(
-        mesh, comp, effective_boundary_type, boundary_id,
-        args.boundary_neighborhood_depth,
-        print_distribution=args.print_neighborhood_distribution
-    )
-
-    # 优先使用当前边集导出的顶点，避免 hole_diagnosis.json 中旧索引/异常索引
-    focus_indices = comp.get("vertices")
-
-    if not focus_indices:
-        focus_indices = comp.get("healthy_hole_vertex_indices", [])
-
-    if not focus_indices:
-        focus_indices = comp.get("endpoints", [])
-
-    # 核心取景点集：优先为健康孔洞边界顶点，其次组件顶点/端点
-    boundary_camera_points = []
-    seifert_camera_points = []
-
-    if focus_indices:
-        focus_points = mesh.vertices[np.asarray(focus_indices, dtype=np.int64)]
-        boundary_camera_points = focus_points.copy()
-
-    scene = trimesh.Scene()
-
-    # 可选：显示半透明原始网格
-    if args.boundary_show_original:
-        vis_mesh = mesh.copy()
-        # 赋予统一半透明颜色（确保存在 face_colors）
-        alpha_uint8 = int(0.3 * 255)
-        vis_mesh.visual.face_colors = np.full(
-            (len(vis_mesh.faces), 4),
-            [200, 200, 200, alpha_uint8],
-            dtype=np.uint8,
-        )
-        # 双面显示原始网格背景
-        if args.double_sided:
-            vis_mesh = make_double_sided(vis_mesh)
-        scene.add_geometry(vis_mesh)
-
-    # 根据邻域深度显示相关三角面片
-    if args.boundary_neighborhood_depth > 0:
-        face_ids = comp.get("face_ids", [])
-        if face_ids:
-            expanded_faces = expand_face_neighborhood(
-                mesh, face_ids, args.boundary_neighborhood_depth
-            )
-            if expanded_faces:
-                sub = mesh.submesh(
-                    [np.array(list(expanded_faces), dtype=np.int64)]
-                )[0]
-
-                if effective_boundary_type == "uncovered":
-                    sub.visual.face_colors = [255, 165, 0, 255]  # 橙色
-                else:
-                    sub.visual.face_colors = [144, 238, 144, 255]  # 浅绿
-
-                # 双面显示相关三角面片
-                if args.double_sided:
-                    sub = make_double_sided(sub)
-
-                scene.add_geometry(sub)
-
-    # 计算默认圆柱半径
-    radius = args.boundary_radius
-    if radius is None or radius <= 0:
-        bounds = mesh.bounds
-        diag = np.linalg.norm(bounds[1] - bounds[0])
-        radius = max(diag * 0.0005, 1e-6)
-
-    # 绘制边界边
-    if effective_boundary_type == "uncovered":
-        edge_color = [0, 128, 255, 255]   # 蓝色
-    else:
-        edge_color = [0, 255, 255, 255]   # 青色
-
-    for v0, v1 in comp["edge_vertex_pairs"]:
-        seg = trimesh.creation.cylinder(
-            radius=radius,
-            segment=[mesh.vertices[v0], mesh.vertices[v1]],
-            sections=4,
-        )
-        seg.visual.face_colors = edge_color
-        scene.add_geometry(seg)
-
-    # 绘制最小包络流形边界（若存在）
-    enclosing = comp.get("minimal_enclosing_boundary", {})
-    if enclosing.get("success"):
-        enclosing_vertices = enclosing.get("boundary_vertices", [])
-        enclosing_radius = radius * 1.5   # 稍粗，更醒目
-
-        for loop_verts in enclosing_vertices:
-            for i in range(len(loop_verts) - 1):
-                v0 = loop_verts[i]
-                v1 = loop_verts[i + 1]
-                seg = trimesh.creation.cylinder(
-                    radius=enclosing_radius,
-                    segment=[mesh.vertices[v0], mesh.vertices[v1]],
-                    sections=6,
-                )
-                seg.visual.face_colors = [255, 0, 255, 255]  # 洋红色
-                scene.add_geometry(seg)
-
-    # 拟合水密包络曲面并显示交线
-    if args.fit_watertight_patch:
-        print("拟合水密包络曲面...")
-        patch_result = fit_watertight_patch_from_component(
-            mesh,
-            comp,
-            method=args.patch_method,
-            neighborhood_depth=args.patch_neighborhood_depth,
-            poisson_depth=args.patch_poisson_depth,
-            density_quantile=args.patch_density_quantile,
-            alpha=args.patch_alpha,
-            allow_non_genus0=args.allow_non_genus0,
-        )
-        if patch_result["success"]:
-            watertight_mesh = patch_result["watertight_mesh"]
-            intersection_vertices = patch_result["intersection_vertices"]
-            intersection_edges = patch_result["intersection_edges"]
-
-            # 显示拟合曲面（半透明青色）
-            # 使用用户指定的不透明度，并支持双面渲染避免背面剔除导致的结构透视
-            alpha = int(np.clip(args.patch_opacity, 0.0, 1.0) * 255)
-            watertight_mesh.visual.face_colors = np.full(
-                (len(watertight_mesh.faces), 4),
-                [0, 200, 200, alpha],
-                dtype=np.uint8,
-            )
-            if args.double_sided:
-                watertight_mesh = make_double_sided(watertight_mesh)
-            scene.add_geometry(watertight_mesh)
-
-            # 显示交线（洋红色圆柱）
-            for edge in intersection_edges:
-                p0 = intersection_vertices[edge[0]]
-                p1 = intersection_vertices[edge[1]]
-                seg = trimesh.creation.cylinder(
-                    radius=radius * 1.2,
-                    segment=[p0, p1],
-                    sections=5,
-                )
-                seg.visual.face_colors = [255, 0, 255, 255]
-                scene.add_geometry(seg)
-
-            print(f"  拟合成功：交线 {len(intersection_vertices)} 个顶点，"
-                  f"{len(intersection_edges)} 条边")
-        else:
-            print(f"  [WARN] 水密包络拟合失败: {patch_result['message']}")
-
-    # 端点（绿色球）
-    for v in comp.get("endpoints", []):
-        sphere = trimesh.creation.icosphere(subdivisions=1, radius=radius * 2.0)
-        sphere.apply_translation(mesh.vertices[v])
-        sphere.visual.face_colors = [0, 255, 0, 255]
-        scene.add_geometry(sphere)
-
-    # 分支点（红色球）
-    for v in comp.get("branch_vertices", []):
-        sphere = trimesh.creation.icosphere(subdivisions=1, radius=radius * 2.0)
-        sphere.apply_translation(mesh.vertices[v])
-        sphere.visual.face_colors = [255, 0, 0, 255]
-        scene.add_geometry(sphere)
-
-    # 候选断裂点对（橙色虚线，用细圆柱表示）
-    for cand in comp.get("candidate_breaks", []):
-        p0 = mesh.vertices[cand["v0"]]
-        p1 = mesh.vertices[cand["v1"]]
-        seg = trimesh.creation.cylinder(
-            radius=radius * 0.8,
-            segment=[p0, p1],
-            sections=4,
-        )
-        seg.visual.face_colors = [255, 165, 0, 255]
-        scene.add_geometry(seg)
-
-    # Seifert 曲面
-    if getattr(args, 'generate_seifert_surface', False):
-        if effective_boundary_type != "healthy":
-            print("  警告: --generate-seifert-surface 仅适用于 healthy 孔洞")
-        else:
-            loop = comp.get("healthy_hole_vertex_indices")
-            if not loop:
-                # 从 edge_vertex_pairs 恢复环
-                edge_pairs = comp.get("edge_vertex_pairs", [])
-                if edge_pairs:
-                    import warnings
-                    # 简化恢复：取所有边的顶点并排序？但这里直接用边构建邻接并遍历
-                    # 可以省略，因为健康孔洞 JSON 中应已有 vertex_indices
-                    print("  [WARN] 未找到 healthy_hole_vertex_indices")
-                else:
-                    print("  [WARN] 未找到任何边界信息")
-                loop = []
-            if loop and len(loop) >= 3:
-                print("生成 Seifert 曲面...")
-                seifert_result = generate_seifert_surface(
-                    mesh,
-                    loop,
-                    optimize_iterations=args.seifert_optimize_iterations,
-                    step_size=args.seifert_step_size,
-                    tol=args.seifert_tolerance,
-                    verbose=True,
-                )
-                if not seifert_result["success"]:
-                    print(f"  [WARN] {seifert_result['message']}")
-                else:
-                    seifert_mesh = seifert_result["mesh"]
-                    boundary_indices = seifert_result["boundary_indices"]
-
-                    # 仅将 Seifert 顶点用于扩大取景半径，不参与相机中心计算
-                    seifert_camera_points = np.asarray(
-                        seifert_mesh.vertices, dtype=np.float64
-                    ).copy()
-
-                    # 局部填充分析
-                    fill_stats = compute_seifert_fill_stats(
-                        mesh,
-                        comp,
-                        seifert_mesh,
-                        loop,
-                        boundary_indices,
-                    )
-                    print_seifert_fill_stats(fill_stats)
-
-                    color = np.array(args.seifert_color, dtype=np.uint8)
-                    seifert_mesh.visual.face_colors = np.tile(
-                        color, (len(seifert_mesh.faces), 1)
-                    )
-                    if args.double_sided:
-                        seifert_mesh = make_double_sided(seifert_mesh)
-                    scene.add_geometry(seifert_mesh)
-                    print(f"  Seifert 曲面已生成: {len(seifert_mesh.faces)} 个三角面片")
-                    if args.seifert_curvature_report:
-                        stats = compute_seifert_curvature_stats(
-                            seifert_mesh, boundary_indices
-                        )
-                        print("  Seifert 曲面曲率统计:")
-                        for k, v in stats.items():
-                            print(f"    {k}: {v:.6f}")
-            else:
-                print("  [WARN] 未找到有效的健康孔洞边界环")
-
-    if getattr(args, "debug_scene", False):
-        print_scene_debug_info(scene, title="Boundary Component Scene Debug Info")
-
-    if args.output:
-        scene.export(args.output)
-        print(
-            f"边界组件 {boundary_id} 可视化已保存至: {args.output}"
-        )
-
-    camera_center = None
-    if args.show:
-        show_scene = scene
-
-        if len(boundary_camera_points) > 0:
-            try:
-                boundary_pts = np.asarray(boundary_camera_points, dtype=np.float64)
-                camera_center = boundary_pts.mean(axis=0)
-
-                # 将孔洞中心平移到原点，让 viewer 的默认旋转中心固定为原点
-                show_scene = scene.copy()
-                show_scene.apply_translation(-camera_center)
-
-                if getattr(args, "debug_scene", False):
-                    print("  [camera] translated scene center:",
-                          f"({camera_center[0]:.6f}, {camera_center[1]:.6f}, {camera_center[2]:.6f})")
-                    print("  [camera] using origin-centered scene for viewer")
-
-            except Exception as e:
-                print(f"[WARN] 场景中心平移失败: {e}")
-
-        os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
-        _show_scene_with_camera_info(
-            show_scene,
-            args,
-            scene_translation=(-camera_center if camera_center is not None else None),
-        )
 
 
 def run_full_diagnosis_pass1(mesh, output_dir, valence_threshold=5):
@@ -1873,338 +548,6 @@ def run_full_diagnosis_pass2(mesh, output_dir, class_faces,
               f"非流形={edge_counts['nonmanifold']}", flush=True)
 
     return results
-
-
-def generate_html_report(output_dir, id_to_code, results):
-    """生成 HTML 报告，包含图例、交互式 SVG 示意图和详细统计。"""
-    output_dir = Path(output_dir)
-    html_path = output_dir / "report.html"
-
-    html = ["<html><head><meta charset='utf-8'><title>Full Face Diagnosis</title>",
-            "<style>",
-            "body { font-family: sans-serif; margin: 20px; }",
-            "table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }",
-            "th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: center; }",
-            "th { background: #f0f0f0; }",
-            ".class-block { margin-bottom: 30px; border: 1px solid #ddd; padding: 10px; }",
-            "img { max-width: 300px; height: auto; }",
-            ".diagram-container { display: inline-block; vertical-align: top; margin-right: 20px; }",
-            ".diagram-container svg { width: 200px; height: 170px; }",
-            ".legend { margin-bottom: 20px; padding: 10px; border: 1px solid #ccc; background: #fafafa; }",
-            ".legend span.legend-dot { display: inline-block; width: 15px; height: 15px; border-radius: 50%; margin-right: 5px; }",
-            ".legend span.solid { background: black; border: 1px solid black; }",
-            ".legend span.hollow { background: white; border: 2px solid black; }",
-            ".legend span.legend-line { display: inline-block; width: 30px; height: 0; border-top: 3px solid; margin-right: 5px; vertical-align: middle; }",
-            ".legend span.blue { border-color: blue; }",
-            ".legend span.green { border-color: green; }",
-            ".legend span.red { border-color: red; }",
-            "</style></head><body>",
-            "<h1>Full Face Diagnosis Report</h1>"]
-
-    # ---- 图例 ----
-    html.append("<div class='legend'>")
-    html.append("<strong>图例：</strong><br>")
-    html.append("<span class='legend-dot solid'></span> 独占顶点（仅被当前面引用）<br>")
-    html.append("<span class='legend-dot hollow'></span> 共享顶点（被多个面引用）<br>")
-    html.append("<span class='legend-line blue'></span> 开放边（仅属于当前面）<br>")
-    html.append("<span class='legend-line green'></span> 流形边（被两面共享）<br>")
-    html.append("<span class='legend-line red'></span> 非流形边（被三面或更多共享）<br>")
-    html.append("</div>")
-
-    html.append("<h2>Topology Classes</h2>")
-
-    for class_id in sorted(results.keys()):
-        res = results[class_id]
-        code = res['code']
-        area = res['area_stats']
-        pc = res['point_counts']
-        ec = res['edge_counts']
-        v_stats = res.get('representative_vertex_stats')
-        if not v_stats:
-            v_stats = [{'normal': 0, 'open': 0, 'nonmanifold': 0} for _ in range(3)]
-        e_stats = res.get('representative_edge_stats')
-        if not e_stats:
-            e_stats = [{'normal': 0, 'open': 0, 'nonmanifold': 0} for _ in range(3)]
-
-        # 内联 SVG 交互图
-        diagram_path = output_dir / "diagrams" / f"diagram_{class_id}.svg"
-        if diagram_path.exists():
-            svg_content = diagram_path.read_text(encoding="utf-8")
-        else:
-            svg_content = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='170'><text x='10' y='80'>Diagram not generated</text></svg>"
-
-        html.append("<div class='class-block'>")
-        html.append(f"<h3>Class {class_id}: {code}</h3>")
-        html.append("<div class='diagram-container'>")
-        html.append(svg_content)
-        html.append("</div>")
-        html.append("<div style='display: inline-block; vertical-align: top;'>")
-
-        # 面积统计表
-        html.append("<table>")
-        html.append("<tr><th>面积统计</th><th>值</th></tr>")
-        rows = [
-            ("count", "面片数"),
-            ("mean", "平均"),
-            ("min", "最小值"),
-            ("p1", "p1"),
-            ("p5", "p5"),
-            ("p10", "p10"),
-            ("p25", "p25"),
-            ("p50", "p50"),
-            ("p75", "p75"),
-            ("p90", "p90"),
-            ("p95", "p95"),
-            ("p99", "p99"),
-            ("max", "最大值"),
-        ]
-        for key, label in rows:
-            html.append(f"<tr><td>{label}</td><td>{area[key]:.6f}</td></tr>")
-        html.append("</table>")
-
-        # 总体邻接统计（点邻 / 边邻）
-        html.append("<table>")
-        html.append("<tr><th></th><th>流形</th><th>开放</th><th>非流形</th></tr>")
-        html.append("<tr><th>点邻（合计）</th>"
-                    f"<td>{pc['normal']}</td><td>{pc['open']}</td><td>{pc['nonmanifold']}</td></tr>")
-        html.append("<tr><th>边邻（合计）</th>"
-                    f"<td>{ec['normal']}</td><td>{ec['open']}</td><td>{ec['nonmanifold']}</td></tr>")
-        html.append("</table>")
-
-        html.append("</div>")  # 关闭右侧容器
-        html.append("</div>")  # 关闭 class-block
-
-    html.append("</body></html>")
-
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(html))
-    print(f"HTML 报告已保存: {html_path}")
-
-
-def generate_latex_report(output_dir, id_to_code, results):
-    """生成 LaTeX 报告（包含更多面积百分位和邻接统计）。"""
-    output_dir = Path(output_dir)
-    tex_path = output_dir / "report.tex"
-
-    tex = ["\\documentclass{article}",
-           "\\usepackage{graphicx}",
-           "\\usepackage{booktabs}",
-           "\\begin{document}",
-           "\\section{Full Face Diagnosis Report}"]
-
-    for class_id in sorted(results.keys()):
-        res = results[class_id]
-        code = res['code']
-        area = res['area_stats']
-        pc = res['point_counts']
-        ec = res['edge_counts']
-        diagram_rel = f"diagrams/diagram_{class_id}.svg"
-
-        tex.append(f"\\subsection{{Class {class_id}: {code}}}")
-        tex.append("\\begin{figure}[h]")
-        tex.append(f"\\includegraphics[width=0.25\\textwidth]{{{diagram_rel}}}")
-        tex.append("\\end{figure}")
-
-        # 面积统计表
-        tex.append("\\begin{tabular}{l r}")
-        tex.append("\\toprule")
-        tex.append("Area Metric & Value \\\\")
-        tex.append("\\midrule")
-        rows = [
-            ("Count", area['count']),
-            ("Mean", area['mean']),
-            ("Min", area['min']),
-            ("p1", area['p1']),
-            ("p5", area['p5']),
-            ("p10", area['p10']),
-            ("p25", area['p25']),
-            ("p50", area['p50']),
-            ("p75", area['p75']),
-            ("p90", area['p90']),
-            ("p95", area['p95']),
-            ("p99", area['p99']),
-            ("Max", area['max']),
-        ]
-        for label, val in rows:
-            tex.append(f"{label} & {val:.6f} \\\\")
-        tex.append("\\bottomrule")
-        tex.append("\\end{tabular}")
-
-        # 邻接统计表
-        tex.append("\\begin{tabular}{l c c c}")
-        tex.append("\\toprule")
-        tex.append("Neighbor & Manifold & Open & Nonmanifold \\\\")
-        tex.append("\\midrule")
-        tex.append(f"Point & {pc['normal']} & {pc['open']} & {pc['nonmanifold']} \\\\")
-        tex.append(f"Edge & {ec['normal']} & {ec['open']} & {ec['nonmanifold']} \\\\")
-        tex.append("\\bottomrule")
-        tex.append("\\end{tabular}")
-
-    tex.append("\\end{document}")
-    with open(tex_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(tex))
-    print(f"LaTeX 报告已保存: {tex_path}")
-
-
-def generate_html_report_from_json(output_dir):
-    """
-    从 abnormal_truncated_classes.json 生成 HTML 报告，
-    包含每个类的拓扑 SVG 示意图和统计表。
-    """
-    output_dir = Path(output_dir)
-    html_path = output_dir / "report.html"
-    classes_json_path = output_dir / "abnormal_truncated_classes.json"
-    diagrams_dir = output_dir / "diagrams"
-    diagrams_dir.mkdir(exist_ok=True)
-
-    if not classes_json_path.exists():
-        print(f"[ERROR] {classes_json_path} not found.")
-        return
-
-    with open(classes_json_path, "r") as f:
-        data = json.load(f)
-
-    html = ["<html><head><meta charset='utf-8'><title>Full Face Diagnosis</title>",
-            "<style>",
-            "body { font-family: sans-serif; margin: 20px; }",
-            "table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }",
-            "th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: center; }",
-            "th { background: #f0f0f0; }",
-            ".class-block { margin-bottom: 30px; border: 1px solid #ddd; padding: 10px; }",
-            "img { max-width: 300px; height: auto; }",
-            ".diagram-container { display: inline-block; vertical-align: top; margin-right: 20px; }",
-            ".diagram-container svg { width: 200px; height: 170px; }",
-            ".legend { margin-bottom: 20px; padding: 10px; border: 1px solid #ccc; background: #fafafa; }",
-            ".legend span.legend-dot { display: inline-block; width: 15px; height: 15px; border-radius: 50%; margin-right: 5px; }",
-            ".legend span.solid { background: black; border: 1px solid black; }",
-            ".legend span.hollow { background: white; border: 2px solid black; }",
-            ".legend span.legend-line { display: inline-block; width: 30px; height: 0; border-top: 3px solid; margin-right: 5px; vertical-align: middle; }",
-            ".legend span.blue { border-color: blue; }",
-            ".legend span.green { border-color: green; }",
-            ".legend span.red { border-color: red; }",
-            "</style></head><body>",
-            "<h1>Full Face Diagnosis Report</h1>"]
-
-    # 图例
-    html.append("<div class='legend'>")
-    html.append("<strong>图例：</strong><br>")
-    html.append("<span class='legend-dot solid'></span> 独占顶点（仅被当前面引用）<br>")
-    html.append("<span class='legend-dot hollow'></span> 共享顶点（被多个面引用）<br>")
-    html.append("<span class='legend-line blue'></span> 开放边（仅属于当前面）<br>")
-    html.append("<span class='legend-line green'></span> 流形边（被两面共享）<br>")
-    html.append("<span class='legend-line red'></span> 非流形边（被三面或更多共享）<br>")
-    html.append("</div>")
-
-    html.append("<h2>Topology Classes</h2>")
-
-    classes = data.get("classes", {})
-    if not classes:
-        html.append("<p>No abnormal classes found.</p>")
-    else:
-        for hex_code, cls_data in classes.items():
-            # 生成 SVG 图
-            diagram_path = diagrams_dir / f"diagram_{hex_code}.svg"
-            try:
-                code_arr = hex_to_code(hex_code)
-                _generate_topology_diagram(code_arr, str(diagram_path))
-            except Exception as e:
-                print(f"  [WARN] Diagram generation for {hex_code} failed: {e}")
-                diagram_path = None
-
-            svg_content = ""
-            if diagram_path and diagram_path.exists():
-                svg_content = diagram_path.read_text(encoding="utf-8")
-            if not svg_content:
-                svg_content = "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='170'><text x='10' y='80'>Diagram not generated</text></svg>"
-
-            html.append("<div class='class-block'>")
-            html.append(f"<h3>Class {hex_code}</h3>")
-            html.append("<div class='diagram-container'>")
-            html.append(svg_content)
-            html.append("</div>")
-            html.append("<div style='display: inline-block; vertical-align: top;'>")
-
-            # 面积统计表
-            area = cls_data.get("area_stats", {})
-            if area:
-                html.append("<table>")
-                html.append("<tr><th>面积统计</th><th>值</th></tr>")
-                rows = [
-                    ("count", "面片数"),
-                    ("mean", "平均"),
-                    ("min", "最小值"),
-                    ("p1", "p1"),
-                    ("p5", "p5"),
-                    ("p10", "p10"),
-                    ("p25", "p25"),
-                    ("p50", "p50"),
-                    ("p75", "p75"),
-                    ("p90", "p90"),
-                    ("p95", "p95"),
-                    ("p99", "p99"),
-                    ("max", "最大值"),
-                ]
-                for key, label in rows:
-                    if key in area:
-                        html.append(f"<tr><td>{label}</td><td>{area[key]:.6f}</td></tr>")
-                    else:
-                        html.append(f"<tr><td>{label}</td><td>N/A</td></tr>")
-                html.append("</table>")
-
-            # 邻接统计
-            pc = cls_data.get("point_counts", {})
-            ec = cls_data.get("edge_counts", {})
-            if pc and ec:
-                html.append("<table>")
-                html.append("<tr><th></th><th>流形</th><th>开放</th><th>非流形</th></tr>")
-                html.append("<tr><th>点邻（合计）</th>"
-                            f"<td>{pc.get('normal', 0)}</td><td>{pc.get('open', 0)}</td><td>{pc.get('nonmanifold', 0)}</td></tr>")
-                html.append("<tr><th>边邻（合计）</th>"
-                            f"<td>{ec.get('normal', 0)}</td><td>{ec.get('open', 0)}</td><td>{ec.get('nonmanifold', 0)}</td></tr>")
-                html.append("</table>")
-
-            # 代表面逐顶点/逐边统计（可选展示）
-            v_stats = cls_data.get("representative_vertex_stats")
-            e_stats = cls_data.get("representative_edge_stats")
-            if v_stats:
-                html.append("<table>")
-                html.append("<tr><th>代表面-顶点</th><th>流形</th><th>开放</th><th>非流形</th></tr>")
-                for idx, vs in enumerate(v_stats):
-                    html.append(f"<tr><td>V{idx}</td>"
-                                f"<td>{vs.get('normal', 0)}</td><td>{vs.get('open', 0)}</td><td>{vs.get('nonmanifold', 0)}</td></tr>")
-                html.append("</table>")
-            if e_stats:
-                html.append("<table>")
-                html.append("<tr><th>代表面-边</th><th>流形</th><th>开放</th><th>非流形</th></tr>")
-                for idx, es in enumerate(e_stats):
-                    html.append(f"<tr><td>E{idx}</td>"
-                                f"<td>{es.get('normal', 0)}</td><td>{es.get('open', 0)}</td><td>{es.get('nonmanifold', 0)}</td></tr>")
-                html.append("</table>")
-
-            # 截断字段真实分布
-            vertex_dist = cls_data.get("truncated_vertex_valence_dist", {})
-            edge_dist = cls_data.get("truncated_edge_valence_dist", {})
-
-            if vertex_dist:
-                html.append("<table>")
-                html.append("<tr><th>顶点元截断分布</th><th>真实 valence</th><th>计数</th></tr>")
-                for val_str, cnt in vertex_dist.items():
-                    html.append(f"<tr><td>valence</td><td>{val_str}</td><td>{cnt}</td></tr>")
-                html.append("</table>")
-
-            if edge_dist:
-                html.append("<table>")
-                html.append("<tr><th>边元截断分布</th><th>真实共享数</th><th>计数</th></tr>")
-                for val_str, cnt in edge_dist.items():
-                    html.append(f"<tr><td>edge</td><td>{val_str}</td><td>{cnt}</td></tr>")
-                html.append("</table>")
-
-            html.append("</div>")  # 关闭右侧容器
-            html.append("</div>")  # 关闭 class-block
-
-    html.append("</body></html>")
-    html_path.write_text("\n".join(html), encoding="utf-8")
-    print(f"HTML 报告已保存: {html_path}")
 
 
 def perform_full_diagnosis(mesh, args):
@@ -2791,38 +1134,6 @@ def inspect_mesh(mesh, args):
     return scene
 
 
-def _parse_color_string(s):
-    """
-    将 'R,G,B,A' 字符串解析为整数列表。
-    """
-    parts = s.split(',')
-    if len(parts) != 4:
-        raise argparse.ArgumentTypeError(
-            f"Color must be 'R,G,B,A', got '{s}'"
-        )
-    try:
-        return [int(p.strip()) for p in parts]
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"Color components must be integers, got '{s}'"
-        )
-
-
-def _parse_color_string_flexible(s):
-    """将 'R,G,B' 或 'R,G,B,A' 字符串解析为整数列表。"""
-    parts = s.split(',')
-    if len(parts) not in (3, 4):
-        raise argparse.ArgumentTypeError(
-            f"Color must be 'R,G,B' or 'R,G,B,A', got '{s}'"
-        )
-    try:
-        return [int(p.strip()) for p in parts]
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"Color components must be integers, got '{s}'"
-        )
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="检查并可视化网格模型，输出拓扑、边长、面积等统计信息。"
@@ -2950,7 +1261,6 @@ def main():
         default=None,
         help="加载已提取的组件包 JSON（与 --visualize-boundary-component 配合使用）"
     )
-    # 新增：局部边界组件可视化参数（在 --hole-diagnosis 后插入）
     parser.add_argument("--visualize-boundary-component", action="store_true",
                         help="可视化特定孔洞/开放边分量及其三角面片")
     parser.add_argument("--boundary-type", choices=["uncovered", "healthy"],

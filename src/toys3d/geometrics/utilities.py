@@ -187,6 +187,99 @@ def trim_isolated_faces(mesh, verbose=False):
     return m
 
 
+def extract_component_submesh(mesh, component, neighborhood_depth=1):
+    seed_faces = set(map(int, component.get('face_ids', [])))
+    if not seed_faces:
+        return None, None, None, None
+
+    expanded = _expand_face_neighborhood_geometrics(
+        mesh, seed_faces, neighborhood_depth
+    )
+    if not expanded:
+        expanded = seed_faces
+    if not expanded:
+        return None, None, None, None
+
+    faces_idx = np.asarray(sorted(expanded), dtype=np.int64)
+    original_faces = np.asarray(mesh.faces, dtype=np.int64)[faces_idx]
+
+    unique_old_vertices = np.unique(original_faces.ravel())
+    old_to_new = {
+        int(old_v): int(new_v)
+        for new_v, old_v in enumerate(unique_old_vertices)
+    }
+
+    local_vertices = mesh.vertices[unique_old_vertices]
+    local_faces = np.asarray(
+        [[old_to_new[int(v)] for v in face] for face in original_faces],
+        dtype=np.int64,
+    )
+
+    local_mesh = trimesh.Trimesh(
+        vertices=local_vertices,
+        faces=local_faces,
+        process=False,
+    )
+
+    face_idx_to_local = {
+        int(old_fid): int(local_fid)
+        for local_fid, old_fid in enumerate(faces_idx)
+    }
+
+    comp_new = component.copy()
+    comp_new["face_ids"] = [
+        face_idx_to_local[int(f)]
+        for f in comp_new.get("face_ids", [])
+        if int(f) in face_idx_to_local
+    ]
+
+    def remap_v(v):
+        return old_to_new.get(int(v), -1)
+
+    comp_new["vertices"] = [
+        remap_v(v)
+        for v in comp_new.get("vertices", [])
+        if remap_v(v) >= 0
+    ]
+
+    comp_new["edge_vertex_pairs"] = [
+        [remap_v(v0), remap_v(v1)]
+        for v0, v1 in comp_new.get("edge_vertex_pairs", [])
+        if remap_v(v0) >= 0 and remap_v(v1) >= 0
+    ]
+
+    comp_new["endpoints"] = [
+        remap_v(v)
+        for v in comp_new.get("endpoints", [])
+        if remap_v(v) >= 0
+    ]
+
+    comp_new["branch_vertices"] = [
+        remap_v(v)
+        for v in comp_new.get("branch_vertices", [])
+        if remap_v(v) >= 0
+    ]
+
+    comp_new["candidate_breaks"] = [
+        {
+            "v0": remap_v(c.get("v0", -1)),
+            "v1": remap_v(c.get("v1", -1)),
+            "distance": c.get("distance", 0.0),
+        }
+        for c in comp_new.get("candidate_breaks", [])
+        if remap_v(c.get("v0", -1)) >= 0 and remap_v(c.get("v1", -1)) >= 0
+    ]
+
+    if "healthy_hole_vertex_indices" in comp_new:
+        comp_new["healthy_hole_vertex_indices"] = [
+            remap_v(v)
+            for v in comp_new.get("healthy_hole_vertex_indices", [])
+            if remap_v(v) >= 0
+        ]
+
+    return local_mesh, faces_idx, old_to_new, comp_new
+
+
 def fix_winding_consistency(mesh):
     m = mesh.copy()
     faces = np.asarray(m.faces, dtype=np.int64)

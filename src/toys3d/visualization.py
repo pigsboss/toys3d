@@ -6,6 +6,7 @@ import argparse
 import colorsys
 import json
 import os
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -13,11 +14,22 @@ import trimesh
 
 from .geometrics import (
     extract_boundary_loops,
+    expand_face_neighborhood,
+    fit_watertight_patch_from_component,
     polygon_area_from_3d_ccw,
     project_vertices_to_shell,
     normalize,
 )
-from .reporting import load_uncovered_edge_data
+from .reporting import (
+    load_boundary_component_data,
+    load_uncovered_edge_data,
+)
+from .meshrepair import (
+    compute_seifert_curvature_stats,
+    compute_seifert_fill_stats,
+    generate_seifert_surface,
+    print_seifert_fill_stats,
+)
 
 
 def add_axes_to_scene(scene, origin, u_x, u_y, u_z, length=0.3, radius=0.01):
@@ -842,4 +854,370 @@ def _parse_color_string_flexible(s):
     except ValueError:
         raise argparse.ArgumentTypeError(
             f"Color components must be integers, got '{s}'"
+        )
+
+
+def _print_boundary_component_diagnostics(mesh, comp, boundary_type, boundary_id,
+                                         neighborhood_depth, print_distribution=False):
+    """
+    打印指定边界组件/健康孔洞的基础诊断信息。
+    """
+    print(f"\n[DIAGNOSTICS] 可视化原始网格组件 (boundary_id={boundary_id}, type={boundary_type})")
+
+    edges = comp.get("edge_vertex_pairs", [])
+    vertices_set = set()
+    for v0, v1 in edges:
+        vertices_set.add(int(v0))
+        vertices_set.add(int(v1))
+
+    print(f"  边界边数: {len(edges)}")
+    print(f"  边界顶点数: {len(vertices_set)}")
+
+    # 顶点度数分布
+    degree = Counter()
+    for v0, v1 in edges:
+        degree[int(v0)] += 1
+        degree[int(v1)] += 1
+
+    deg1 = sum(1 for d in degree.values() if d == 1)
+    deg2 = sum(1 for d in degree.values() if d == 2)
+    deg3plus = sum(1 for d in degree.values() if d >= 3)
+    print(f"  度为1的顶点数: {deg1}")
+    print(f"  度为2的顶点数: {deg2}")
+    print(f"  度为3及以上的顶点数: {deg3plus}")
+
+    seed_faces = comp.get("face_ids", [])
+    print(f"  种子面片数: {len(seed_faces)}")
+
+    if print_distribution and neighborhood_depth > 0:
+        print("  邻域面片距离分布（距离0=种子面片）:")
+        max_display = min(neighborhood_depth, 20)  # 最多显示到20层
+        prev_set = set(seed_faces)
+        print(f"    距离 0: {len(prev_set)}")
+        for d in range(1, max_display + 1):
+            cur_set = expand_face_neighborhood(mesh, seed_faces, d + 1)
+            new_count = len(cur_set - prev_set)
+            print(f"    距离 {d}: {new_count}")
+            prev_set = cur_set
+
+
+def visualize_boundary_component(mesh, args):
+    """
+    可视化健康孔洞或未覆盖开放边分量及其局部三角面片。
+    默认不显示整个网格，只显示目标边界和指定邻域深度内的面片。
+    """
+    # 自动查找与输入 PLY 同名的组件包 JSON
+    if not args.component_package:
+        candidate = Path(args.input_file).with_suffix('.json')
+        if candidate.exists():
+            args.component_package = str(candidate)
+            print(f"自动找到组件包: {candidate}")
+
+    boundary_id = args.boundary_id
+
+    if args.component_package:
+        package_path = Path(args.component_package)
+        if not package_path.exists():
+            raise FileNotFoundError(f"未找到组件包文件: {package_path}")
+
+        with open(package_path, "r", encoding="utf-8") as f:
+            package_data = json.load(f)
+
+        comp = package_data.get("component", {})
+        effective_boundary_type = package_data.get("boundary_type", args.boundary_type)
+        boundary_id = package_data.get("boundary_id", args.boundary_id)
+
+        # 确保必要字段存在
+        comp.setdefault("edge_vertex_pairs", [])
+        comp.setdefault("vertices", [])
+        comp.setdefault("face_ids", [])
+        comp.setdefault("endpoints", [])
+        comp.setdefault("branch_vertices", [])
+        comp.setdefault("candidate_breaks", [])
+        comp.setdefault("healthy_hole_vertex_indices", [])
+    else:
+        comp = load_boundary_component_data(
+            args.boundary_data_dir,
+            args.boundary_id,
+            args.boundary_type,
+        )
+        effective_boundary_type = args.boundary_type
+
+    # 打印组件诊断信息
+    _print_boundary_component_diagnostics(
+        mesh, comp, effective_boundary_type, boundary_id,
+        args.boundary_neighborhood_depth,
+        print_distribution=args.print_neighborhood_distribution
+    )
+
+    # 优先使用当前边集导出的顶点，避免 hole_diagnosis.json 中旧索引/异常索引
+    focus_indices = comp.get("vertices")
+
+    if not focus_indices:
+        focus_indices = comp.get("healthy_hole_vertex_indices", [])
+
+    if not focus_indices:
+        focus_indices = comp.get("endpoints", [])
+
+    # 核心取景点集：优先为健康孔洞边界顶点，其次组件顶点/端点
+    boundary_camera_points = []
+    seifert_camera_points = []
+
+    if focus_indices:
+        focus_points = mesh.vertices[np.asarray(focus_indices, dtype=np.int64)]
+        boundary_camera_points = focus_points.copy()
+
+    scene = trimesh.Scene()
+
+    # 可选：显示半透明原始网格
+    if args.boundary_show_original:
+        vis_mesh = mesh.copy()
+        # 赋予统一半透明颜色（确保存在 face_colors）
+        alpha_uint8 = int(0.3 * 255)
+        vis_mesh.visual.face_colors = np.full(
+            (len(vis_mesh.faces), 4),
+            [200, 200, 200, alpha_uint8],
+            dtype=np.uint8,
+        )
+        # 双面显示原始网格背景
+        if args.double_sided:
+            vis_mesh = make_double_sided(vis_mesh)
+        scene.add_geometry(vis_mesh)
+
+    # 根据邻域深度显示相关三角面片
+    if args.boundary_neighborhood_depth > 0:
+        face_ids = comp.get("face_ids", [])
+        if face_ids:
+            expanded_faces = expand_face_neighborhood(
+                mesh, face_ids, args.boundary_neighborhood_depth
+            )
+            if expanded_faces:
+                sub = mesh.submesh(
+                    [np.array(list(expanded_faces), dtype=np.int64)]
+                )[0]
+
+                if effective_boundary_type == "uncovered":
+                    sub.visual.face_colors = [255, 165, 0, 255]  # 橙色
+                else:
+                    sub.visual.face_colors = [144, 238, 144, 255]  # 浅绿
+
+                # 双面显示相关三角面片
+                if args.double_sided:
+                    sub = make_double_sided(sub)
+
+                scene.add_geometry(sub)
+
+    # 计算默认圆柱半径
+    radius = args.boundary_radius
+    if radius is None or radius <= 0:
+        bounds = mesh.bounds
+        diag = np.linalg.norm(bounds[1] - bounds[0])
+        radius = max(diag * 0.0005, 1e-6)
+
+    # 绘制边界边
+    if effective_boundary_type == "uncovered":
+        edge_color = [0, 128, 255, 255]   # 蓝色
+    else:
+        edge_color = [0, 255, 255, 255]   # 青色
+
+    for v0, v1 in comp["edge_vertex_pairs"]:
+        seg = trimesh.creation.cylinder(
+            radius=radius,
+            segment=[mesh.vertices[v0], mesh.vertices[v1]],
+            sections=4,
+        )
+        seg.visual.face_colors = edge_color
+        scene.add_geometry(seg)
+
+    # 绘制最小包络流形边界（若存在）
+    enclosing = comp.get("minimal_enclosing_boundary", {})
+    if enclosing.get("success"):
+        enclosing_vertices = enclosing.get("boundary_vertices", [])
+        enclosing_radius = radius * 1.5   # 稍粗，更醒目
+
+        for loop_verts in enclosing_vertices:
+            for i in range(len(loop_verts) - 1):
+                v0 = loop_verts[i]
+                v1 = loop_verts[i + 1]
+                seg = trimesh.creation.cylinder(
+                    radius=enclosing_radius,
+                    segment=[mesh.vertices[v0], mesh.vertices[v1]],
+                    sections=6,
+                )
+                seg.visual.face_colors = [255, 0, 255, 255]  # 洋红色
+                scene.add_geometry(seg)
+
+    # 拟合水密包络曲面并显示交线
+    if args.fit_watertight_patch:
+        print("拟合水密包络曲面...")
+        patch_result = fit_watertight_patch_from_component(
+            mesh,
+            comp,
+            method=args.patch_method,
+            neighborhood_depth=args.patch_neighborhood_depth,
+            poisson_depth=args.patch_poisson_depth,
+            density_quantile=args.patch_density_quantile,
+            alpha=args.patch_alpha,
+            allow_non_genus0=args.allow_non_genus0,
+        )
+        if patch_result["success"]:
+            watertight_mesh = patch_result["watertight_mesh"]
+            intersection_vertices = patch_result["intersection_vertices"]
+            intersection_edges = patch_result["intersection_edges"]
+
+            # 显示拟合曲面（半透明青色）
+            alpha = int(np.clip(args.patch_opacity, 0.0, 1.0) * 255)
+            watertight_mesh.visual.face_colors = np.full(
+                (len(watertight_mesh.faces), 4),
+                [0, 200, 200, alpha],
+                dtype=np.uint8,
+            )
+            if args.double_sided:
+                watertight_mesh = make_double_sided(watertight_mesh)
+            scene.add_geometry(watertight_mesh)
+
+            # 显示交线（洋红色圆柱）
+            for edge in intersection_edges:
+                p0 = intersection_vertices[edge[0]]
+                p1 = intersection_vertices[edge[1]]
+                seg = trimesh.creation.cylinder(
+                    radius=radius * 1.2,
+                    segment=[p0, p1],
+                    sections=5,
+                )
+                seg.visual.face_colors = [255, 0, 255, 255]
+                scene.add_geometry(seg)
+
+            print(f"  拟合成功：交线 {len(intersection_vertices)} 个顶点，"
+                  f"{len(intersection_edges)} 条边")
+        else:
+            print(f"  [WARN] 水密包络拟合失败: {patch_result['message']}")
+
+    # 端点（绿色球）
+    for v in comp.get("endpoints", []):
+        sphere = trimesh.creation.icosphere(subdivisions=1, radius=radius * 2.0)
+        sphere.apply_translation(mesh.vertices[v])
+        sphere.visual.face_colors = [0, 255, 0, 255]
+        scene.add_geometry(sphere)
+
+    # 分支点（红色球）
+    for v in comp.get("branch_vertices", []):
+        sphere = trimesh.creation.icosphere(subdivisions=1, radius=radius * 2.0)
+        sphere.apply_translation(mesh.vertices[v])
+        sphere.visual.face_colors = [255, 0, 0, 255]
+        scene.add_geometry(sphere)
+
+    # 候选断裂点对（橙色虚线，用细圆柱表示）
+    for cand in comp.get("candidate_breaks", []):
+        p0 = mesh.vertices[cand["v0"]]
+        p1 = mesh.vertices[cand["v1"]]
+        seg = trimesh.creation.cylinder(
+            radius=radius * 0.8,
+            segment=[p0, p1],
+            sections=4,
+        )
+        seg.visual.face_colors = [255, 165, 0, 255]
+        scene.add_geometry(seg)
+
+    # Seifert 曲面
+    if getattr(args, 'generate_seifert_surface', False):
+        if effective_boundary_type != "healthy":
+            print("  警告: --generate-seifert-surface 仅适用于 healthy 孔洞")
+        else:
+            loop = comp.get("healthy_hole_vertex_indices")
+            if not loop:
+                # 从 edge_vertex_pairs 恢复环
+                edge_pairs = comp.get("edge_vertex_pairs", [])
+                if edge_pairs:
+                    import warnings
+                    # 简化恢复：取所有边的顶点并排序？但这里直接用边构建邻接并遍历
+                    # 可以省略，因为健康孔洞 JSON 中应已有 vertex_indices
+                    print("  [WARN] 未找到 healthy_hole_vertex_indices")
+                else:
+                    print("  [WARN] 未找到任何边界信息")
+                loop = []
+            if loop and len(loop) >= 3:
+                print("生成 Seifert 曲面...")
+                seifert_result = generate_seifert_surface(
+                    mesh,
+                    loop,
+                    optimize_iterations=args.seifert_optimize_iterations,
+                    step_size=args.seifert_step_size,
+                    tol=args.seifert_tolerance,
+                    verbose=True,
+                )
+                if not seifert_result["success"]:
+                    print(f"  [WARN] {seifert_result['message']}")
+                else:
+                    seifert_mesh = seifert_result["mesh"]
+                    boundary_indices = seifert_result["boundary_indices"]
+
+                    # 仅将 Seifert 顶点用于扩大取景半径，不参与相机中心计算
+                    seifert_camera_points = np.asarray(
+                        seifert_mesh.vertices, dtype=np.float64
+                    ).copy()
+
+                    # 局部填充分析
+                    fill_stats = compute_seifert_fill_stats(
+                        mesh,
+                        comp,
+                        seifert_mesh,
+                        loop,
+                        boundary_indices,
+                    )
+                    print_seifert_fill_stats(fill_stats)
+
+                    color = np.array(args.seifert_color, dtype=np.uint8)
+                    seifert_mesh.visual.face_colors = np.tile(
+                        color, (len(seifert_mesh.faces), 1)
+                    )
+                    if args.double_sided:
+                        seifert_mesh = make_double_sided(seifert_mesh)
+                    scene.add_geometry(seifert_mesh)
+                    print(f"  Seifert 曲面已生成: {len(seifert_mesh.faces)} 个三角面片")
+                    if args.seifert_curvature_report:
+                        stats = compute_seifert_curvature_stats(
+                            seifert_mesh, boundary_indices
+                        )
+                        print("  Seifert 曲面曲率统计:")
+                        for k, v in stats.items():
+                            print(f"    {k}: {v:.6f}")
+            else:
+                print("  [WARN] 未找到有效的健康孔洞边界环")
+
+    if getattr(args, "debug_scene", False):
+        print_scene_debug_info(scene, title="Boundary Component Scene Debug Info")
+
+    if args.output:
+        scene.export(args.output)
+        print(
+            f"边界组件 {boundary_id} 可视化已保存至: {args.output}"
+        )
+
+    camera_center = None
+    if args.show:
+        show_scene = scene
+
+        if len(boundary_camera_points) > 0:
+            try:
+                boundary_pts = np.asarray(boundary_camera_points, dtype=np.float64)
+                camera_center = boundary_pts.mean(axis=0)
+
+                # 将孔洞中心平移到原点，让 viewer 的默认旋转中心固定为原点
+                show_scene = scene.copy()
+                show_scene.apply_translation(-camera_center)
+
+                if getattr(args, "debug_scene", False):
+                    print("  [camera] translated scene center:",
+                          f"({camera_center[0]:.6f}, {camera_center[1]:.6f}, {camera_center[2]:.6f})")
+                    print("  [camera] using origin-centered scene for viewer")
+
+            except Exception as e:
+                print(f"[WARN] 场景中心平移失败: {e}")
+
+        os.environ['TRIMESH_DEFAULT_VIEWER'] = 'vedo'
+        _show_scene_with_camera_info(
+            show_scene,
+            args,
+            scene_translation=(-camera_center if camera_center is not None else None),
         )
