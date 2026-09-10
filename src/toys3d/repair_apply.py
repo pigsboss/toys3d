@@ -167,7 +167,8 @@ def main():
         faces=combined_faces,
         process=True,
     )
-    result.remove_duplicate_faces()
+    # trimesh 没有 remove_duplicate_faces，使用 unique_faces + update_faces
+    result.update_faces(result.unique_faces())
     result.remove_unreferenced_vertices()
     result.export(args.output_mesh)
     print(f"\n应用补丁后的网格已保存: {args.output_mesh}")
