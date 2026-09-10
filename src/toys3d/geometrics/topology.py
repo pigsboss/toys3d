@@ -954,18 +954,25 @@ def _extract_boundary_loops_from_edge_keys(mesh, edge_keys):
     return loops
 
 
-def _expand_face_neighborhood_geometrics(mesh, seed_faces, depth):
+def _expand_face_neighborhood_geometrics(mesh, seed_faces, depth, adjacency=None):
     if depth <= 0:
         return set()
     seed_faces = set(map(int, seed_faces))
     if depth == 1:
         return seed_faces.copy()
 
-    n_faces = len(mesh.faces)
-    adjacency = [[] for _ in range(n_faces)]
-    for f0, f1 in mesh.face_adjacency:
-        adjacency[int(f0)].append(int(f1))
-        adjacency[int(f1)].append(int(f0))
+    if adjacency is None:
+        n_faces = len(mesh.faces)
+        adjacency = [[] for _ in range(n_faces)]
+        face_adj = mesh.face_adjacency
+        if face_adj is not None and len(face_adj) > 0:
+            for f0, f1 in face_adj:
+                f0 = int(f0)
+                f1 = int(f1)
+                if f0 < 0 or f1 < 0:
+                    continue
+                adjacency[f0].append(f1)
+                adjacency[f1].append(f0)
 
     current = list(seed_faces)
     visited = set(seed_faces)
@@ -983,11 +990,32 @@ def _expand_face_neighborhood_geometrics(mesh, seed_faces, depth):
     return visited
 
 
-def expand_face_neighborhood(mesh, seed_faces, depth):
+def build_face_adjacency_list(mesh):
     """
-    公开的邻域扩展接口，内部调用已有私有实现。
+    预计算面片邻接表（list of lists），可作为 _expand_face_neighborhood_geometrics
+    或 expand_face_neighborhood 的预计算输入，避免批量提取时重复构建。
     """
-    return _expand_face_neighborhood_geometrics(mesh, seed_faces, depth)
+    n_faces = len(mesh.faces)
+    adjacency = [[] for _ in range(n_faces)]
+    face_adj = mesh.face_adjacency
+    if face_adj is not None and len(face_adj) > 0:
+        for f0, f1 in face_adj:
+            f0 = int(f0)
+            f1 = int(f1)
+            if f0 < 0 or f1 < 0:
+                continue
+            adjacency[f0].append(f1)
+            adjacency[f1].append(f0)
+    return adjacency
+
+
+def expand_face_neighborhood(mesh, seed_faces, depth, adjacency=None):
+    """
+    公开的邻域扩展接口；adjacency 可选，用于复用预计算的面片邻接表。
+    """
+    return _expand_face_neighborhood_geometrics(
+        mesh, seed_faces, depth, adjacency=adjacency
+    )
 
 
 def compute_face_distances(mesh, source_mask):

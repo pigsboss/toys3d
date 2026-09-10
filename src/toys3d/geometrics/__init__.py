@@ -45,6 +45,7 @@ from .topology import (
     build_manifold_face_adjacency,
     is_manifold_closed_boundary,
     expand_face_neighborhood,
+    build_face_adjacency_list,
     compute_face_distances,
     reconstruct_loop_from_edges,
 )

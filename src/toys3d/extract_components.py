@@ -26,8 +26,8 @@ _src_parent = os.path.dirname(_project_root)
 if _src_parent not in sys.path:
     sys.path.insert(0, _src_parent)
 
-from toys3d.geometrics import export_component_package
-from toys3d.reporting import load_boundary_component_data
+from toys3d.geometrics import export_component_package, build_face_adjacency_list
+from toys3d.reporting import load_boundary_component_data, DiagnosisBundle
 
 
 def load_mesh(input_file):
@@ -38,29 +38,15 @@ def load_mesh(input_file):
     return mesh
 
 
-def _enumerate_component_ids(diag_dir, boundary_type):
+def _enumerate_component_ids(bundle, boundary_type):
     """
     仅枚举诊断目录中可用的组件 ID 列表。
     真正的组件数据由 load_boundary_component_data 提供。
     """
-    diag_dir = Path(diag_dir)
-
     if boundary_type == "healthy":
-        diag_json = diag_dir / "hole_diagnosis.json"
-        if not diag_json.exists():
-            raise FileNotFoundError(f"缺少诊断文件: {diag_json}")
-        with open(diag_json, "r", encoding="utf-8") as f:
-            diagnosis = json.load(f)
-        return [int(h["hole_id"]) for h in diagnosis.get("healthy_holes", [])]
-
+        return [int(h["hole_id"]) for h in bundle.diag_json.get("healthy_holes", [])]
     elif boundary_type == "uncovered":
-        comp_json = diag_dir / "uncovered_component_analysis.json"
-        if not comp_json.exists():
-            raise FileNotFoundError(f"缺少未覆盖分量分析文件: {comp_json}")
-        with open(comp_json, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return [int(c["component_id"]) for c in data.get("components", [])]
-
+        return [int(c["component_id"]) for c in bundle.comp_json.get("components", [])]
     else:
         raise ValueError(f"未知的 boundary_type: {boundary_type}")
 
@@ -68,12 +54,13 @@ def _enumerate_component_ids(diag_dir, boundary_type):
 def extract_component_by_id(
     mesh,
     input_file,
-    diag_dir,
+    bundle,
     boundary_type,
     boundary_id,
     neighborhood_depth,
     output_dir,
     overwrite,
+    adjacency=None,
 ):
     """
     提取单个组件，保存 PLY 和 JSON。
@@ -81,9 +68,10 @@ def extract_component_by_id(
     """
     try:
         comp = load_boundary_component_data(
-            str(diag_dir),
+            bundle.data_dir,
             boundary_id,
             boundary_type,
+            bundle=bundle,
         )
     except Exception as e:
         return False, 0, 0, f"加载组件失败: {e}"
@@ -104,6 +92,7 @@ def extract_component_by_id(
         json_path=json_path,
         source_file=source_file,
         overwrite=overwrite,
+        adjacency=adjacency,
     )
 
     if not result['success']:
@@ -171,10 +160,9 @@ def main():
     print(f"Hey! Loading {args.input_file}")
     mesh = load_mesh(args.input_file)
 
-    # 仅枚举组件 ID；实际提取走 load_boundary_component_data，
-    # 保证与 meshinspect.py --extract-component-package 完全一致。
     try:
-        ids = _enumerate_component_ids(args.hole_diagnosis_dir, args.boundary_type)
+        bundle = DiagnosisBundle(args.hole_diagnosis_dir)
+        ids = _enumerate_component_ids(bundle, args.boundary_type)
     except Exception as e:
         print(f"[ERROR] 枚举组件 ID 失败: {e}")
         return
@@ -192,6 +180,9 @@ def main():
     if args.max_components is not None:
         ids = ids[: args.max_components]
 
+    print("预计算面片邻接表...")
+    adjacency = build_face_adjacency_list(mesh)
+
     success_count = 0
     fail_count = 0
 
@@ -199,12 +190,13 @@ def main():
         success, face_cnt, vert_cnt, msg = extract_component_by_id(
             mesh,
             args.input_file,
-            args.hole_diagnosis_dir,
+            bundle,
             args.boundary_type,
             boundary_id,
             args.boundary_neighborhood_depth,
             output_dir,
             args.overwrite,
+            adjacency=adjacency,
         )
         if success:
             success_count += 1

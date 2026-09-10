@@ -16,6 +16,47 @@ from matplotlib.lines import Line2D
 from .geometrics import hex_to_code
 
 
+class DiagnosisBundle:
+    """
+    诊断目录中的数据缓存，避免批量提取时重复打开文件。
+    """
+
+    def __init__(self, data_dir):
+        self.data_dir = Path(data_dir)
+        self._npz = None
+        self._diag_json = None
+        self._comp_json = None
+
+    @property
+    def npz(self):
+        if self._npz is None:
+            path = self.data_dir / "hole_diagnosis_data.npz"
+            if not path.exists():
+                raise FileNotFoundError(f"未找到 {path}")
+            self._npz = np.load(path)
+        return self._npz
+
+    @property
+    def diag_json(self):
+        if self._diag_json is None:
+            path = self.data_dir / "hole_diagnosis.json"
+            if not path.exists():
+                raise FileNotFoundError(f"未找到 {path}")
+            with open(path, "r") as f:
+                self._diag_json = json.load(f)
+        return self._diag_json
+
+    @property
+    def comp_json(self):
+        if self._comp_json is None:
+            path = self.data_dir / "uncovered_component_analysis.json"
+            if not path.exists():
+                raise FileNotFoundError(f"未找到 {path}")
+            with open(path, "r") as f:
+                self._comp_json = json.load(f)
+        return self._comp_json
+
+
 def load_uncovered_edge_data(data_dir):
     """
     从 hole diagnosis 输出目录加载未覆盖开放边数据。
@@ -32,18 +73,19 @@ def load_uncovered_edge_data(data_dir):
     return uncovered_ids, all_vertex_pairs, categories
 
 
-def load_boundary_component_data(data_dir, boundary_id, boundary_type="uncovered"):
+def load_boundary_component_data(data_dir, boundary_id, boundary_type="uncovered",
+                                  bundle=None):
     """
     从 hole diagnosis 输出目录加载指定边界组件或健康孔洞的数据。
+
+    bundle 可选：传入 DiagnosisBundle 实例可复用已加载的 NPZ 与 JSON，
+    避免批量提取时反复读取文件。
     """
-    data_dir = Path(data_dir)
+    if bundle is None:
+        bundle = DiagnosisBundle(data_dir)
 
     if boundary_type == "uncovered":
-        component_json = data_dir / "uncovered_component_analysis.json"
-        if not component_json.exists():
-            raise FileNotFoundError(f"未找到 {component_json}")
-        with open(component_json, "r") as f:
-            comp_data = json.load(f)
+        comp_data = bundle.comp_json
         components = comp_data.get("components", [])
         if boundary_id < 0 or boundary_id >= len(components):
             raise ValueError(
@@ -56,14 +98,8 @@ def load_boundary_component_data(data_dir, boundary_id, boundary_type="uncovered
         return comp
 
     elif boundary_type == "healthy":
-        npz_path = data_dir / "hole_diagnosis_data.npz"
-        json_path = data_dir / "hole_diagnosis.json"
-        if not npz_path.exists() or not json_path.exists():
-            raise FileNotFoundError(f"未找到 {npz_path} 或 {json_path}")
-
-        npz = np.load(npz_path)
-        with open(json_path, "r") as f:
-            diag_json = json.load(f)
+        npz = bundle.npz
+        diag_json = bundle.diag_json
 
         healthy_holes = diag_json.get("healthy_holes", [])
         if boundary_id < 0 or boundary_id >= len(healthy_holes):

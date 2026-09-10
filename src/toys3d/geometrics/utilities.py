@@ -201,6 +201,7 @@ def export_component_package(
     json_path,
     source_file=None,
     overwrite=True,
+    adjacency=None,
 ):
     """
     将指定组件（健康孔洞或未覆盖开放边连通分量）提取为局部网格，
@@ -228,6 +229,8 @@ def export_component_package(
         记录在 JSON 中的源文件路径；``None`` 时写入空字符串。
     overwrite : bool
         为 ``False`` 时，如果任一输出文件已存在，则跳过并返回 ``success=False``。
+    adjacency : list[list[int]] | None
+        预计算的面片邻接表；传入可避免重复构建。
 
     Returns
     -------
@@ -270,7 +273,7 @@ def export_component_package(
         return _fail("组件没有种子面片")
 
     expanded = _expand_face_neighborhood_geometrics(
-        mesh, seed_faces, neighborhood_depth
+        mesh, seed_faces, neighborhood_depth, adjacency=adjacency
     )
     if not expanded:
         expanded = seed_faces
@@ -386,13 +389,13 @@ def export_component_package(
     }
 
 
-def extract_component_submesh(mesh, component, neighborhood_depth=1):
+def extract_component_submesh(mesh, component, neighborhood_depth=1, adjacency=None):
     seed_faces = set(map(int, component.get('face_ids', [])))
     if not seed_faces:
         return None, None, None, None
 
     expanded = _expand_face_neighborhood_geometrics(
-        mesh, seed_faces, neighborhood_depth
+        mesh, seed_faces, neighborhood_depth, adjacency=adjacency
     )
     if not expanded:
         expanded = seed_faces
