@@ -27,6 +27,7 @@ if _src_parent not in sys.path:
     sys.path.insert(0, _src_parent)
 
 from toys3d.geometrics import expand_face_neighborhood
+from toys3d.geometrics import export_component_package
 
 
 def load_mesh(input_file):
@@ -92,6 +93,40 @@ def load_uncovered_components(diag_dir):
     return components
 
 
+def _enumerate_components(diag_dir, boundary_type):
+    """
+    枚举诊断目录中的组件，仅用于提供 boundary_id 列表和提取所需的原始组件数据。
+    返回 (component_id, component_dict) 列表。
+    """
+    if boundary_type == "healthy":
+        raw_components = load_healthy_holes(diag_dir)
+        enumerated = []
+        for hole in raw_components:
+            comp = dict(hole)
+            comp["component_id"] = int(hole["hole_id"])
+            comp.setdefault("face_ids", [])
+            comp.setdefault("vertices", [])
+            comp.setdefault("edge_vertex_pairs", [])
+            comp.setdefault("endpoints", [])
+            comp.setdefault("branch_vertices", [])
+            comp.setdefault("candidate_breaks", [])
+            comp.setdefault("healthy_hole_vertex_indices", [])
+            enumerated.append(comp)
+        return enumerated
+
+    elif boundary_type == "uncovered":
+        raw_components = load_uncovered_components(diag_dir)
+        enumerated = []
+        for comp in raw_components:
+            c = dict(comp)
+            c.setdefault("healthy_hole_vertex_indices", [])
+            enumerated.append(c)
+        return enumerated
+
+    else:
+        raise ValueError(f"未知的 boundary_type: {boundary_type}")
+
+
 def extract_component_by_id(
     mesh,
     comp_original,
@@ -103,124 +138,39 @@ def extract_component_by_id(
 ):
     """
     提取单个组件，保存 PLY 和 JSON。
-    返回 (success: bool, local_face_count: int, local_vertex_count: int, message: str)
+    返回 (success: bool, face_count: int, vertex_count: int, message: str)
     """
-    seed_faces = comp_original.get("face_ids", [])
-    if not seed_faces:
-        return False, 0, 0, "组件没有种子面片"
-
-    # 扩展到指定深度
-    expanded = expand_face_neighborhood(mesh, seed_faces, neighborhood_depth)
-    if not expanded:
-        return False, 0, 0, "扩展后无面片"
-
-    faces_idx = np.array(sorted(expanded), dtype=np.int64)
-    original_faces = np.asarray(mesh.faces, dtype=np.int64)[faces_idx]
-
-    # 局部顶点重映射
-    unique_old_vertices = np.unique(original_faces.ravel())
-    old_to_new = {
-        int(old_v): int(new_v)
-        for new_v, old_v in enumerate(unique_old_vertices)
-    }
-
-    local_vertices = mesh.vertices[unique_old_vertices]
-    local_faces = np.array(
-        [
-            [old_to_new[int(v)] for v in face]
-            for face in original_faces
-        ],
-        dtype=np.int64,
-    )
-
-    local_mesh = trimesh.Trimesh(
-        vertices=local_vertices,
-        faces=local_faces,
-        process=False,
-    )
-
-    # 重映射组件数据
-    comp_new = comp_original.copy()
-
-    # 面片索引映射
-    face_idx_to_local = {
-        int(old_fid): int(local_fid)
-        for local_fid, old_fid in enumerate(faces_idx)
-    }
-    comp_new["face_ids"] = [
-        face_idx_to_local[int(f)]
-        for f in comp_original.get("face_ids", [])
-        if int(f) in face_idx_to_local
-    ]
-
-    def remap_v(v):
-        return old_to_new.get(int(v), -1)
-
-    comp_new["vertices"] = [
-        remap_v(v)
-        for v in comp_original.get("vertices", [])
-        if remap_v(v) >= 0
-    ]
-
-    comp_new["edge_vertex_pairs"] = [
-        [remap_v(v0), remap_v(v1)]
-        for v0, v1 in comp_original.get("edge_vertex_pairs", [])
-        if remap_v(v0) >= 0 and remap_v(v1) >= 0
-    ]
-
-    comp_new["endpoints"] = [
-        remap_v(v)
-        for v in comp_original.get("endpoints", [])
-        if remap_v(v) >= 0
-    ]
-
-    comp_new["branch_vertices"] = [
-        remap_v(v)
-        for v in comp_original.get("branch_vertices", [])
-        if remap_v(v) >= 0
-    ]
-
-    comp_new["candidate_breaks"] = [
-        {
-            "v0": remap_v(c.get("v0", -1)),
-            "v1": remap_v(c.get("v1", -1)),
-            "distance": float(c.get("distance", 0.0)),
-        }
-        for c in comp_original.get("candidate_breaks", [])
-        if remap_v(c.get("v0", -1)) >= 0 and remap_v(c.get("v1", -1)) >= 0
-    ]
-
-    if "healthy_hole_vertex_indices" in comp_original:
-        comp_new["healthy_hole_vertex_indices"] = [
-            remap_v(v)
-            for v in comp_original.get("healthy_hole_vertex_indices", [])
-            if remap_v(v) >= 0
-        ]
-
-    # 输出路径
     stem = f"{boundary_type}_{boundary_id}_depth{neighborhood_depth}"
-    ply_path = output_dir / f"{stem}.ply"
-    json_path = output_dir / f"{stem}.json"
+    ply_path = Path(output_dir) / f"{stem}.ply"
+    json_path = Path(output_dir) / f"{stem}.json"
 
-    if not overwrite and (ply_path.exists() or json_path.exists()):
-        return False, 0, 0, f"输出文件已存在（{stem}）"
+    source_file = ""
+    try:
+        source_file = mesh.metadata.get("file_name", "") or ""
+    except Exception:
+        source_file = ""
 
-    local_mesh.export(ply_path)
+    result = export_component_package(
+        mesh,
+        comp_original,
+        boundary_type=boundary_type,
+        boundary_id=boundary_id,
+        neighborhood_depth=neighborhood_depth,
+        ply_path=ply_path,
+        json_path=json_path,
+        source_file=source_file,
+        overwrite=overwrite,
+    )
 
-    package_data = {
-        "source_file": str(mesh.metadata.get("file_name", "")),
-        "boundary_type": boundary_type,
-        "boundary_id": boundary_id,
-        "neighborhood_depth": neighborhood_depth,
-        "local_vertex_count": int(len(local_vertices)),
-        "local_face_count": int(len(local_faces)),
-        "component": comp_new,
-    }
+    if not result['success']:
+        return False, 0, 0, result['message']
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(package_data, f, indent=2, ensure_ascii=False)
-
-    return True, len(local_faces), len(local_vertices), ""
+    return (
+        True,
+        result['local_face_count'],
+        result['local_vertex_count'],
+        "",
+    )
 
 
 def main():
@@ -277,24 +227,9 @@ def main():
     print(f"Hey! Loading {args.input_file}")
     mesh = load_mesh(args.input_file)
 
-    # 根据类型加载组件
-    if args.boundary_type == "healthy":
-        components = load_healthy_holes(args.hole_diagnosis_dir)
-        # 为健康孔洞添加 component_id 等字段（hole_id 作为 component_id）
-        for hole in components:
-            hole["component_id"] = hole["hole_id"]
-            hole["edge_vertex_pairs"] = []  # 健康孔洞暂时没有直接边对，后续可补
-            hole["endpoints"] = []
-            hole["branch_vertices"] = []
-            hole["candidate_breaks"] = []
-            # 加载网格时未合并顶点，全局顶点索引可能失效，这里不写入旧索引
-            hole["vertices"] = []
-            hole["healthy_hole_vertex_indices"] = []
-    else:
-        components = load_uncovered_components(args.hole_diagnosis_dir)
-        # 未覆盖组件中已经有 component_id、face_ids 等
-        for comp in components:
-            comp.setdefault("healthy_hole_vertex_indices", [])
+    # 枚举组件（作为 boundary_id 的来源；实际提取仍走共享的
+    # export_component_package，以保证与 meshinspect.py 行为一致）
+    components = _enumerate_components(args.hole_diagnosis_dir, args.boundary_type)
 
     if not components:
         print("没有找到任何组件。")

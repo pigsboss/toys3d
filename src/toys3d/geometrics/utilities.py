@@ -2,6 +2,9 @@
 """
 综合几何工具：孔洞统计、修复、点云拟合等。
 """
+import json
+from pathlib import Path
+
 import numpy as np
 import trimesh
 from scipy.sparse import csr_matrix
@@ -185,6 +188,202 @@ def trim_isolated_faces(mesh, verbose=False):
         m.remove_unreferenced_vertices()
 
     return m
+
+
+def export_component_package(
+    mesh,
+    component,
+    *,
+    boundary_type,
+    boundary_id,
+    neighborhood_depth,
+    ply_path,
+    json_path,
+    source_file=None,
+    overwrite=True,
+):
+    """
+    将指定组件（健康孔洞或未覆盖开放边连通分量）提取为局部网格，
+    并保存为 PLY + JSON 组件包。
+
+    Parameters
+    ----------
+    mesh : trimesh.Trimesh
+        全局网格。
+    component : dict
+        组件信息字典，至少包含 ``face_ids``；其他字段（``vertices``、
+        ``edge_vertex_pairs``、``endpoints``、``branch_vertices``、
+        ``candidate_breaks`` 等）会按局部顶点索引做重映射。
+    boundary_type : str
+        写入 JSON 的 ``boundary_type`` 字段（例如 ``"healthy"`` / ``"uncovered"``）。
+    boundary_id : int
+        写入 JSON 的 ``boundary_id`` 字段。
+    neighborhood_depth : int
+        邻域扩展深度（0 表示仅种子面片）。
+    ply_path : str | Path
+        局部网格 PLY 输出路径。
+    json_path : str | Path
+        组件包 JSON 输出路径。
+    source_file : str | None
+        记录在 JSON 中的源文件路径；``None`` 时写入空字符串。
+    overwrite : bool
+        为 ``False`` 时，如果任一输出文件已存在，则跳过并返回 ``success=False``。
+
+    Returns
+    -------
+    dict
+        结果字典，字段包括：
+
+        - ``success`` (bool)
+        - ``message`` (str)
+        - ``local_mesh`` (trimesh.Trimesh | None)
+        - ``local_face_count`` (int)
+        - ``local_vertex_count`` (int)
+        - ``faces_idx`` (np.ndarray | None)
+        - ``old_to_new`` (dict | None)
+        - ``comp_new`` (dict | None)
+        - ``ply_path`` (Path | None)
+        - ``json_path`` (Path | None)
+    """
+    ply_path = Path(ply_path)
+    json_path = Path(json_path)
+
+    def _fail(msg):
+        return {
+            'success': False,
+            'message': msg,
+            'local_mesh': None,
+            'local_face_count': 0,
+            'local_vertex_count': 0,
+            'faces_idx': None,
+            'old_to_new': None,
+            'comp_new': None,
+            'ply_path': None,
+            'json_path': None,
+        }
+
+    if not overwrite and (ply_path.exists() or json_path.exists()):
+        return _fail(f"输出文件已存在（{ply_path.name} / {json_path.name}）")
+
+    seed_faces = set(map(int, component.get('face_ids', [])))
+    if not seed_faces:
+        return _fail("组件没有种子面片")
+
+    expanded = _expand_face_neighborhood_geometrics(
+        mesh, seed_faces, neighborhood_depth
+    )
+    if not expanded:
+        expanded = seed_faces
+    if not expanded:
+        return _fail("扩展后无面片")
+
+    faces_idx = np.asarray(sorted(expanded), dtype=np.int64)
+    original_faces = np.asarray(mesh.faces, dtype=np.int64)[faces_idx]
+
+    unique_old_vertices = np.unique(original_faces.ravel())
+    old_to_new = {
+        int(old_v): int(new_v)
+        for new_v, old_v in enumerate(unique_old_vertices)
+    }
+
+    local_vertices = mesh.vertices[unique_old_vertices]
+    local_faces = np.asarray(
+        [[old_to_new[int(v)] for v in face] for face in original_faces],
+        dtype=np.int64,
+    )
+
+    local_mesh = trimesh.Trimesh(
+        vertices=local_vertices,
+        faces=local_faces,
+        process=False,
+    )
+
+    face_idx_to_local = {
+        int(old_fid): int(local_fid)
+        for local_fid, old_fid in enumerate(faces_idx)
+    }
+
+    comp_new = component.copy()
+    comp_new["face_ids"] = [
+        face_idx_to_local[int(f)]
+        for f in comp_new.get("face_ids", [])
+        if int(f) in face_idx_to_local
+    ]
+
+    def remap_v(v):
+        return old_to_new.get(int(v), -1)
+
+    comp_new["vertices"] = [
+        remap_v(v)
+        for v in comp_new.get("vertices", [])
+        if remap_v(v) >= 0
+    ]
+
+    comp_new["edge_vertex_pairs"] = [
+        [remap_v(v0), remap_v(v1)]
+        for v0, v1 in comp_new.get("edge_vertex_pairs", [])
+        if remap_v(v0) >= 0 and remap_v(v1) >= 0
+    ]
+
+    comp_new["endpoints"] = [
+        remap_v(v)
+        for v in comp_new.get("endpoints", [])
+        if remap_v(v) >= 0
+    ]
+
+    comp_new["branch_vertices"] = [
+        remap_v(v)
+        for v in comp_new.get("branch_vertices", [])
+        if remap_v(v) >= 0
+    ]
+
+    comp_new["candidate_breaks"] = [
+        {
+            "v0": remap_v(c.get("v0", -1)),
+            "v1": remap_v(c.get("v1", -1)),
+            "distance": c.get("distance", 0.0),
+        }
+        for c in comp_new.get("candidate_breaks", [])
+        if remap_v(c.get("v0", -1)) >= 0 and remap_v(c.get("v1", -1)) >= 0
+    ]
+
+    if "healthy_hole_vertex_indices" in comp_new:
+        comp_new["healthy_hole_vertex_indices"] = [
+            remap_v(v)
+            for v in comp_new.get("healthy_hole_vertex_indices", [])
+            if remap_v(v) >= 0
+        ]
+
+    ply_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+
+    local_mesh.export(ply_path)
+
+    package_data = {
+        "source_file": str(source_file) if source_file is not None else "",
+        "boundary_type": boundary_type,
+        "boundary_id": boundary_id,
+        "neighborhood_depth": neighborhood_depth,
+        "local_vertex_count": int(len(local_vertices)),
+        "local_face_count": int(len(local_faces)),
+        "component": comp_new,
+    }
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(package_data, f, indent=2, ensure_ascii=False)
+
+    return {
+        'success': True,
+        'message': "",
+        'local_mesh': local_mesh,
+        'local_face_count': int(len(local_faces)),
+        'local_vertex_count': int(len(local_vertices)),
+        'faces_idx': faces_idx,
+        'old_to_new': old_to_new,
+        'comp_new': comp_new,
+        'ply_path': ply_path,
+        'json_path': json_path,
+    }
 
 
 def extract_component_submesh(mesh, component, neighborhood_depth=1):

@@ -92,5 +92,6 @@ from .utilities import (
     find_minimal_enclosing_manifold_boundary_greedy,
     extract_intersection_faces_by_vertex_state,
     extract_component_submesh,
+    export_component_package,
     segment_tubular_regions,
 )

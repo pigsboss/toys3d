@@ -65,6 +65,7 @@ from toys3d.geometrics import (
     point_in_polygon_2d,
     normalize,
     extract_component_submesh,
+    export_component_package,
 )
 
 from toys3d.reporting import (
@@ -283,19 +284,6 @@ def extract_component_package(mesh, args):
         print_distribution=args.print_neighborhood_distribution,
     )
 
-    local_mesh, _faces_idx, _old_to_new, comp_new = extract_component_submesh(
-        mesh,
-        comp,
-        neighborhood_depth=args.boundary_neighborhood_depth,
-    )
-
-    if local_mesh is None:
-        print("[ERROR] 没有可提取的面片")
-        return
-
-    local_vertices = local_mesh.vertices
-    local_faces = local_mesh.faces
-
     input_stem = Path(args.input_file).stem
     ply_path = Path(
         args.component_output
@@ -306,26 +294,27 @@ def extract_component_package(mesh, args):
         or f"{input_stem}_component_{args.boundary_id}.json"
     )
 
-    local_mesh.export(ply_path)
-    print(f"局部网格已保存: {ply_path}")
+    result = export_component_package(
+        mesh,
+        comp,
+        boundary_type=args.boundary_type,
+        boundary_id=args.boundary_id,
+        neighborhood_depth=args.boundary_neighborhood_depth,
+        ply_path=ply_path,
+        json_path=json_path,
+        source_file=str(Path(args.input_file).resolve()),
+        overwrite=True,
+    )
 
-    package_data = {
-        "source_file": str(Path(args.input_file).resolve()),
-        "boundary_type": args.boundary_type,
-        "boundary_id": args.boundary_id,
-        "neighborhood_depth": args.boundary_neighborhood_depth,
-        "local_vertex_count": int(len(local_vertices)),
-        "local_face_count": int(len(local_faces)),
-        "component": comp_new,
-    }
+    if not result['success']:
+        print(f"[ERROR] 组件提取失败：{result['message']}")
+        return
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(package_data, f, indent=2, ensure_ascii=False)
-    print(f"组件数据已保存: {json_path}")
-
+    print(f"局部网格已保存: {result['ply_path']}")
+    print(f"组件数据已保存: {result['json_path']}")
     print(
-        f"提取完成：局部面片数 {len(local_faces)}，"
-        f"局部顶点数 {len(local_vertices)}"
+        f"提取完成：局部面片数 {result['local_face_count']}，"
+        f"局部顶点数 {result['local_vertex_count']}"
     )
 
 
