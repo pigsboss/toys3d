@@ -369,6 +369,9 @@ def export_component_package(
         "neighborhood_depth": neighborhood_depth,
         "local_vertex_count": int(len(local_vertices)),
         "local_face_count": int(len(local_faces)),
+        # 局部索引 -> 全局索引 映射，用于把补丁应用回原始网格
+        "source_vertex_indices": [int(v) for v in unique_old_vertices.tolist()],
+        "source_face_indices": [int(f) for f in faces_idx.tolist()],
         "component": comp_new,
     }
 
