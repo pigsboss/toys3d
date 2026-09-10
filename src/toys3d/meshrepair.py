@@ -72,6 +72,74 @@ def print_global_mesh_stats(label, stats):
 
 
 # ---------------------------------------------------------------------------
+# 组件包加载辅助
+# ---------------------------------------------------------------------------
+
+def _load_component_package(input_file, component_package_arg):
+    """
+    加载组件包 JSON：
+    - 显式给出 --component-package 时，读取该路径；
+    - 否则，自动查找与输入 PLY 同名的 .json 文件；
+    - 若文件不存在或不含 component.healthy_hole_vertex_indices，返回 (None, None)。
+
+    返回 (data, path) 或 (None, None)。
+    """
+    if component_package_arg is not None:
+        path = Path(component_package_arg)
+        if not path.exists():
+            raise FileNotFoundError(f"未找到组件包: {path}")
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f), path
+
+    input_path = Path(input_file)
+    auto_path = input_path.with_suffix(".json")
+    if not auto_path.exists():
+        return None, None
+
+    try:
+        with open(auto_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None, None
+
+    comp = data.get("component", {})
+    if "healthy_hole_vertex_indices" not in comp:
+        return None, None
+    return data, auto_path
+
+
+def _build_hole_from_component(component_data, override_hole_id=None):
+    """
+    将组件包转换为 repair_healthy_hole 期望的 hole 字典。
+    """
+    comp = component_data.get("component", {})
+    boundary_type = component_data.get("boundary_type", "healthy")
+    if boundary_type != "healthy":
+        raise ValueError(
+            f"组件包边界类型不是 healthy，而是 {boundary_type}"
+        )
+
+    verts = comp.get("healthy_hole_vertex_indices", [])
+    if not verts:
+        raise ValueError("组件包中 healthy_hole_vertex_indices 为空")
+
+    boundary_id = int(component_data.get("boundary_id", 0))
+    if override_hole_id is not None and override_hole_id != boundary_id:
+        print(
+            f"  [WARN] --hole-id={override_hole_id} 与组件包 "
+            f"boundary_id={boundary_id} 不一致，将使用组件包中的 ID"
+        )
+
+    vert_list = [int(v) for v in verts]
+    return {
+        "hole_id": boundary_id,
+        "vertex_indices": vert_list,
+        "num_vertices": len(vert_list),
+        "num_edges": len(vert_list),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 命令行入口
 # ---------------------------------------------------------------------------
 
@@ -85,6 +153,12 @@ def _main():
         "--hole-diagnosis-dir",
         default="hole_diagnosis_report",
         help="hole diagnosis 输出目录（默认 hole_diagnosis_report）",
+    )
+    parser.add_argument(
+        "--component-package",
+        type=str,
+        default=None,
+        help="组件包 JSON 路径。默认会自动查找与输入 PLY 同名的 .json 文件。",
     )
     parser.add_argument(
         "--hole-id",
@@ -118,14 +192,30 @@ def _main():
     print(f"Hey! Loading {args.input_file}")
     mesh = trimesh.load(args.input_file, force="mesh")
 
-    diag_path = Path(args.hole_diagnosis_dir) / "hole_diagnosis.json"
-    if not diag_path.exists():
-        raise FileNotFoundError(f"未找到 {diag_path}")
+    comp_data, comp_path = _load_component_package(
+        args.input_file, args.component_package
+    )
 
-    with open(diag_path, "r", encoding="utf-8") as f:
-        diag = json.load(f)
+    if comp_data is not None:
+        print(f"自动找到组件包: {comp_path}")
+        try:
+            hole = _build_hole_from_component(comp_data, args.hole_id)
+        except Exception as e:
+            raise RuntimeError(f"解析组件包失败: {e}")
 
-    healthy_holes = diag.get("healthy_holes", [])
+        healthy_holes = [hole]
+        component_mode = True
+    else:
+        diag_path = Path(args.hole_diagnosis_dir) / "hole_diagnosis.json"
+        if not diag_path.exists():
+            raise FileNotFoundError(f"未找到 {diag_path}")
+
+        with open(diag_path, "r", encoding="utf-8") as f:
+            diag = json.load(f)
+
+        healthy_holes = diag.get("healthy_holes", [])
+        component_mode = False
+
     if not healthy_holes:
         print("未找到健康孔洞，无需修补。")
         mesh.export(args.output_file)
@@ -143,7 +233,17 @@ def _main():
     print_global_mesh_stats("修补前", before_stats)
     print(f"  健康孔洞总数: {len(healthy_holes)}")
 
-    if args.hole_id is not None:
+    if component_mode:
+        hole = healthy_holes[0]
+        repaired_mesh, msg = repair_healthy_hole(
+            mesh, hole, seifert_options, verbose=args.verbose
+        )
+        if repaired_mesh is None:
+            raise RuntimeError(f"修补失败: {msg}")
+        repaired_ids = [hole["hole_id"]]
+        failed_records = []
+
+    elif args.hole_id is not None:
         hole = next(
             (h for h in healthy_holes if h["hole_id"] == args.hole_id),
             None,
@@ -157,6 +257,7 @@ def _main():
             raise RuntimeError(f"修补失败: {msg}")
         repaired_ids = [args.hole_id]
         failed_records = []
+
     else:
         repaired_mesh, repaired_ids, failed_records = repair_all_healthy_holes(
             mesh, healthy_holes, seifert_options, verbose=args.verbose
