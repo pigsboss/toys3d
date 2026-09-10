@@ -26,8 +26,8 @@ _src_parent = os.path.dirname(_project_root)
 if _src_parent not in sys.path:
     sys.path.insert(0, _src_parent)
 
-from toys3d.geometrics import expand_face_neighborhood
 from toys3d.geometrics import export_component_package
+from toys3d.reporting import load_boundary_component_data
 
 
 def load_mesh(input_file):
@@ -38,90 +38,28 @@ def load_mesh(input_file):
     return mesh
 
 
-def load_healthy_holes(diag_dir):
+def _enumerate_component_ids(diag_dir, boundary_type):
     """
-    从 hole diagnosis 目录加载健康孔洞列表。
-    每个孔洞包含：
-        hole_id, vertex_indices, num_edges, area, perimeter, face_ids
+    仅枚举诊断目录中可用的组件 ID 列表。
+    真正的组件数据由 load_boundary_component_data 提供。
     """
     diag_dir = Path(diag_dir)
-    diag_json = diag_dir / "hole_diagnosis.json"
-    npz_path = diag_dir / "hole_diagnosis_data.npz"
-    if not diag_json.exists() or not npz_path.exists():
-        raise FileNotFoundError(
-            f"缺少诊断文件: {diag_json} 或 {npz_path}"
-        )
 
-    with open(diag_json, "r", encoding="utf-8") as f:
-        diagnosis = json.load(f)
-
-    npz = np.load(npz_path)
-    hole_ids_per_edge = npz["hole_ids_per_edge"]
-    open_edge_face_ids = npz["open_edge_face_ids"]
-
-    healthy_holes = []
-    for hole in diagnosis.get("healthy_holes", []):
-        hole_id = hole["hole_id"]
-        # 反推种子面片
-        edge_mask = hole_ids_per_edge == hole_id
-        face_ids = list(set(open_edge_face_ids[edge_mask].tolist()))
-        hole = dict(hole)
-        hole["face_ids"] = face_ids
-        healthy_holes.append(hole)
-
-    return healthy_holes
-
-
-def load_uncovered_components(diag_dir):
-    """从 hole diagnosis 目录加载未覆盖开放边连通分量。"""
-    diag_dir = Path(diag_dir)
-    comp_json = diag_dir / "uncovered_component_analysis.json"
-    if not comp_json.exists():
-        raise FileNotFoundError(f"缺少未覆盖分量分析文件: {comp_json}")
-
-    with open(comp_json, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    components = data.get("components", [])
-    for comp in components:
-        # 确保关键字段存在
-        comp.setdefault("face_ids", [])
-        comp.setdefault("endpoints", [])
-        comp.setdefault("branch_vertices", [])
-        comp.setdefault("candidate_breaks", [])
-        comp.setdefault("edge_vertex_pairs", [])
-    return components
-
-
-def _enumerate_components(diag_dir, boundary_type):
-    """
-    枚举诊断目录中的组件，仅用于提供 boundary_id 列表和提取所需的原始组件数据。
-    返回 (component_id, component_dict) 列表。
-    """
     if boundary_type == "healthy":
-        raw_components = load_healthy_holes(diag_dir)
-        enumerated = []
-        for hole in raw_components:
-            comp = dict(hole)
-            comp["component_id"] = int(hole["hole_id"])
-            comp.setdefault("face_ids", [])
-            comp.setdefault("vertices", [])
-            comp.setdefault("edge_vertex_pairs", [])
-            comp.setdefault("endpoints", [])
-            comp.setdefault("branch_vertices", [])
-            comp.setdefault("candidate_breaks", [])
-            comp.setdefault("healthy_hole_vertex_indices", [])
-            enumerated.append(comp)
-        return enumerated
+        diag_json = diag_dir / "hole_diagnosis.json"
+        if not diag_json.exists():
+            raise FileNotFoundError(f"缺少诊断文件: {diag_json}")
+        with open(diag_json, "r", encoding="utf-8") as f:
+            diagnosis = json.load(f)
+        return [int(h["hole_id"]) for h in diagnosis.get("healthy_holes", [])]
 
     elif boundary_type == "uncovered":
-        raw_components = load_uncovered_components(diag_dir)
-        enumerated = []
-        for comp in raw_components:
-            c = dict(comp)
-            c.setdefault("healthy_hole_vertex_indices", [])
-            enumerated.append(c)
-        return enumerated
+        comp_json = diag_dir / "uncovered_component_analysis.json"
+        if not comp_json.exists():
+            raise FileNotFoundError(f"缺少未覆盖分量分析文件: {comp_json}")
+        with open(comp_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [int(c["component_id"]) for c in data.get("components", [])]
 
     else:
         raise ValueError(f"未知的 boundary_type: {boundary_type}")
@@ -129,7 +67,8 @@ def _enumerate_components(diag_dir, boundary_type):
 
 def extract_component_by_id(
     mesh,
-    comp_original,
+    input_file,
+    diag_dir,
     boundary_type,
     boundary_id,
     neighborhood_depth,
@@ -140,19 +79,24 @@ def extract_component_by_id(
     提取单个组件，保存 PLY 和 JSON。
     返回 (success: bool, face_count: int, vertex_count: int, message: str)
     """
+    try:
+        comp = load_boundary_component_data(
+            str(diag_dir),
+            boundary_id,
+            boundary_type,
+        )
+    except Exception as e:
+        return False, 0, 0, f"加载组件失败: {e}"
+
     stem = f"{boundary_type}_{boundary_id}_depth{neighborhood_depth}"
     ply_path = Path(output_dir) / f"{stem}.ply"
     json_path = Path(output_dir) / f"{stem}.json"
 
-    source_file = ""
-    try:
-        source_file = mesh.metadata.get("file_name", "") or ""
-    except Exception:
-        source_file = ""
+    source_file = str(Path(input_file).resolve())
 
     result = export_component_package(
         mesh,
-        comp_original,
+        comp,
         boundary_type=boundary_type,
         boundary_id=boundary_id,
         neighborhood_depth=neighborhood_depth,
@@ -227,33 +171,35 @@ def main():
     print(f"Hey! Loading {args.input_file}")
     mesh = load_mesh(args.input_file)
 
-    # 枚举组件（作为 boundary_id 的来源；实际提取仍走共享的
-    # export_component_package，以保证与 meshinspect.py 行为一致）
-    components = _enumerate_components(args.hole_diagnosis_dir, args.boundary_type)
+    # 仅枚举组件 ID；实际提取走 load_boundary_component_data，
+    # 保证与 meshinspect.py --extract-component-package 完全一致。
+    try:
+        ids = _enumerate_component_ids(args.hole_diagnosis_dir, args.boundary_type)
+    except Exception as e:
+        print(f"[ERROR] 枚举组件 ID 失败: {e}")
+        return
 
-    if not components:
+    if not ids:
         print("没有找到任何组件。")
         return
 
     # 按 ID 过滤
     if args.ids is not None:
         id_set = set(int(x) for x in args.ids.split(",") if x.strip())
-        components = [
-            c for c in components if int(c.get("component_id", -1)) in id_set
-        ]
+        ids = [i for i in ids if i in id_set]
 
     # 限制数量
     if args.max_components is not None:
-        components = components[: args.max_components]
+        ids = ids[: args.max_components]
 
     success_count = 0
     fail_count = 0
 
-    for comp in components:
-        boundary_id = int(comp.get("component_id", -1))
+    for boundary_id in ids:
         success, face_cnt, vert_cnt, msg = extract_component_by_id(
             mesh,
-            comp,
+            args.input_file,
+            args.hole_diagnosis_dir,
             args.boundary_type,
             boundary_id,
             args.boundary_neighborhood_depth,
