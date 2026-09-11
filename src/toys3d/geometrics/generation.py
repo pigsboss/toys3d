@@ -325,6 +325,29 @@ def generate_initial_seifert_disk(mesh, loop_vertices):
             if len(set(boundary_indices)) != len(flat):
                 continue
 
+            # ---- Stage 0: 校验 patch 外环与 boundary_indices 的环序一致 ----
+            # polygon.buffer(0) 会重排外环，使 boundary_indices 变成一次置换，
+            # 从而在 apply_seifert_patch_to_mesh 中产生错位映射。
+            # 这里拒绝这种 patch，让循环换下一个候选法向。
+            outer_edge_count = {}
+            for tri in tri_faces:
+                for k in range(3):
+                    a = int(tri[k])
+                    b = int(tri[(k + 1) % 3])
+                    key = (a, b) if a < b else (b, a)
+                    outer_edge_count[key] = outer_edge_count.get(key, 0) + 1
+
+            ring_edges = [e for e, c in outer_edge_count.items() if c == 1]
+            outer_ring = _walk_closed_ring(ring_edges)
+
+            if outer_ring is None:
+                continue
+            if set(outer_ring) != set(boundary_indices):
+                continue
+            if not _is_cyclic_rotation(outer_ring, boundary_indices,
+                                       allow_reverse=True):
+                continue
+
             disk = trimesh.Trimesh(
                 vertices=v3d,
                 faces=tri_faces,
@@ -523,10 +546,17 @@ def print_seifert_fill_stats(stats):
     )
 
 
-def compute_seifert_curvature_stats(seifert_mesh, boundary_vertex_indices):
+def compute_seifert_curvature_stats(seifert_mesh, boundary_vertex_indices=None):
     """
     计算 Seifert 曲面内部顶点的离散曲率统计。
+    boundary_vertex_indices=None 时自动从曲面边界环提取。
     """
+    if boundary_vertex_indices is None:
+        from .topology import extract_boundary_loops
+        loops = extract_boundary_loops(seifert_mesh)
+        boundary_vertex_indices = [
+            int(v) for loop in loops for v in loop
+        ]
     return compute_curvature_statistics(seifert_mesh, boundary_vertex_indices)
 
 
@@ -694,6 +724,65 @@ def _classify_edge_count(cnt):
     if cnt == 2:
         return "manifold"
     return "nonmanifold"
+
+
+def _walk_closed_ring(edges):
+    """
+    从无序边集恢复单一闭环的顶点序列。
+    返回环（不含重复起点）；不是单环则返回 None。
+    """
+    if not edges:
+        return None
+    adj = {}
+    for a, b in edges:
+        a, b = int(a), int(b)
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+    for nbrs in adj.values():
+        if len(nbrs) != 2:
+            return None
+
+    start = next(iter(adj))
+    ring = [start]
+    prev = None
+    cur = start
+    while True:
+        nxts = [v for v in adj[cur] if v != prev]
+        if not nxts:
+            return None
+        nxt = nxts[0]
+        if nxt == start:
+            break
+        ring.append(nxt)
+        prev, cur = cur, nxt
+        if len(ring) > len(adj):
+            return None
+
+    return ring if len(ring) == len(adj) else None
+
+
+def _is_cyclic_rotation(a, b, allow_reverse=False):
+    """b 是否为 a 的循环移位（可选允许反向循环移位）。"""
+    if len(a) != len(b):
+        return False
+    if not a:
+        return True
+
+    def _rot_match(x, y):
+        n = len(x)
+        y0 = y[0]
+        for i in range(n):
+            if x[i] != y0:
+                continue
+            if all(x[(i + k) % n] == y[k] for k in range(n)):
+                return True
+        return False
+
+    if _rot_match(a, b):
+        return True
+    if allow_reverse:
+        return _rot_match(a[::-1], b)
+    return False
 
 
 def _build_edge_tuple_to_faces(mesh, face_indices=None):
